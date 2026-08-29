@@ -1,11 +1,14 @@
-# Tipico Market Intelligence Dashboard V0.3
+# Tipico Market Intelligence Dashboard V0.4
 
-Lokales, read-only Streamlit-Tool zur Beobachtung des öffentlichen Tipico-Live-Fußballfeeds.
+Lokales, read-only Streamlit-Tool zur Beobachtung des öffentlichen Tipico-Live-Fußballfeeds
+mit getrenntem Paper-Trading für die validierte `ZERO_OR_2PLUS`-Strategie.
 
 Der aktuelle Projektumfang umfasst:
 
 - alle aktuell gelieferten Live-Fußballspiele
 - dynamische Wettbewerb-/Liga-Zuordnung
+- Tipico-Land/Region je Wettbewerb, z. B. `Bundesliga · Deutschland` oder
+  `Bundesliga · Österreich`, in Events und `competitions` persistiert
 - Spielstand, Spielminute und Phase
 - vollständige Märkte und Outcomes für genau ein geöffnetes Event
 - Quoten-/Status-Historie in SQLite
@@ -21,10 +24,14 @@ Der aktuelle Projektumfang umfasst:
 - ZERO_OR_2PLUS-Szenarien, Cent-Einsatzoptimierung und struktureller P1-Puffer
 - Upcoming-Ansicht, automatischer Halbzeit-Scanner und Odds-History-Tabs
 - optionale, rein mathematische Dynamic-Middle-Rescue-Schadensprofile
+- mehrere Paper-Portfolios mit festen oder prozentualen Einsätzen
+- globaler Paper-Kill-Switch, Portfolio-Filter, Entry-Regeln und HT-Einstiegsfenster
+- unveränderlicher Paper-Einstiegssnapshot, idempotentes Bankroll-Ledger und Settlement
+- Paper-Trading-Analytics, Calibration nach Tipico-P1 und CSV-Export
+- automatische Geräteerkennung über Browser-User-Agent plus responsive Mobilansicht
 
 Nicht enthalten sind eigene ML-Wahrscheinlichkeiten, andere Anbieter, FotMob,
-WebSocket/STOMP, Inhaltsfilter, Best-Bet-/Edge-Ranking und automatische
-Wettabgabe.
+WebSocket/STOMP, Inhaltsfilter, automatische Optimierung und echte Wettabgabe.
 
 ## Voraussetzungen
 
@@ -77,13 +84,13 @@ bash deploy/install_proxmox.sh
 ~~~
 
 Das Installationsskript richtet eine virtuelle Python-Umgebung ein, installiert
-die Abhängigkeiten und aktiviert zwei systemd-Dienste: das Dashboard auf Port
-8506 sowie den historischen Background Collector. Danach ist die Oberfläche
-unter `http://<LXC-ODER-VM-IP>:8506` erreichbar.
+die Abhängigkeiten und aktiviert drei getrennte systemd-Dienste: Dashboard,
+historischen Collector und Paper-Worker. Danach ist die Oberfläche unter
+`http://<LXC-ODER-VM-IP>:8506` erreichbar.
 
 ~~~bash
-systemctl status tipico-observer tipico-collector
-journalctl -u tipico-observer -u tipico-collector -f
+systemctl status wetten-ui wetten-collector wetten-paper
+journalctl -u wetten-ui -u wetten-collector -u wetten-paper -f
 ~~~
 
 Die optionalen Einstellungen liegen nach der Installation in
@@ -93,11 +100,16 @@ Die optionalen Einstellungen liegen nach der Installation in
 
 ## Bedienung
 
-Die Navigation besteht aus **Live**, **Upcoming**, **Halftime Scanner** und
-**Data / Debug**. Die Live-Seite lädt den öffentlichen Livefeed standardmäßig
+Die Navigation besteht aus **Live**, **Upcoming**, **Halftime Scanner**,
+**Paper Trading** und **Data / Debug**. Die Live-Seite lädt den öffentlichen Livefeed standardmäßig
 alle 10 Sekunden. Alle Wettbewerbe bleiben sichtbar; die Expander sind
 standardmäßig geschlossen. Das Suchfeld filtert nur die Darstellung in der UI
 und verändert den Collector nicht.
+
+Liga und Land werden getrennt angezeigt. Tipicos `sportCompetitionMap` liefert
+dafür den `parentName`; dieser wird nicht in den Ligatitel eingemischt, sondern
+als `competition_country` am Event und als `country_or_region` in
+`competitions` gespeichert.
 
 Mit **Quoten** wird genau ein Event geöffnet und mit **Analyse** dieselbe
 Detailansicht mit der normalisierten Auswertung. Erst dann wird der
@@ -129,6 +141,30 @@ der Zeitpunkt noch nicht verpasst ist, T−60, T−15, T−5 und T−1 geplant.
 Die Seite **Data Collection** liest ausschließlich SQLite und
 `data/collector_status.json`; sie startet keinen Collector und entscheidet
 nicht über die Datensammlung.
+
+### Paper Trading
+
+Paper Trading arbeitet vollständig ohne Wettschein und ohne Wettabgabe. Im
+Dashboard können mehrere Portfolios angelegt, pausiert, archiviert und mit
+Liga-/Länderzuordnung versehen werden. Die Regeln prüfen frische 0-/2+-Quoten,
+P1, P1-Puffer, Win-ROI und das HT-Einstiegsfenster. Der Worker läuft getrennt
+von Streamlit:
+
+~~~powershell
+python scripts/run_paper.py --root .
+python scripts/run_paper.py --root . --once
+~~~
+
+Pro Event und Portfolio wird höchstens ein Einstieg für die Strategie erzeugt.
+Quoten, Quotenalter, Markt-/Outcome-IDs, Score, Bankroll und Strategieversion
+werden im `entry_snapshot_json` eingefroren. Beim Settlement wird ausschließlich
+die zweite Halbzeit aus dem bestätigten Endstand berechnet; fehlende Endstände,
+unbekannter Extra-Time-Scope und abgebrochene Spiele werden nicht als Gewinn
+gezählt.
+
+Die App erkennt Mobilgeräte automatisch über den Browser-User-Agent und nutzt
+zusätzlich eine responsive Ansicht. Für einen manuellen Test kann `?view=mobile`
+oder `?view=desktop` an die URL angehängt werden.
 
 Pausierte oder quotenlose Outcomes werden als nicht verfügbar angezeigt. Eine pausierte Quote mit quoteFloatValue = 1.0 wird niemals als spielbare Quote behandelt.
 
@@ -170,7 +206,10 @@ Raw-Payloads werden kanonisch gehasht. Identische Antworten erzeugen keine zweit
 
 Die Datenbank enthält die Tabellen `events`, `event_states`, `markets`,
 `outcomes`, `odds_history`, `competitions`, `snapshots`, `market_presence`,
-`canonical_outcomes` und `strategy_evaluations`. Der Raw-Layer wird nie
+`canonical_outcomes`, `strategy_evaluations`, `paper_portfolios`,
+`paper_portfolio_competitions`, `paper_trades`,
+`paper_bankroll_transactions`, `paper_signal_log`, `paper_runtime_settings`
+und `paper_worker_runs`. Der Raw-Layer wird nie
 überschrieben. Canonical Outcomes tragen `normalizer_version = v0.3.1`;
 Strategiezeilen werden nur bei relevanter Quote-, Quellen-, P1- oder
 Statusänderung gespeichert. `market_presence` unterscheidet einen nicht
@@ -185,7 +224,9 @@ pytest -q
 Die fachlichen V0.3-Tests decken Normalisierung, dynamische Score-Linien,
 Äquivalenz-Scope, Best Odds, Stale-/Paused-Quoten, Probability Engine,
 Inkonsistenz-Markierung, Strategy Engine, Cent-Rundung und Rescue-Arithmetik
-ab.
+ab. Die V0.4-Tests decken Portfolio-Regeln, Einsatzmodi, Bankroll-Grenzen,
+Signalfilter, alle Settlement-Klassen, HT1:1/FT2:2, Idempotenz und Snapshot-
+Unveränderlichkeit ab.
 
 Der reproduzierbare Live-Smoke-Test ruft den aktuellen Feed und genau ein Eventdetail ab:
 

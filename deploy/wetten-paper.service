@@ -1,0 +1,25 @@
+[Unit]
+Description=Sportwetten Tipico Paper Trading Worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=-/etc/default/tipico-observer
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__INSTALL_DIR__/.venv/bin/python __INSTALL_DIR__/scripts/run_paper.py --root __INSTALL_DIR__ --interval 30
+Restart=always
+RestartSec=15
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=__INSTALL_DIR__/data __INSTALL_DIR__/logs
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

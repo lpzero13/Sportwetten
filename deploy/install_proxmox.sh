@@ -63,23 +63,33 @@ sed \
     -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
     -e "s|__SERVICE_USER__|$SERVICE_USER|g" \
     -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
-    "$INSTALL_DIR/deploy/tipico-observer.service" \
-    > /etc/systemd/system/tipico-observer.service
+    "$INSTALL_DIR/deploy/wetten-ui.service" \
+    > /etc/systemd/system/wetten-ui.service
 sed \
     -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
     -e "s|__SERVICE_USER__|$SERVICE_USER|g" \
     -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
-    "$INSTALL_DIR/deploy/tipico-collector.service" \
-    > /etc/systemd/system/tipico-collector.service
+    "$INSTALL_DIR/deploy/wetten-collector.service" \
+    > /etc/systemd/system/wetten-collector.service
+sed \
+    -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
+    -e "s|__SERVICE_USER__|$SERVICE_USER|g" \
+    -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
+    "$INSTALL_DIR/deploy/wetten-paper.service" \
+    > /etc/systemd/system/wetten-paper.service
+
+# V0.3 service names are retired in favour of the explicit V0.4 names.
+systemctl disable --now tipico-observer.service tipico-collector.service 2>/dev/null || true
 
 systemctl daemon-reload
-systemctl enable tipico-observer.service tipico-collector.service
-systemctl restart tipico-observer.service
-systemctl restart tipico-collector.service
+systemctl enable wetten-ui.service wetten-collector.service wetten-paper.service
+systemctl restart wetten-ui.service
+systemctl restart wetten-collector.service
+systemctl restart wetten-paper.service
 
 LXC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo
 echo "Installation abgeschlossen."
 echo "Dashboard: http://${LXC_IP:-<LXC-IP>}:8506"
-echo "Status:    systemctl status tipico-observer tipico-collector"
-echo "Logs:      journalctl -u tipico-observer -u tipico-collector -f"
+echo "Status:    systemctl status wetten-ui wetten-collector wetten-paper"
+echo "Logs:      journalctl -u wetten-ui -u wetten-collector -u wetten-paper -f"

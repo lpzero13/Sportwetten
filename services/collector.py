@@ -491,6 +491,8 @@ class Collector:
                 )
                 if job.fallback_event is not None and not details.event.competition_name:
                     details.event.competition_name = job.fallback_event.competition_name
+                if job.fallback_event is not None and not details.event.competition_country:
+                    details.event.competition_country = job.fallback_event.competition_country
                 return DetailFetchResult(
                     job=job,
                     success=True,

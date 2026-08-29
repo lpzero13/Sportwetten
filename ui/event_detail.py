@@ -58,7 +58,7 @@ def render_event_header(
     event = details.event
     st.subheader(f"{event.home_team} – {event.away_team}")
     st.caption(
-        f"{event.competition_name} · {event.display_minute} · "
+        f"{event.competition_name} · {event.competition_country or 'Land unbekannt'} · {event.display_minute} · "
         f"{event.score_label} · Phase: {event.period}"
     )
 

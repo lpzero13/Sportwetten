@@ -22,6 +22,7 @@ def test_live_feed_resolves_competition_and_score() -> None:
     assert isinstance(event.event_id, str)
     assert event.competition_id == "104124301"
     assert event.competition_name == "We-League, Frauen"
+    assert event.competition_country == "Japan"
     assert event.home_team == "Nagano Parceiro (F)"
     assert event.away_team == "NTV Beleza (F)"
     assert event.display_minute == "50'"
@@ -115,4 +116,5 @@ def test_upcoming_feed_parses_prematch_events_and_region() -> None:
     assert len(events) == 1
     assert events[0].status == "pre_match"
     assert events[0].competition_name == "Testliga"
+    assert events[0].competition_country == "Testland"
     assert events[0].raw_data["groups"] == ["Testliga", "Testland", "Fußball"]

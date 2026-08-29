@@ -1,0 +1,25 @@
+[Unit]
+Description=Sportwetten Tipico Dashboard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=-/etc/default/tipico-observer
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__INSTALL_DIR__/.venv/bin/python -m streamlit run __INSTALL_DIR__/app.py --server.address=0.0.0.0 --server.port=8506 --server.headless=true --browser.gatherUsageStats=false
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=__INSTALL_DIR__/data __INSTALL_DIR__/logs
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

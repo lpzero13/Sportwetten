@@ -38,6 +38,10 @@ class LiveEvent:
     break_before: Any = None
     clock_data: dict[str, Any] = field(default_factory=dict)
     raw_data: dict[str, Any] = field(default_factory=dict, repr=False)
+    # Tipico exposes the country/region separately from the competition name
+    # in the sportCompetitionMap (for example "Deutschland" or "Österreich").
+    # Keep it optional for backwards-compatible construction of fixture events.
+    competition_country: str | None = None
 
     @property
     def score_label(self) -> str:

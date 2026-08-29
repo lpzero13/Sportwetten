@@ -10,6 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 
 from config import Settings, configure_logging
 from intelligence.service import MarketIntelligenceService
+from paper.service import PaperTradingService
 from services.event_service import EventService
 from services.halftime_scanner import HalftimeScannerService
 from services.market_service import MarketService
@@ -19,12 +20,14 @@ from storage.raw_storage import RawStorage
 from tipico.client import TipicoClient
 from ui.debug import render_debug_page
 from ui.data_collection import render_data_collection
+from ui.device import apply_responsive_style, detect_device
 from ui.event_detail import render_event_header
 from ui.analysis import render_market_analysis
 from ui.halftime_scanner import render_halftime_scanner
 from ui.live_overview import render_live_overview
 from ui.time_format import current_munich_time, format_local_datetime, parse_datetime
 from ui.upcoming import render_upcoming
+from ui.paper_trading import render_paper_trading
 
 
 @st.cache_resource(show_spinner=False)
@@ -35,6 +38,7 @@ def get_runtime(root_dir: str) -> tuple[
     UpcomingService,
     Database,
     MarketIntelligenceService,
+    PaperTradingService,
 ]:
     settings = Settings.from_env(Path(root_dir))
     logger = configure_logging(settings)
@@ -69,6 +73,7 @@ def get_runtime(root_dir: str) -> tuple[
         settings,
         logger=logger,
     )
+    paper_service = PaperTradingService(database, settings, logger=logger)
     return (
         settings,
         event_service,
@@ -76,6 +81,7 @@ def get_runtime(root_dir: str) -> tuple[
         upcoming_service,
         database,
         intelligence_service,
+        paper_service,
     )
 
 
@@ -315,6 +321,8 @@ def main() -> None:
         page_icon="⚽",
         layout="wide",
     )
+    apply_responsive_style()
+    device = detect_device()
     root_dir = Path(__file__).resolve().parent
     (
         settings,
@@ -323,14 +331,16 @@ def main() -> None:
         upcoming_service,
         database,
         intelligence_service,
+        paper_service,
     ) = get_runtime(str(root_dir))
 
     st.sidebar.title("Tipico Live Observer")
     page = st.sidebar.radio(
         "Ansicht",
-        ["Live", "Upcoming", "Halftime Scanner", "Data / Debug"],
+        ["Live", "Upcoming", "Halftime Scanner", "Paper Trading", "Data / Debug"],
     )
-    st.sidebar.caption("V0.3 Dashboard · Read-only · REST/Polling")
+    st.sidebar.caption("V0.4 Dashboard · Paper Trading · REST/Polling")
+    st.sidebar.caption(f"Gerät: {device.label}")
     st.sidebar.caption(f"Münchner Zeit: {current_munich_time()}")
 
     if page == "Upcoming":
@@ -352,6 +362,11 @@ def main() -> None:
             scanner,
             total_stake=float(settings.default_total_stake_eur),
         )
+        return
+
+    if page == "Paper Trading":
+        st_autorefresh(interval=30_000, key="paper-autorefresh")
+        render_paper_trading(paper_service, database, mobile=device.is_mobile)
         return
 
     if page == "Data / Debug":
@@ -388,7 +403,7 @@ def main() -> None:
     overview_metrics[0].metric("Live-Spiele", len(event_service.events))
     overview_metrics[1].metric(
         "Wettbewerbe",
-        len({event.competition_name for event in event_service.events}),
+        len({(event.competition_name, event.competition_country) for event in event_service.events}),
     )
     overview_metrics[2].metric(
         "Letztes Update",

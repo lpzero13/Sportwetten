@@ -173,7 +173,7 @@ def render_data_collection(database: Database, settings: Settings) -> None:
     labels = {
         str(row["event_id"]): (
             f"{row['home_team']} – {row['away_team']} · "
-            f"{row['competition_name']} · {row['event_id']}"
+            f"{row['competition_name']} · {row['competition_country'] or 'Land unbekannt'} · {row['event_id']}"
         )
         for row in events
     }
@@ -187,7 +187,7 @@ def render_data_collection(database: Database, settings: Settings) -> None:
         return
     st.caption(
         f"{selected['home_team']} – {selected['away_team']} · "
-        f"{selected['competition_name']} · Event {selected['event_id']}"
+        f"{selected['competition_name']} · {selected['competition_country'] or 'Land unbekannt'} · Event {selected['event_id']}"
     )
 
     snapshots = database.snapshots_for_event(selected_id)

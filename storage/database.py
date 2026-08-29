@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY,
     competition_id TEXT,
     competition_name TEXT NOT NULL,
+    competition_country TEXT,
     sport TEXT NOT NULL,
     home_team_id TEXT,
     home_team TEXT NOT NULL,
@@ -240,11 +242,168 @@ CREATE TABLE IF NOT EXISTS strategy_evaluations (
     win_roi REAL,
     p1_max REAL,
     p1_tipico REAL,
-    p1_buffer REAL
+    p1_buffer REAL,
+    p_zero REAL,
+    p_one REAL,
+    p_two_plus REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_strategy_evaluations_event_observed
     ON strategy_evaluations(event_id, strategy_type, observed_at, evaluation_id);
+
+CREATE TABLE IF NOT EXISTS paper_portfolios (
+    portfolio_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    starting_bankroll REAL NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'EUR',
+    strategy_type TEXT NOT NULL DEFAULT 'ZERO_OR_2PLUS',
+    stake_mode TEXT NOT NULL DEFAULT 'FIXED',
+    fixed_stake REAL,
+    bankroll_percentage REAL,
+    min_stake REAL,
+    max_stake REAL,
+    minimum_win_roi REAL NOT NULL DEFAULT 0,
+    minimum_p1_buffer REAL NOT NULL DEFAULT 0,
+    maximum_tipico_p1 REAL NOT NULL DEFAULT 1,
+    minimum_q_zero REAL NOT NULL DEFAULT 1,
+    minimum_q_two_plus REAL NOT NULL DEFAULT 1,
+    max_quote_age_seconds INTEGER NOT NULL DEFAULT 10,
+    entry_window_start_seconds INTEGER NOT NULL DEFAULT 0,
+    entry_window_end_seconds INTEGER NOT NULL DEFAULT 120,
+    allow_all_competitions INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    version INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS paper_portfolio_competitions (
+    portfolio_id TEXT NOT NULL,
+    competition_id TEXT NOT NULL,
+    PRIMARY KEY (portfolio_id, competition_id),
+    FOREIGN KEY (portfolio_id) REFERENCES paper_portfolios(portfolio_id)
+);
+
+CREATE TABLE IF NOT EXISTS paper_trades (
+    paper_trade_id TEXT PRIMARY KEY,
+    portfolio_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    competition_id TEXT,
+    competition_name TEXT NOT NULL,
+    competition_country TEXT,
+    created_at TEXT NOT NULL,
+    strategy_evaluation_id INTEGER,
+    strategy_type TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    normalizer_version TEXT NOT NULL,
+    home_team TEXT NOT NULL,
+    away_team TEXT NOT NULL,
+    ht_score_home INTEGER,
+    ht_score_away INTEGER,
+    zero_market_id TEXT,
+    zero_outcome_id TEXT,
+    zero_market_type TEXT,
+    zero_market_caption TEXT,
+    zero_outcome_caption TEXT,
+    q_zero REAL NOT NULL,
+    zero_quote_observed_at TEXT,
+    zero_quote_age_seconds REAL,
+    two_plus_market_id TEXT,
+    two_plus_outcome_id TEXT,
+    two_plus_market_type TEXT,
+    two_plus_market_caption TEXT,
+    two_plus_outcome_caption TEXT,
+    q_two_plus REAL NOT NULL,
+    two_plus_quote_observed_at TEXT,
+    two_plus_quote_age_seconds REAL,
+    stake_total REAL NOT NULL,
+    stake_zero REAL NOT NULL,
+    stake_two_plus REAL NOT NULL,
+    payout_zero REAL NOT NULL,
+    payout_two_plus REAL NOT NULL,
+    p_zero REAL,
+    p_one REAL,
+    p_two_plus REAL,
+    p1_max REAL,
+    p1_tipico REAL,
+    p1_buffer REAL,
+    win_roi REAL,
+    bankroll_before REAL NOT NULL,
+    bankroll_after REAL NOT NULL,
+    rank INTEGER,
+    status TEXT NOT NULL DEFAULT 'OPEN',
+    settled_at TEXT,
+    final_score_home INTEGER,
+    final_score_away INTEGER,
+    second_half_goals INTEGER,
+    settlement_reason TEXT,
+    return_amount REAL,
+    pnl REAL,
+    invalidated_reason TEXT,
+    entry_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (portfolio_id) REFERENCES paper_portfolios(portfolio_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_trade_one_entry
+    ON paper_trades(portfolio_id, event_id, strategy_type);
+
+CREATE INDEX IF NOT EXISTS idx_paper_trades_portfolio_status
+    ON paper_trades(portfolio_id, status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_paper_trades_event
+    ON paper_trades(event_id, status);
+
+CREATE TABLE IF NOT EXISTS paper_bankroll_transactions (
+    transaction_id TEXT PRIMARY KEY,
+    portfolio_id TEXT NOT NULL,
+    paper_trade_id TEXT,
+    created_at TEXT NOT NULL,
+    transaction_type TEXT NOT NULL,
+    amount REAL NOT NULL,
+    balance_before REAL NOT NULL,
+    balance_after REAL NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    note TEXT,
+    FOREIGN KEY (portfolio_id) REFERENCES paper_portfolios(portfolio_id),
+    FOREIGN KEY (paper_trade_id) REFERENCES paper_trades(paper_trade_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_ledger_portfolio_time
+    ON paper_bankroll_transactions(portfolio_id, created_at, transaction_id);
+
+CREATE TABLE IF NOT EXISTS paper_signal_log (
+    signal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    portfolio_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    evaluation_id INTEGER,
+    observed_at TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(portfolio_id, event_id, evaluation_id, decision),
+    FOREIGN KEY (portfolio_id) REFERENCES paper_portfolios(portfolio_id)
+);
+
+CREATE TABLE IF NOT EXISTS paper_runtime_settings (
+    setting_key TEXT PRIMARY KEY,
+    setting_value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_worker_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    signals_seen INTEGER NOT NULL DEFAULT 0,
+    trades_created INTEGER NOT NULL DEFAULT 0,
+    trades_settled INTEGER NOT NULL DEFAULT 0,
+    errors INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'RUNNING',
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_worker_runs_started
+    ON paper_worker_runs(started_at DESC, run_id DESC);
 """
 
 
@@ -270,13 +429,27 @@ class Database:
         )
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.execute("PRAGMA busy_timeout = 30000")
         self.connection.execute("PRAGMA journal_mode = WAL")
+        self.connection.execute("PRAGMA synchronous = NORMAL")
         self.connection.executescript(SCHEMA)
+        self._ensure_column("events", "competition_country", "TEXT")
         self._ensure_column("odds_history", "snapshot_id", "INTEGER")
+        self._ensure_column("strategy_evaluations", "p_zero", "REAL")
+        self._ensure_column("strategy_evaluations", "p_one", "REAL")
+        self._ensure_column("strategy_evaluations", "p_two_plus", "REAL")
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_odds_history_snapshot ON odds_history(snapshot_id)"
         )
         self._backfill_competitions()
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO paper_runtime_settings
+                (setting_key, setting_value, updated_at)
+            VALUES ('enabled', '1', ?)
+            """,
+            (datetime.now(timezone.utc).isoformat(),),
+        )
         self.connection.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -300,7 +473,7 @@ class Database:
                 competition_id, competition_name, country_or_region,
                 first_seen_at, last_seen_at, events_observed
             )
-            SELECT competition_id, MAX(competition_name), NULL,
+            SELECT competition_id, MAX(competition_name), MAX(competition_country),
                    MIN(first_seen_at), MAX(last_seen_at), COUNT(*)
             FROM events
             WHERE competition_id IS NOT NULL
@@ -310,6 +483,23 @@ class Database:
                 first_seen_at = MIN(competitions.first_seen_at, excluded.first_seen_at),
                 last_seen_at = MAX(competitions.last_seen_at, excluded.last_seen_at),
                 events_observed = MAX(competitions.events_observed, excluded.events_observed)
+            """
+        )
+        self.connection.execute(
+            """
+            UPDATE events
+            SET competition_country = (
+                SELECT country_or_region
+                FROM competitions
+                WHERE competitions.competition_id = events.competition_id
+            )
+            WHERE (competition_country IS NULL OR competition_country = '')
+              AND competition_id IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM competitions
+                  WHERE competitions.competition_id = events.competition_id
+                    AND country_or_region IS NOT NULL
+              )
             """
         )
 
@@ -328,6 +518,7 @@ class Database:
             event.event_id,
             event.competition_id,
             event.competition_name,
+            event.competition_country,
             event.sport,
             event.home_team_id,
             event.home_team,
@@ -360,7 +551,7 @@ class Database:
             self.connection.execute(
                 """
                 INSERT INTO events (
-                    event_id, competition_id, competition_name, sport,
+                    event_id, competition_id, competition_name, competition_country, sport,
                     home_team_id, home_team, away_team_id, away_team,
                     kickoff_time, status, period, display_time,
                     score_home, score_away, ht_score_home, ht_score_away,
@@ -369,10 +560,13 @@ class Database:
                     extra_time, penalties, break_before, clock_data_json,
                     raw_data_json, first_seen_at, last_seen_at, last_updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(event_id) DO UPDATE SET
                     competition_id = excluded.competition_id,
                     competition_name = excluded.competition_name,
+                    competition_country = COALESCE(
+                        excluded.competition_country, events.competition_country
+                    ),
                     sport = excluded.sport,
                     home_team_id = excluded.home_team_id,
                     home_team = excluded.home_team,
@@ -412,7 +606,7 @@ class Database:
                 self._upsert_competition_in_transaction(
                     str(event.competition_id),
                     event.competition_name or str(event.competition_id),
-                    region,
+                    event.competition_country or region,
                     event.first_seen_at or observed_at,
                     observed_at,
                 )
@@ -742,6 +936,9 @@ class Database:
         p1_max: float | None,
         p1_tipico: float | None,
         p1_buffer: float | None,
+        p_zero: float | None = None,
+        p_one: float | None = None,
+        p_two_plus: float | None = None,
     ) -> bool:
         """Persist strategy state only when a material input changed."""
 
@@ -760,8 +957,8 @@ class Database:
             previous = self.connection.execute(
                 """
                 SELECT status, total_stake, q_zero, q_two_plus,
-                       source_zero, source_two_plus, p1_tipico,
-                       normalizer_version, strategy_version
+                        source_zero, source_two_plus, p1_tipico,
+                        normalizer_version, strategy_version
                 FROM strategy_evaluations
                 WHERE event_id = ? AND strategy_type = ?
                 ORDER BY observed_at DESC, evaluation_id DESC
@@ -780,9 +977,9 @@ class Database:
                         q_two_plus, source_zero, source_two_plus, stake_zero,
                         stake_two_plus, payout_zero, payout_two_plus,
                         payout_difference, covered_profit, win_roi, p1_max,
-                        p1_tipico, p1_buffer
+                        p1_tipico, p1_buffer, p_zero, p_one, p_two_plus
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                              ?, ?, ?, ?, ?)
+                              ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(event_id),
@@ -806,6 +1003,9 @@ class Database:
                         p1_max,
                         p1_tipico,
                         p1_buffer,
+                        p_zero,
+                        p_one,
+                        p_two_plus,
                     ),
                 )
             return True
@@ -951,6 +1151,544 @@ class Database:
                 ).fetchall()
             )
 
+    def recent_strategy_evaluations(
+        self,
+        *,
+        strategy_type: str = "ZERO_OR_2PLUS",
+        since: str | None = None,
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        """Return evaluations used by the independent paper worker."""
+
+        clauses = ["se.strategy_type = ?"]
+        params: list[Any] = [str(strategy_type)]
+        if since:
+            clauses.append("se.observed_at >= ?")
+            params.append(str(since))
+        params.append(max(1, int(limit)))
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT se.*, e.competition_id, e.competition_name,
+                           e.competition_country, e.home_team, e.away_team,
+                           e.ht_score_home AS event_ht_score_home,
+                           e.ht_score_away AS event_ht_score_away,
+                           e.sport, e.extra_time, e.penalties
+                    FROM strategy_evaluations se
+                    LEFT JOIN events e ON e.event_id = se.event_id
+                    WHERE """
+                    + " AND ".join(clauses)
+                    + " ORDER BY se.observed_at DESC, se.evaluation_id DESC LIMIT ?",
+                    params,
+                ).fetchall()
+            )
+
+    def canonical_quotes_for_evaluation(
+        self,
+        event_id: str,
+        observed_at: str,
+        canonical_types: Iterable[str],
+    ) -> list[sqlite3.Row]:
+        types = [str(item) for item in canonical_types]
+        if not types:
+            return []
+        placeholders = ", ".join("?" for _ in types)
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    f"""
+                    SELECT * FROM canonical_outcomes
+                    WHERE event_id = ? AND observed_at = ?
+                      AND canonical_type IN ({placeholders})
+                      AND available = 1 AND odds IS NOT NULL
+                    ORDER BY odds ASC, canonical_id DESC
+                    """,
+                    [str(event_id), str(observed_at), *types],
+                ).fetchall()
+            )
+
+    def first_halftime_observed_at(self, event_id: str) -> str | None:
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT MIN(observed_at) AS observed_at
+                FROM event_states
+                WHERE event_id = ?
+                  AND (upper(period) IN ('HALF_TIME', 'HALFTIME', 'HT')
+                       OR upper(display_time) = 'HZ')
+                """,
+                (str(event_id),),
+            ).fetchone()
+        return str(row["observed_at"]) if row and row["observed_at"] else None
+
+    def final_snapshot_for_event(self, event_id: str) -> sqlite3.Row | None:
+        """Return the best persisted final result, never a disappeared live state."""
+
+        with self._lock:
+            return self.connection.execute(
+                """
+                SELECT * FROM snapshots
+                WHERE event_id = ?
+                  AND snapshot_type = 'FINAL'
+                  AND score_home IS NOT NULL AND score_away IS NOT NULL
+                  AND COALESCE(snapshot_quality, '') NOT IN ('FAILED')
+                ORDER BY observed_at DESC, snapshot_id DESC
+                LIMIT 1
+                """,
+                (str(event_id),),
+            ).fetchone()
+
+    def list_competitions(self, limit: int = 1000) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT competition_id, competition_name, country_or_region,
+                           first_seen_at, last_seen_at, events_observed
+                    FROM competitions
+                    ORDER BY competition_name COLLATE NOCASE,
+                             country_or_region COLLATE NOCASE, competition_id
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+            )
+
+    def update_event_competition_country(
+        self,
+        event_id: str,
+        country_or_region: str,
+        *,
+        observed_at: str | None = None,
+    ) -> bool:
+        """Backfill country metadata without changing the event snapshot."""
+
+        country = str(country_or_region).strip()
+        if not country:
+            return False
+        with self._lock:
+            with self.connection:
+                cursor = self.connection.execute(
+                    """
+                    UPDATE events
+                    SET competition_country = ?
+                    WHERE event_id = ?
+                      AND COALESCE(competition_country, '') != ?
+                    """,
+                    (country, str(event_id), country),
+                )
+                row = self.connection.execute(
+                    """
+                    SELECT competition_id, competition_name, first_seen_at, last_seen_at
+                    FROM events WHERE event_id = ?
+                    """,
+                    (str(event_id),),
+                ).fetchone()
+                if row and row["competition_id"]:
+                    stamp = observed_at or str(row["last_seen_at"] or row["first_seen_at"])
+                    self._upsert_competition_in_transaction(
+                        str(row["competition_id"]),
+                        str(row["competition_name"] or row["competition_id"]),
+                        country,
+                        str(row["first_seen_at"] or stamp),
+                        stamp,
+                    )
+            return cursor.rowcount > 0
+
+    def paper_portfolio_rows(self, *, include_archived: bool = True) -> list[sqlite3.Row]:
+        clause = "" if include_archived else " WHERE status != 'ARCHIVED'"
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    "SELECT * FROM paper_portfolios" + clause + " ORDER BY created_at, portfolio_id"
+                ).fetchall()
+            )
+
+    def paper_portfolio_row(self, portfolio_id: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.connection.execute(
+                "SELECT * FROM paper_portfolios WHERE portfolio_id = ?",
+                (str(portfolio_id),),
+            ).fetchone()
+
+    def paper_portfolio_competition_ids(self, portfolio_id: str) -> tuple[str, ...]:
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT competition_id FROM paper_portfolio_competitions
+                WHERE portfolio_id = ? ORDER BY competition_id
+                """,
+                (str(portfolio_id),),
+            ).fetchall()
+        return tuple(str(row["competition_id"]) for row in rows)
+
+    def insert_paper_portfolio(
+        self,
+        values: Mapping[str, Any],
+        competition_ids: Iterable[str] = (),
+    ) -> sqlite3.Row:
+        columns = (
+            "portfolio_id", "name", "created_at", "updated_at", "starting_bankroll",
+            "currency", "strategy_type", "stake_mode", "fixed_stake",
+            "bankroll_percentage", "min_stake", "max_stake", "minimum_win_roi",
+            "minimum_p1_buffer", "maximum_tipico_p1", "minimum_q_zero",
+            "minimum_q_two_plus", "max_quote_age_seconds", "entry_window_start_seconds",
+            "entry_window_end_seconds", "allow_all_competitions", "status", "version",
+        )
+        params = tuple(values.get(column) for column in columns)
+        with self._lock:
+            with self.connection:
+                self.connection.execute(
+                    f"INSERT INTO paper_portfolios ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                    params,
+                )
+                for competition_id in competition_ids:
+                    self.connection.execute(
+                        """
+                        INSERT OR IGNORE INTO paper_portfolio_competitions
+                            (portfolio_id, competition_id) VALUES (?, ?)
+                        """,
+                        (str(values["portfolio_id"]), str(competition_id)),
+                    )
+            row = self.connection.execute(
+                "SELECT * FROM paper_portfolios WHERE portfolio_id = ?",
+                (str(values["portfolio_id"]),),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Paper portfolio was not persisted")
+        return row
+
+    def update_paper_portfolio(
+        self,
+        portfolio_id: str,
+        values: Mapping[str, Any],
+        competition_ids: Iterable[str] | None = None,
+    ) -> sqlite3.Row | None:
+        allowed = {
+            "name", "updated_at", "starting_bankroll", "currency", "strategy_type",
+            "stake_mode", "fixed_stake", "bankroll_percentage", "min_stake", "max_stake",
+            "minimum_win_roi", "minimum_p1_buffer", "maximum_tipico_p1", "minimum_q_zero",
+            "minimum_q_two_plus", "max_quote_age_seconds", "entry_window_start_seconds",
+            "entry_window_end_seconds", "allow_all_competitions", "status", "version",
+        }
+        assignments = [(key, values[key]) for key in values if key in allowed]
+        if not assignments and competition_ids is None:
+            return self.paper_portfolio_row(portfolio_id)
+        with self._lock:
+            with self.connection:
+                if assignments:
+                    self.connection.execute(
+                        "UPDATE paper_portfolios SET "
+                        + ", ".join(f"{key} = ?" for key, _ in assignments)
+                        + " WHERE portfolio_id = ?",
+                        [value for _, value in assignments] + [str(portfolio_id)],
+                    )
+                if competition_ids is not None:
+                    self.connection.execute(
+                        "DELETE FROM paper_portfolio_competitions WHERE portfolio_id = ?",
+                        (str(portfolio_id),),
+                    )
+                    for competition_id in competition_ids:
+                        self.connection.execute(
+                            """
+                            INSERT OR IGNORE INTO paper_portfolio_competitions
+                                (portfolio_id, competition_id) VALUES (?, ?)
+                            """,
+                            (str(portfolio_id), str(competition_id)),
+                        )
+            return self.connection.execute(
+                "SELECT * FROM paper_portfolios WHERE portfolio_id = ?",
+                (str(portfolio_id),),
+            ).fetchone()
+
+    def set_paper_runtime_setting(self, key: str, value: str, updated_at: str) -> None:
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO paper_runtime_settings (setting_key, setting_value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_at = excluded.updated_at
+                """,
+                (str(key), str(value), str(updated_at)),
+            )
+
+    def get_paper_runtime_setting(self, key: str, default: str | None = None) -> str | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT setting_value FROM paper_runtime_settings WHERE setting_key = ?",
+                (str(key),),
+            ).fetchone()
+        return str(row["setting_value"]) if row else default
+
+    def paper_balance(self, portfolio_id: str) -> float:
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT p.starting_bankroll,
+                       COALESCE(SUM(t.amount), 0) AS ledger_delta
+                FROM paper_portfolios p
+                LEFT JOIN paper_bankroll_transactions t
+                  ON t.portfolio_id = p.portfolio_id
+                WHERE p.portfolio_id = ?
+                GROUP BY p.portfolio_id
+                """,
+                (str(portfolio_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown paper portfolio: {portfolio_id}")
+        return float(row["starting_bankroll"] or 0) + float(row["ledger_delta"] or 0)
+
+    def paper_trade_rows(
+        self,
+        portfolio_id: str | None = None,
+        *,
+        status: str | None = None,
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if portfolio_id:
+            clauses.append("portfolio_id = ?")
+            params.append(str(portfolio_id))
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status))
+        params.append(max(1, int(limit)))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    "SELECT * FROM paper_trades" + where
+                    + " ORDER BY created_at DESC, paper_trade_id DESC LIMIT ?",
+                    params,
+                ).fetchall()
+            )
+
+    def paper_trade_row(self, paper_trade_id: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.connection.execute(
+                "SELECT * FROM paper_trades WHERE paper_trade_id = ?",
+                (str(paper_trade_id),),
+            ).fetchone()
+
+    def log_paper_signal(self, values: Mapping[str, Any]) -> None:
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO paper_signal_log (
+                    portfolio_id, event_id, evaluation_id, observed_at,
+                    decision, reason, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(values["portfolio_id"]), str(values["event_id"]),
+                    values.get("evaluation_id"), str(values["observed_at"]),
+                    str(values["decision"]), str(values["reason"]),
+                    _json(values.get("details", {})),
+                ),
+            )
+
+    def reserve_paper_trade(self, snapshot: Mapping[str, Any]) -> tuple[bool, sqlite3.Row | None, str]:
+        """Atomically reserve bankroll and create one immutable entry snapshot."""
+
+        portfolio_id = str(snapshot["portfolio_id"])
+        event_id = str(snapshot["event_id"])
+        strategy_type = str(snapshot["strategy_type"])
+        stake = float(snapshot["stake_total"])
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self.connection.execute(
+                    """
+                    SELECT * FROM paper_trades
+                    WHERE portfolio_id = ? AND event_id = ? AND strategy_type = ?
+                    LIMIT 1
+                    """,
+                    (portfolio_id, event_id, strategy_type),
+                ).fetchone()
+                if existing is not None:
+                    self.connection.rollback()
+                    return False, existing, "ALREADY_ENTERED"
+                portfolio = self.connection.execute(
+                    "SELECT status FROM paper_portfolios WHERE portfolio_id = ?",
+                    (portfolio_id,),
+                ).fetchone()
+                if portfolio is None:
+                    self.connection.rollback()
+                    return False, None, "UNKNOWN_PORTFOLIO"
+                if str(portfolio["status"]).upper() != "ACTIVE":
+                    self.connection.rollback()
+                    return False, None, "PORTFOLIO_NOT_ACTIVE"
+                balance_row = self.connection.execute(
+                    """
+                    SELECT p.starting_bankroll + COALESCE(SUM(t.amount), 0) AS balance
+                    FROM paper_portfolios p
+                    LEFT JOIN paper_bankroll_transactions t
+                      ON t.portfolio_id = p.portfolio_id
+                    WHERE p.portfolio_id = ? GROUP BY p.portfolio_id
+                    """,
+                    (portfolio_id,),
+                ).fetchone()
+                balance_before = float(balance_row["balance"] or 0) if balance_row else 0.0
+                if stake <= 0 or stake > balance_before + 1e-9:
+                    self.connection.rollback()
+                    return False, None, "INSUFFICIENT_BANKROLL"
+                balance_after = balance_before - stake
+                trade_columns = (
+                    "paper_trade_id", "portfolio_id", "event_id", "competition_id",
+                    "competition_name", "competition_country", "created_at",
+                    "strategy_evaluation_id", "strategy_type", "strategy_version",
+                    "normalizer_version", "home_team", "away_team", "ht_score_home",
+                    "ht_score_away", "zero_market_id", "zero_outcome_id",
+                    "zero_market_type", "zero_market_caption", "zero_outcome_caption",
+                    "q_zero", "zero_quote_observed_at", "zero_quote_age_seconds",
+                    "two_plus_market_id", "two_plus_outcome_id", "two_plus_market_type",
+                    "two_plus_market_caption", "two_plus_outcome_caption", "q_two_plus",
+                    "two_plus_quote_observed_at", "two_plus_quote_age_seconds", "stake_total",
+                    "stake_zero", "stake_two_plus", "payout_zero", "payout_two_plus",
+                    "p_zero", "p_one", "p_two_plus", "p1_max", "p1_tipico", "p1_buffer",
+                    "win_roi", "bankroll_before", "bankroll_after", "rank", "status",
+                    "entry_snapshot_json",
+                )
+                trade_params = tuple(snapshot.get(column) for column in trade_columns[:-1]) + (
+                    _json(snapshot.get("entry_snapshot", dict(snapshot))),
+                )
+                self.connection.execute(
+                    f"INSERT INTO paper_trades ({', '.join(trade_columns)}) VALUES ({', '.join('?' for _ in trade_columns)})",
+                    trade_params,
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO paper_bankroll_transactions (
+                        transaction_id, portfolio_id, paper_trade_id, created_at,
+                        transaction_type, amount, balance_before, balance_after,
+                        idempotency_key, note
+                    ) VALUES (?, ?, ?, ?, 'STAKE_RESERVED', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(snapshot["reservation_transaction_id"]), portfolio_id,
+                        str(snapshot["paper_trade_id"]), str(snapshot["created_at"]),
+                        -stake, balance_before, balance_after,
+                        str(snapshot["reservation_idempotency_key"]),
+                        "Paper-Trade Einsatz reserviert",
+                    ),
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+            row = self.connection.execute(
+                "SELECT * FROM paper_trades WHERE paper_trade_id = ?",
+                (str(snapshot["paper_trade_id"]),),
+            ).fetchone()
+        return True, row, "CREATED"
+
+    def settle_paper_trade(
+        self,
+        paper_trade_id: str,
+        settlement: Mapping[str, Any],
+    ) -> tuple[bool, sqlite3.Row | None]:
+        """Settle once; settlement columns are the only mutable trade fields."""
+
+        trade_id = str(paper_trade_id)
+        status = str(settlement["status"])
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                trade = self.connection.execute(
+                    "SELECT * FROM paper_trades WHERE paper_trade_id = ?",
+                    (trade_id,),
+                ).fetchone()
+                if trade is None:
+                    self.connection.rollback()
+                    return False, None
+                if str(trade["status"]).upper() != "OPEN":
+                    self.connection.rollback()
+                    return False, trade
+                stake = float(trade["stake_total"] or 0)
+                return_amount = float(settlement.get("return_amount") or 0)
+                release = stake if status in {"VOID", "UNRESOLVED"} else 0.0
+                ledger_amount = return_amount + release
+                balance_row = self.connection.execute(
+                    """
+                    SELECT p.starting_bankroll + COALESCE(SUM(t.amount), 0) AS balance
+                    FROM paper_portfolios p
+                    LEFT JOIN paper_bankroll_transactions t
+                      ON t.portfolio_id = p.portfolio_id
+                    WHERE p.portfolio_id = ? GROUP BY p.portfolio_id
+                    """,
+                    (str(trade["portfolio_id"]),),
+                ).fetchone()
+                balance_before = float(balance_row["balance"] or 0) if balance_row else 0.0
+                balance_after = balance_before + ledger_amount
+                self.connection.execute(
+                    """
+                    INSERT INTO paper_bankroll_transactions (
+                        transaction_id, portfolio_id, paper_trade_id, created_at,
+                        transaction_type, amount, balance_before, balance_after,
+                        idempotency_key, note
+                    ) VALUES (?, ?, ?, ?, 'TRADE_SETTLED', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(settlement["transaction_id"]), str(trade["portfolio_id"]),
+                        trade_id, str(settlement["settled_at"]), ledger_amount,
+                        balance_before, balance_after, str(settlement["idempotency_key"]),
+                        str(settlement.get("note") or "Paper-Trade abgerechnet"),
+                    ),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE paper_trades SET
+                        status = ?, settled_at = ?, final_score_home = ?,
+                        final_score_away = ?, second_half_goals = ?,
+                        settlement_reason = ?, return_amount = ?, pnl = ?
+                    WHERE paper_trade_id = ? AND status = 'OPEN'
+                    """,
+                    (
+                        status, str(settlement["settled_at"]),
+                        settlement.get("final_score_home"), settlement.get("final_score_away"),
+                        settlement.get("second_half_goals"), str(settlement.get("reason") or ""),
+                        return_amount, float(settlement.get("pnl") or 0), trade_id,
+                    ),
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+            row = self.connection.execute(
+                "SELECT * FROM paper_trades WHERE paper_trade_id = ?", (trade_id,)
+            ).fetchone()
+        return True, row
+
+    def invalidate_paper_trade(
+        self,
+        paper_trade_id: str,
+        *,
+        reason: str,
+        settled_at: str,
+        transaction_id: str,
+        idempotency_key: str,
+    ) -> tuple[bool, sqlite3.Row | None]:
+        return self.settle_paper_trade(
+            paper_trade_id,
+            {
+                "status": "VOID",
+                "settled_at": settled_at,
+                "final_score_home": None,
+                "final_score_away": None,
+                "second_half_goals": None,
+                "reason": reason,
+                "return_amount": 0.0,
+                "pnl": 0.0,
+                "transaction_id": transaction_id,
+                "idempotency_key": idempotency_key,
+                "note": "Trade manuell invalidiert; Einsatz freigegeben",
+            },
+        )
+
     @staticmethod
     def _history_status(outcome: Outcome) -> str:
         if outcome.status:
@@ -1064,6 +1802,13 @@ class Database:
             "market_presence",
             "canonical_outcomes",
             "strategy_evaluations",
+            "paper_portfolios",
+            "paper_portfolio_competitions",
+            "paper_trades",
+            "paper_bankroll_transactions",
+            "paper_signal_log",
+            "paper_runtime_settings",
+            "paper_worker_runs",
         }
         if table not in allowed:
             raise ValueError(f"Unsupported table: {table}")
@@ -1176,7 +1921,8 @@ class Database:
             return list(
                 self.connection.execute(
                     """
-                    SELECT e.event_id, e.competition_name, e.home_team, e.away_team,
+                    SELECT e.event_id, e.competition_name, e.competition_country,
+                           e.home_team, e.away_team,
                            e.kickoff_time, e.status, e.period, e.display_time,
                            e.score_home, e.score_away, e.ht_score_home,
                            e.ht_score_away, e.first_seen_at, e.last_seen_at,

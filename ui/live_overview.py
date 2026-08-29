@@ -27,16 +27,21 @@ def render_live_overview(
         st.info("Keine Live-Fußballspiele im aktuellen Tipico-Feed.")
         return None
 
-    grouped: dict[str, list[LiveEvent]] = defaultdict(list)
+    grouped: dict[tuple[str, str], list[LiveEvent]] = defaultdict(list)
     for event in events:
-        grouped[event.competition_name or "Unbekannter Wettbewerb"].append(event)
+        grouped[
+            (
+                event.competition_name or "Unbekannter Wettbewerb",
+                event.competition_country or "Land unbekannt",
+            )
+        ].append(event)
 
     selected = selected_event_id
     st.caption("Alle vom Tipico-Livefeed gelieferten Fußball-Events werden angezeigt.")
-    for competition_name in sorted(grouped, key=str.casefold):
-        competition_events = grouped[competition_name]
+    for competition_name, country in sorted(grouped, key=lambda item: (item[0].casefold(), item[1].casefold())):
+        competition_events = grouped[(competition_name, country)]
         with st.expander(
-            f"{competition_name} ({len(competition_events)})",
+            f"{competition_name} · {country} ({len(competition_events)})",
             expanded=False,
         ):
             header = st.columns([1.0, 3.0, 1.0, 0.9, 0.9, 1.2])

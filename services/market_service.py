@@ -98,6 +98,8 @@ class MarketService:
             )
             if overview_event is not None:
                 details.event.competition_name = overview_event.competition_name
+                if not details.event.competition_country:
+                    details.event.competition_country = overview_event.competition_country
             observed_at = response.metrics.response_received_at
             raw_path = self._store_raw(
                 resolved_event_id,

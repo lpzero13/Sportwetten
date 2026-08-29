@@ -5,6 +5,7 @@ from .event_service import EventRefreshResult, EventService
 from .halftime_scanner import HalftimeScanItem, HalftimeScannerService
 from .market_service import MarketRefreshResult, MarketService
 from .upcoming_service import UpcomingRefreshResult, UpcomingService
+from paper.service import PaperTradingService
 
 __all__ = [
     "Collector",
@@ -16,4 +17,5 @@ __all__ = [
     "MarketService",
     "UpcomingRefreshResult",
     "UpcomingService",
+    "PaperTradingService",
 ]

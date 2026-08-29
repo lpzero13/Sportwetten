@@ -155,6 +155,9 @@ class MarketIntelligenceService:
                 p1_max=strategy.p1_max,
                 p1_tipico=strategy.p1_tipico,
                 p1_buffer=strategy.p1_buffer,
+                p_zero=analysis.probability.p0,
+                p_one=analysis.probability.p1,
+                p_two_plus=analysis.probability.p2_plus,
                 normalizer_version=self.normalizer.version,
             )
         except Exception as exc:  # persistence must never interrupt live polling

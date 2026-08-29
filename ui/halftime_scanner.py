@@ -101,6 +101,7 @@ def render_halftime_scanner(
                 "Rang": index,
                 "Spiel": f"{event.home_team} – {event.away_team}",
                 "Liga": event.competition_name,
+                "Land": event.competition_country or "—",
                 "HZ-Stand": event.score_label,
                 "Quote 0": _odds(strategy.q_zero),
                 "Quote 2+": _odds(strategy.q_two_plus),
@@ -126,6 +127,7 @@ def render_halftime_scanner(
                     {
                         "Spiel": f"{item.event.home_team} – {item.event.away_team}",
                         "Liga": item.event.competition_name,
+                        "Land": item.event.competition_country or "—",
                         "Stand": item.event.score_label,
                         "Quelle": item.source,
                         "Status": (

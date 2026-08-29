@@ -48,6 +48,7 @@ def render_upcoming(
             {
                 "Start": _kickoff(event),
                 "Liga": event.competition_name,
+                "Land": event.competition_country or "—",
                 "Spiel": f"{event.home_team} – {event.away_team}",
                 "Market Count": (
                     str(event.bet_markets_count)
@@ -60,7 +61,10 @@ def render_upcoming(
     st.subheader("Pre-Match Quoten")
     event_options = [event.event_id for event in events]
     labels = {
-        event.event_id: f"{event.home_team} – {event.away_team} · {event.competition_name}"
+        event.event_id: (
+            f"{event.home_team} – {event.away_team} · {event.competition_name} · "
+            f"{event.competition_country or 'Land unbekannt'}"
+        )
         for event in events
     }
     selected_id = st.selectbox(

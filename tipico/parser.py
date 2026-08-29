@@ -124,6 +124,38 @@ def _competition_name_from_detail(event: Mapping[str, Any]) -> str:
     return _string(event.get("competitionId"), "Unbekannter Wettbewerb")
 
 
+def _competition_country_from_detail(event: Mapping[str, Any]) -> str | None:
+    """Extract Tipico's country/region without confusing it with the league."""
+
+    def clean(value: Any) -> str:
+        # A few previously archived payloads contain the Unicode replacement
+        # character in this country name. Tipico's current payload spells it
+        # correctly; repairing this known value keeps historical rows usable.
+        return _string(value).strip().replace("�sterreich", "Österreich")
+
+    for key in ("countryName", "country", "regionName", "region", "parentName"):
+        value = clean(event.get(key))
+        if value and value.casefold() not in {"fußball", "fussball", "soccer"}:
+            return value
+    groups = _list(event.get("groups"))
+    competition_name = _competition_name_from_detail(event).casefold()
+    for value in groups[1:]:
+        candidate = clean(value)
+        if candidate and candidate.casefold() not in {
+            competition_name,
+            "fußball",
+            "fussball",
+            "soccer",
+        }:
+            return candidate
+    event_info = _string(event.get("eventInfo"))
+    if " / " in event_info:
+        prefix = clean(event_info.split(" / ", 1)[0])
+        if prefix and prefix.casefold() != competition_name:
+            return prefix
+    return None
+
+
 def _competition_lookup(live: Mapping[str, Any]) -> dict[str, str]:
     result: dict[str, str] = {}
     competition_map = _mapping(live.get("sportCompetitionMap"))
@@ -140,6 +172,26 @@ def _competition_lookup(live: Mapping[str, Any]) -> dict[str, str]:
     return result
 
 
+def _competition_country_lookup(live: Mapping[str, Any]) -> dict[str, str]:
+    """Return Tipico's parentName/country for every competition ID."""
+
+    result: dict[str, str] = {}
+    competition_map = _mapping(live.get("sportCompetitionMap"))
+    for entries in competition_map.values():
+        if isinstance(entries, Mapping):
+            entries = list(entries.values())
+        for item in _list(entries):
+            if not isinstance(item, Mapping):
+                continue
+            competition_id = _id(
+                item.get("groupIdString") or item.get("groupId") or item.get("id")
+            )
+            country = _competition_country_from_detail(item)
+            if competition_id and country:
+                result[competition_id] = country
+    return result
+
+
 def _red_cards(event: Mapping[str, Any]) -> tuple[int | None, int | None]:
     values = event.get("redCards")
     if values is None:
@@ -153,6 +205,7 @@ def _build_event(
     event_id: str | None = None,
     scores: Mapping[str, Any] | None = None,
     competition_name: str | None = None,
+    competition_country: str | None = None,
     sport: str = "soccer",
 ) -> LiveEvent:
     resolved_id = _id(event.get("id")) or event_id or ""
@@ -197,6 +250,7 @@ def _build_event(
         break_before=event.get("breakBefore"),
         clock_data=clock_data,
         raw_data=dict(event),
+        competition_country=competition_country or _competition_country_from_detail(event),
     )
 
 
@@ -218,6 +272,7 @@ def parse_live_feed(
         if (resolved := _id(item))
     }
     competition_names = _competition_lookup(live)
+    competition_countries = _competition_country_lookup(live)
     normalized: list[LiveEvent] = []
 
     for key, raw_event in events.items():
@@ -251,6 +306,10 @@ def parse_live_feed(
                     competition_id or "",
                     _competition_name_from_detail(raw_event),
                 ),
+                competition_country=competition_countries.get(
+                    competition_id or "",
+                    _competition_country_from_detail(raw_event),
+                ),
                 sport="soccer",
             )
         )
@@ -281,15 +340,7 @@ def parse_upcoming_feed(
         if (resolved := _id(item))
     }
     competition_names = _competition_lookup(container)
-    competition_regions: dict[str, str] = {}
-    for entries in _mapping(container.get("sportCompetitionMap")).values():
-        for item in _list(entries):
-            if not isinstance(item, Mapping):
-                continue
-            competition_id = _id(item.get("groupIdString") or item.get("groupId") or item.get("id"))
-            parent = item.get("parentName")
-            if competition_id and parent:
-                competition_regions[competition_id] = _string(parent)
+    competition_regions = _competition_country_lookup(container)
 
     normalized: list[LiveEvent] = []
     for key, raw_event in events.items():
@@ -312,6 +363,10 @@ def parse_upcoming_feed(
             event_id=event_id,
             scores=scores.get(event_id) or scores.get(key),
             competition_name=competition_name,
+            competition_country=competition_regions.get(
+                competition_id or "",
+                _competition_country_from_detail(raw_event),
+            ),
             sport="soccer",
         )
         region = competition_regions.get(competition_id or "")
