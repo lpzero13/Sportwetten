@@ -1,0 +1,13 @@
+.venv/
+work/
+work/v01-venv/
+work/validation-runtime/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+archived_logs/
+latest_logs/

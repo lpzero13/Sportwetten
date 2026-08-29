@@ -1,0 +1,79 @@
+{
+  "LIVE": {
+    "availableMarkets": {
+      "soccer": [
+        "standard",
+        "standard-rest",
+        "points-more-less-rest",
+        "next-point",
+        "handicap",
+        "score-both",
+        "section-points-more-less",
+        "double-chance",
+        "head-to-head"
+      ]
+    },
+    "sportCompetitionMap": {
+      "soccer": [
+        {
+          "groupId": 104124301,
+          "groupIdString": "104124301",
+          "name": "We-League, Frauen",
+          "parentName": "Japan",
+          "groupInfo": "Japan / We-League, Frauen",
+          "icon": "soccer"
+        }
+      ]
+    },
+    "competitionEventMap": {
+      "104124301": [
+        "721621110"
+      ]
+    },
+    "events": {
+      "721621110": {
+        "eventStartTime": 1787994219000,
+        "status": "running",
+        "type": "live",
+        "eventName": "Nagano Parceiro (F) - NTV Beleza (F)",
+        "team1": "Nagano Parceiro (F)",
+        "team2": "NTV Beleza (F)",
+        "team1Id": 249397,
+        "team2Id": 249393,
+        "id": "721621110",
+        "competitionId": 104124301,
+        "sportRadarMatchId": 72339002,
+        "redCards": [
+          "0",
+          "0"
+        ],
+        "date": "50'",
+        "eventInfo": "We-League, Frauen / Nagano Parceiro (F) - NTV Beleza (F)",
+        "betMarketsCount": 16,
+        "extraTime": false,
+        "penalties": false,
+        "breakBefore": null,
+        "betGeniusId": null
+      }
+    },
+    "eventsBySport": {
+      "soccer": [
+        "721621110"
+      ]
+    },
+    "scores": {
+      "721621110": {
+        "currentScore": [
+          "1",
+          "1"
+        ],
+        "htScore": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    "pushEligible": false,
+    "live": true
+  }
+}

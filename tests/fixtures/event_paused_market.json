@@ -1,0 +1,77 @@
+{
+  "event": {
+    "id": "721525010",
+    "competitionId": 3973301,
+    "sport": "soccer",
+    "status": "running",
+    "eventState": "running",
+    "groups": [
+      "Premier League",
+      "Hong Kong",
+      "Fußball"
+    ],
+    "team1": "Golik North District",
+    "team2": "Kitchee SC",
+    "date": "67'",
+    "eventScores": {
+      "currentScore": [
+        "0",
+        "0"
+      ],
+      "htScore": [
+        "0",
+        "0"
+      ]
+    },
+    "betMarketsCount": 34
+  },
+  "categories": [
+    {
+      "id": 0,
+      "name": "Hauptwetten"
+    }
+  ],
+  "categoryOddGroupMapSectioned": {
+    "0": [
+      {
+        "oddGroupTitle": "+/- (1,5) für Golik North District",
+        "oddGroupType": "team-points-more-less",
+        "oddGroupIds": [
+          86538516610
+        ]
+      }
+    ]
+  },
+  "oddGroups": {
+    "86538516610": {
+      "id": 86538516610,
+      "caption": "+/- (1,5) für Golik North District",
+      "type": "team-points-more-less",
+      "fixedParam": "1:1.5",
+      "standard": false,
+      "shortCaption": "1,5 Tore"
+    }
+  },
+  "oddGroupResultsMap": {
+    "86538516610": [
+      233210274610,
+      233210274710
+    ]
+  },
+  "results": {
+    "233210274610": {
+      "id": 233210274610,
+      "caption": "+",
+      "quote": "10",
+      "quoteFloatValue": 10.0,
+      "choiceParam": "+"
+    },
+    "233210274710": {
+      "id": 233210274710,
+      "caption": "-",
+      "quoteFloatValue": 1.0,
+      "status": "paused",
+      "choiceParam": "-"
+    }
+  }
+}

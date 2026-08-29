@@ -1,0 +1,210 @@
+{
+  "event": {
+    "templateName": "topSoccer",
+    "id": "721621110",
+    "competitionId": 104124301,
+    "sport": "soccer",
+    "status": "running",
+    "live": true,
+    "groups": [
+      "We-League, Frauen",
+      "Japan",
+      "Fußball"
+    ],
+    "team1": "Nagano Parceiro (F)",
+    "team2": "NTV Beleza (F)",
+    "team1Id": 249397,
+    "team2Id": 249393,
+    "date": "50'",
+    "eventStartTime": 1787994219000,
+    "eventScores": {
+      "currentScore": [
+        "1",
+        "1"
+      ],
+      "htScore": [
+        "1",
+        "1"
+      ]
+    },
+    "sportRadarMatchId": 72339002,
+    "redCards": [
+      "0",
+      "0"
+    ],
+    "betMarketsCount": 16,
+    "extraTime": false,
+    "penalties": false,
+    "breakBefore": null,
+    "eventState": "running",
+    "clockData": {
+      "sectionSecondsPlayed": 248,
+      "clockTimestamp": 1787998095859,
+      "currentSectionDuration": 2700,
+      "passedSectionsTime": 2700,
+      "sectionTime": 0,
+      "sectionNumber": 2
+    },
+    "eventPoints": [
+      {
+        "score": "1:1",
+        "action": "point",
+        "showScore": true,
+        "minute": "34'",
+        "ht": false,
+        "partOne": true
+      },
+      {
+        "score": "",
+        "action": "blank",
+        "showScore": true,
+        "minute": "conference.timeCol.HZ",
+        "ht": true,
+        "partOne": true
+      }
+    ]
+  },
+  "categories": [
+    {
+      "id": 0,
+      "name": "Hauptwetten"
+    },
+    {
+      "id": 1,
+      "name": "Über/Unter"
+    },
+    {
+      "id": 2,
+      "name": "Handicaps"
+    }
+  ],
+  "categoryOddGroupMapSectioned": {
+    "0": [
+      {
+        "oddGroupTitle": "Tipp",
+        "oddGroupType": "standard",
+        "oddGroupIds": [
+          86572551010
+        ]
+      },
+      {
+        "oddGroupTitle": "Tore ab jetzt (+/- 0,5)",
+        "oddGroupType": "points-more-less-rest",
+        "oddGroupIds": [
+          86623140510
+        ]
+      }
+    ],
+    "1": [
+      {
+        "oddGroupTitle": "Tore ab jetzt (+/- 0,5)",
+        "oddGroupType": "points-more-less-rest",
+        "oddGroupIds": [
+          86623140510
+        ]
+      }
+    ]
+  },
+  "oddGroups": {
+    "86572551010": {
+      "id": 86572551010,
+      "caption": "Tipp",
+      "type": "standard",
+      "fixedParam": "",
+      "standard": true,
+      "shortCaption": ""
+    },
+    "86623140510": {
+      "id": 86623140510,
+      "caption": "Tore ab jetzt (+/- 0,5)",
+      "type": "points-more-less-rest",
+      "fixedParam": "3:0.5",
+      "standard": false,
+      "shortCaption": "0,5 Tore"
+    },
+    "86572551510": {
+      "id": 86572551510,
+      "caption": "Handicap (3:0)",
+      "type": "handicap",
+      "fixedParam": "3:0",
+      "standard": false,
+      "shortCaption": "3:0"
+    }
+  },
+  "oddGroupResultsMap": {
+    "86572551010": [
+      233303042510,
+      233303042610,
+      233303042710
+    ],
+    "86623140510": [
+      233444205010,
+      233444205110
+    ],
+    "86572551510": [
+      233555000010,
+      233555000110,
+      233555000210
+    ]
+  },
+  "results": {
+    "233303042510": {
+      "id": 233303042510,
+      "caption": "1",
+      "quote": "11",
+      "quoteFloatValue": 11.0,
+      "choiceParam": "1"
+    },
+    "233303042610": {
+      "id": 233303042610,
+      "caption": "X",
+      "quote": "2.90",
+      "quoteFloatValue": 2.9,
+      "choiceParam": "X"
+    },
+    "233303042710": {
+      "id": 233303042710,
+      "caption": "2",
+      "quote": "1.50",
+      "quoteFloatValue": 1.5,
+      "choiceParam": "2"
+    },
+    "233444205010": {
+      "id": 233444205010,
+      "caption": "+",
+      "quote": "1.22",
+      "quoteFloatValue": 1.22,
+      "choiceParam": "+"
+    },
+    "233444205110": {
+      "id": 233444205110,
+      "caption": "-",
+      "quote": "3.60",
+      "quoteFloatValue": 3.6,
+      "choiceParam": "-"
+    },
+    "233555000010": {
+      "id": 233555000010,
+      "caption": "1",
+      "quote": "4.10",
+      "quoteFloatValue": 4.1,
+      "choiceParam": "1"
+    },
+    "233555000110": {
+      "id": 233555000110,
+      "caption": "X",
+      "quote": "3.30",
+      "quoteFloatValue": 3.3,
+      "choiceParam": "X"
+    },
+    "233555000210": {
+      "id": 233555000210,
+      "caption": "2",
+      "quote": "1.80",
+      "quoteFloatValue": 1.8,
+      "choiceParam": "2"
+    }
+  },
+  "oddsDividedOnColumns": {},
+  "categoryOddsDividedOnColumns": {}
+}
