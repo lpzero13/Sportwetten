@@ -6,10 +6,12 @@ from pathlib import Path
 
 import streamlit as st
 
+from fotmob.service import FotMobService
 from services.event_service import EventService
 from services.market_service import MarketService
 from storage.database import Database
 from ui.time_format import format_local_datetime
+from ui.fotmob import render_fotmob_debug
 
 
 def render_debug_page(
@@ -19,6 +21,7 @@ def render_debug_page(
     *,
     database_path: Path,
     raw_storage_enabled: bool,
+    fotmob_service: FotMobService | None = None,
 ) -> None:
     st.title("Debug / System")
     metrics = event_service.last_metrics or market_service.last_metrics
@@ -80,3 +83,7 @@ def render_debug_page(
         st.dataframe(rows, hide_index=True, width="stretch")
     else:
         st.info("Noch keine Quotenänderungen gespeichert.")
+
+    if fotmob_service is not None:
+        with st.expander("FotMob Access & Matching", expanded=True):
+            render_fotmob_debug(fotmob_service)

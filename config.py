@@ -25,6 +25,26 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_nonnegative_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def _env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     value = os.getenv(name)
     if value is None:
@@ -77,6 +97,22 @@ SNAPSHOT_85_ENABLED = True
 SNAPSHOT_90_ENABLED = True
 SNAPSHOT_FINAL_ENABLED = True
 
+# FotMob is an optional enrichment source.  It is deliberately disabled by
+# default: Tipico collection, analysis and paper trading must remain fully
+# operational when FotMob is unavailable or not permitted in the deployment.
+FOTMOB_ENABLED = False
+FOTMOB_BASE_URL = "https://www.fotmob.com"
+FOTMOB_API_BASE_URL = "https://www.fotmob.com/api"
+FOTMOB_MATCH_DETAILS_PATH = "/matchDetails?matchId={match_id}"
+FOTMOB_POLL_SECONDS = 30
+FOTMOB_TIMEOUT_SECONDS = 10
+FOTMOB_MAX_RETRIES = 3
+FOTMOB_MIN_REQUEST_INTERVAL_SECONDS = 1.0
+FOTMOB_MATCHING_TOLERANCE_MINUTES = 15
+FOTMOB_HT_STABLE_DELAY_SECONDS = 45
+FOTMOB_SNAPSHOT_OUTBOX_EXPORT_INTERVAL_SECONDS = 300
+FOTMOB_SNAPSHOT_OUTBOX_BATCH_SIZE = 100
+
 
 @dataclass(slots=True)
 class Settings:
@@ -124,6 +160,18 @@ class Settings:
     snapshot_85_enabled: bool = SNAPSHOT_85_ENABLED
     snapshot_90_enabled: bool = SNAPSHOT_90_ENABLED
     snapshot_final_enabled: bool = SNAPSHOT_FINAL_ENABLED
+    fotmob_enabled: bool = FOTMOB_ENABLED
+    fotmob_base_url: str = FOTMOB_BASE_URL
+    fotmob_api_base_url: str = FOTMOB_API_BASE_URL
+    fotmob_match_details_path: str = FOTMOB_MATCH_DETAILS_PATH
+    fotmob_poll_seconds: int = FOTMOB_POLL_SECONDS
+    fotmob_timeout_seconds: int = FOTMOB_TIMEOUT_SECONDS
+    fotmob_max_retries: int = FOTMOB_MAX_RETRIES
+    fotmob_min_request_interval_seconds: float = FOTMOB_MIN_REQUEST_INTERVAL_SECONDS
+    fotmob_matching_tolerance_minutes: int = FOTMOB_MATCHING_TOLERANCE_MINUTES
+    fotmob_ht_stable_delay_seconds: int = FOTMOB_HT_STABLE_DELAY_SECONDS
+    fotmob_snapshot_outbox_export_interval_seconds: int = FOTMOB_SNAPSHOT_OUTBOX_EXPORT_INTERVAL_SECONDS
+    fotmob_snapshot_outbox_batch_size: int = FOTMOB_SNAPSHOT_OUTBOX_BATCH_SIZE
 
     @property
     def database_path(self) -> Path:
@@ -234,6 +282,39 @@ class Settings:
             snapshot_85_enabled=_env_bool("SNAPSHOT_85_ENABLED", SNAPSHOT_85_ENABLED),
             snapshot_90_enabled=_env_bool("SNAPSHOT_90_ENABLED", SNAPSHOT_90_ENABLED),
             snapshot_final_enabled=_env_bool("SNAPSHOT_FINAL_ENABLED", SNAPSHOT_FINAL_ENABLED),
+            fotmob_enabled=_env_bool("FOTMOB_ENABLED", FOTMOB_ENABLED),
+            fotmob_base_url=os.getenv("FOTMOB_BASE_URL", FOTMOB_BASE_URL).rstrip("/"),
+            fotmob_api_base_url=os.getenv("FOTMOB_API_BASE_URL", FOTMOB_API_BASE_URL).rstrip("/"),
+            fotmob_match_details_path=os.getenv(
+                "FOTMOB_MATCH_DETAILS_PATH", FOTMOB_MATCH_DETAILS_PATH
+            ),
+            fotmob_poll_seconds=_env_int("FOTMOB_POLL_SECONDS", FOTMOB_POLL_SECONDS),
+            fotmob_timeout_seconds=_env_int(
+                "FOTMOB_TIMEOUT_SECONDS", FOTMOB_TIMEOUT_SECONDS
+            ),
+            fotmob_max_retries=_env_nonnegative_int("FOTMOB_MAX_RETRIES", FOTMOB_MAX_RETRIES),
+            fotmob_min_request_interval_seconds=max(
+                0.0,
+                _env_float(
+                    "FOTMOB_MIN_REQUEST_INTERVAL_SECONDS",
+                    FOTMOB_MIN_REQUEST_INTERVAL_SECONDS,
+                ),
+            ),
+            fotmob_matching_tolerance_minutes=_env_int(
+                "FOTMOB_MATCHING_TOLERANCE_MINUTES",
+                FOTMOB_MATCHING_TOLERANCE_MINUTES,
+            ),
+            fotmob_ht_stable_delay_seconds=_env_int(
+                "FOTMOB_HT_STABLE_DELAY_SECONDS", FOTMOB_HT_STABLE_DELAY_SECONDS
+            ),
+            fotmob_snapshot_outbox_export_interval_seconds=_env_int(
+                "FOTMOB_SNAPSHOT_OUTBOX_EXPORT_INTERVAL_SECONDS",
+                FOTMOB_SNAPSHOT_OUTBOX_EXPORT_INTERVAL_SECONDS,
+            ),
+            fotmob_snapshot_outbox_batch_size=_env_int(
+                "FOTMOB_SNAPSHOT_OUTBOX_BATCH_SIZE",
+                FOTMOB_SNAPSHOT_OUTBOX_BATCH_SIZE,
+            ),
         )
 
 

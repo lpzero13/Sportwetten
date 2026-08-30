@@ -92,11 +92,20 @@ sed \
     -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
     "$INSTALL_DIR/deploy/wetten-cleanup.timer" \
     > /etc/systemd/system/wetten-cleanup.timer
+sed \
+    -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
+    -e "s|__SERVICE_USER__|$SERVICE_USER|g" \
+    -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
+    "$INSTALL_DIR/deploy/wetten-fotmob.service" \
+    > /etc/systemd/system/wetten-fotmob.service
 
 # V0.3 service names are retired in favour of the explicit V0.4 names.
 systemctl disable --now tipico-observer.service tipico-collector.service 2>/dev/null || true
 
 systemctl daemon-reload
+# FotMob remains installed but intentionally disabled by default.  Start it
+# explicitly only after setting FOTMOB_ENABLED=true in the env file.
+systemctl disable --now wetten-fotmob.service 2>/dev/null || true
 systemctl enable wetten-ui.service wetten-collector.service wetten-paper.service wetten-cleanup.timer
 systemctl restart wetten-ui.service
 systemctl restart wetten-collector.service

@@ -1,4 +1,4 @@
-# Tipico Market Intelligence Dashboard V0.4
+# Tipico Market Intelligence Dashboard V0.5
 
 Lokales, read-only Streamlit-Tool zur Beobachtung des öffentlichen Tipico-Live-Fußballfeeds
 mit getrenntem Paper-Trading für die validierte `ZERO_OR_2PLUS`-Strategie.
@@ -31,8 +31,10 @@ Der aktuelle Projektumfang umfasst:
 - unveränderlicher Paper-Einstiegssnapshot, idempotentes Bankroll-Ledger und Settlement
 - Paper-Trading-Analytics, Calibration nach Tipico-P1 und CSV-Export
 - automatische Geräteerkennung über Browser-User-Agent plus responsive Mobilansicht
+- optionales FotMob-Discovery, provider-neutrales Match-Matching und
+  informatives Live-Enrichment ohne Einfluss auf Quoten, Strategie oder Paper Trading
 
-Nicht enthalten sind eigene ML-Wahrscheinlichkeiten, andere Anbieter, FotMob,
+Nicht enthalten sind eigene ML-Wahrscheinlichkeiten, FotMob-Quoten,
 WebSocket/STOMP, Inhaltsfilter, automatische Optimierung und echte Wettabgabe.
 
 ## Voraussetzungen
@@ -150,6 +152,30 @@ Die Seite **Data Collection** liest ausschließlich Current State, SQLite,
 Parquet-Metadaten und `data/collector_status.json`; sie startet keinen Collector
 und entscheidet nicht über die Datensammlung.
 
+### Optionales FotMob-Enrichment
+
+FotMob ist vollständig vom Tipico-Collector getrennt und standardmäßig
+deaktiviert. Der FotMob-Tab zeigt nach einer bestätigten Verknüpfung nur
+Matchstatus und Fußballstatistiken. FotMob-Werte werden weder für das
+Tipico-Market-Ranking noch für Paper-Trades oder Settlement verwendet.
+
+Die öffentliche Browser-Discovery und die Einschränkung, dass eine sichtbare
+Seite keinen stabilen Automationsvertrag garantiert, stehen in
+`outputs/FOTMOB_DISCOVERY.md`. Für einen einzelnen ausdrücklich gewünschten
+Probeabruf gibt es `scripts/discover_fotmob.py`. Der optionale Worker liest nur
+bestätigte Match-Links:
+
+~~~powershell
+$env:FOTMOB_ENABLED="true"
+python scripts/discover_fotmob.py --root . --match-id 5881143
+python scripts/run_fotmob.py --root . --once
+~~~
+
+Für Proxmox ist `wetten-fotmob.service` vorhanden, wird vom Installationsskript
+aber nicht automatisch aktiviert. Der Service muss nur nach Prüfung der
+aktuellen Nutzungsbedingungen und nach Setzen von `FOTMOB_ENABLED=true`
+manuell gestartet werden.
+
 ### Paper Trading
 
 Paper Trading arbeitet vollständig ohne Wettschein und ohne Wettabgabe. Im
@@ -210,8 +236,18 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | COLLECTOR_RETRY_DELAYS_SECONDS | 1,3,10 | Retry-Verzögerungen |
 | MAX_LIVE_ODDS_AGE_SECONDS | 10 | Freshness-Grenze für Live-Quoten |
 | DEFAULT_TOTAL_STAKE_EUR | 30 | Default-Einsatz für Szenarien |
+| FOTMOB_ENABLED | false | optionales FotMob-Enrichment und Worker |
+| FOTMOB_API_BASE_URL | https://www.fotmob.com/api | konfigurierbarer FotMob-API-Bereich |
+| FOTMOB_MATCH_DETAILS_PATH | /matchDetails?matchId={match_id} | ein einzelner Match-Details-Pfad |
+| FOTMOB_TIMEOUT_SECONDS | 10 | FotMob-Timeout |
+| FOTMOB_MAX_RETRIES | 3 | FotMob-Retry-Anzahl, Delays 1/3/10 s |
+| FOTMOB_MIN_REQUEST_INTERVAL_SECONDS | 1 | Mindestabstand zwischen FotMob-Requests |
+| FOTMOB_MATCHING_TOLERANCE_MINUTES | 15 | Kickoff-Matchingfenster |
+| FOTMOB_POLL_SECONDS | 30 | optionaler Worker-Poll |
 
-Die verifizierten Endpunkte und Discovery-Ergebnisse stehen in outputs/DISCOVERY.md.
+Die verifizierten Tipico-Endpunkte stehen in outputs/DISCOVERY.md. Die FotMob-
+Discovery und Matching-Grenzen stehen in outputs/FOTMOB_DISCOVERY.md und
+outputs/FOTMOB_MATCHING_REPORT.md.
 
 ### Storage-Migration und Cleanup
 
@@ -231,6 +267,7 @@ Paper-Trades, Settlements, Ledger, Match Results und Paper-Entry-Raw bleiben erh
 
 - SQLite: data/tipico.db
 - Parquet: data/archive/tipico/snapshots/year=YYYY/month=MM/date=YYYY-MM-DD/
+- FotMob-Parquet: data/archive/fotmob/snapshots/year=YYYY/month=MM/date=YYYY-MM-DD/
 - Raw-JSON: data/raw/YYYY-MM-DD/ (Debug und Paper-Entry, je nach Kompression)
 - Halbzeit-Raw: .../events/<event_id>/halftime/ nur bei `RAW_AT_HALFTIME=true`
 - Logdatei: logs/tipico.log
@@ -244,7 +281,10 @@ Die Datenbank enthält die Tabellen `events`, `event_states`, `current_event_sta
 `current_strategy_evaluations`, `paper_portfolios`,
 `paper_portfolio_competitions`, `paper_trades`,
 `paper_bankroll_transactions`, `paper_signal_log`, `paper_runtime_settings`
-und `paper_worker_runs`. `current_event_state`, `current_canonical_outcomes` und
+und `paper_worker_runs` sowie die optionalen V0.5-Tabellen `matches`,
+`match_provider_links`, `teams`, `team_provider_aliases`,
+`competition_provider_aliases`, `fotmob_current_state`, `fotmob_snapshots`,
+`fotmob_snapshot_outbox` und `match_data_quality`. `current_event_state`, `current_canonical_outcomes` und
 `current_strategy_evaluations` sind ersetzbare Betriebsdaten. `snapshots` ist
 die kurze SQLite-Staging-/Indexschicht; die historische Zeile wird als flache
 Parquet-Zeile mit `schema_version` archiviert. `market_presence`, `odds_history`

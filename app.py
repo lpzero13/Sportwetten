@@ -9,6 +9,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from config import Settings, configure_logging
+from fotmob.service import FotMobService
 from intelligence.service import MarketIntelligenceService
 from paper.service import PaperTradingService
 from services.event_service import EventService
@@ -28,6 +29,7 @@ from ui.live_overview import render_live_overview
 from ui.time_format import current_munich_time, format_local_datetime, parse_datetime
 from ui.upcoming import render_upcoming
 from ui.paper_trading import render_paper_trading
+from ui.fotmob import render_fotmob_debug, render_fotmob_tab
 
 
 @st.cache_resource(show_spinner=False)
@@ -39,6 +41,7 @@ def get_runtime(root_dir: str) -> tuple[
     Database,
     MarketIntelligenceService,
     PaperTradingService,
+    FotMobService,
 ]:
     settings = Settings.from_env(Path(root_dir))
     logger = configure_logging(settings)
@@ -78,6 +81,7 @@ def get_runtime(root_dir: str) -> tuple[
         logger=logger,
     )
     paper_service = PaperTradingService(database, settings, logger=logger)
+    fotmob_service = FotMobService(settings, database, logger=logger)
     return (
         settings,
         event_service,
@@ -86,6 +90,7 @@ def get_runtime(root_dir: str) -> tuple[
         database,
         intelligence_service,
         paper_service,
+        fotmob_service,
     )
 
 
@@ -117,6 +122,7 @@ def _load_selected_detail(
     market_service: MarketService,
     database: Database,
     intelligence_service: MarketIntelligenceService,
+    fotmob_service: FotMobService,
 ) -> None:
     selected_id = st.session_state.get("selected_event_id")
     if not selected_id:
@@ -224,12 +230,12 @@ def _load_selected_detail(
         )
 
     if opening_intent == "quotes":
-        quotes_tab, analysis_tab, history_tab, raw_tab = st.tabs(
-            ["Alle Tipico Märkte", "Analyse", "Odds History", "Raw / Debug"]
+        quotes_tab, analysis_tab, fotmob_tab, history_tab, raw_tab = st.tabs(
+            ["Alle Tipico Märkte", "Analyse", "FotMob", "Odds History", "Raw / Debug"]
         )
     else:
-        analysis_tab, quotes_tab, history_tab, raw_tab = st.tabs(
-            ["Analyse", "Alle Tipico Märkte", "Odds History", "Raw / Debug"]
+        analysis_tab, fotmob_tab, quotes_tab, history_tab, raw_tab = st.tabs(
+            ["Analyse", "FotMob", "Alle Tipico Märkte", "Odds History", "Raw / Debug"]
         )
 
     with analysis_tab:
@@ -247,6 +253,8 @@ def _load_selected_detail(
         from ui.market_view import render_markets
 
         render_markets(details)
+    with fotmob_tab:
+        render_fotmob_tab(fotmob_service, details.event)
     with history_tab:
         history = database.odds_history_for_event(selected_id)
         if history:
@@ -337,6 +345,7 @@ def main() -> None:
         database,
         intelligence_service,
         paper_service,
+        fotmob_service,
     ) = get_runtime(str(root_dir))
 
     st.sidebar.title("Tipico Live Observer")
@@ -344,7 +353,7 @@ def main() -> None:
         "Ansicht",
         ["Live", "Upcoming", "Halftime Scanner", "Paper Trading", "Data / Debug"],
     )
-    st.sidebar.caption("V0.4 Dashboard · Paper Trading · REST/Polling")
+    st.sidebar.caption("V0.5 Dashboard · Paper Trading · REST/Polling")
     st.sidebar.caption(f"Gerät: {device.label}")
     st.sidebar.caption(f"Münchner Zeit: {current_munich_time()}")
 
@@ -366,6 +375,7 @@ def main() -> None:
         render_halftime_scanner(
             scanner,
             total_stake=float(settings.default_total_stake_eur),
+            fotmob_service=fotmob_service,
         )
         return
 
@@ -378,11 +388,13 @@ def main() -> None:
         st_autorefresh(interval=30_000, key="collection-autorefresh")
         section = st.radio(
             "Bereich",
-            ["Data Collection", "Debug / System"],
+            ["Data Collection", "Debug / System", "FotMob"],
             horizontal=True,
         )
         if section == "Data Collection":
-            render_data_collection(database, settings)
+            render_data_collection(database, settings, fotmob_service=fotmob_service)
+        elif section == "FotMob":
+            render_fotmob_debug(fotmob_service)
         else:
             event_service.refresh_if_due()
             render_debug_page(
@@ -391,6 +403,7 @@ def main() -> None:
                 database,
                 database_path=settings.database_path,
                 raw_storage_enabled=settings.store_raw_responses,
+                fotmob_service=fotmob_service,
             )
         return
 
@@ -437,6 +450,7 @@ def main() -> None:
         market_service,
         database,
         intelligence_service,
+        fotmob_service,
     )
 
     selected = render_live_overview(

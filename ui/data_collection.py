@@ -8,6 +8,7 @@ from pathlib import Path
 import streamlit as st
 
 from config import Settings
+from fotmob.service import FotMobService
 from storage.database import Database
 from storage.parquet_archive import ParquetArchive
 from ui.time_format import format_local_datetime
@@ -49,7 +50,12 @@ def _size_label(size_bytes: int) -> str:
     return "0.0 B"
 
 
-def render_data_collection(database: Database, settings: Settings) -> None:
+def render_data_collection(
+    database: Database,
+    settings: Settings,
+    *,
+    fotmob_service: FotMobService | None = None,
+) -> None:
     """Render collector state without making any Tipico request."""
 
     st.title("Data Collection")
@@ -194,6 +200,20 @@ def render_data_collection(database: Database, settings: Settings) -> None:
         "Refreshes bleiben Current State. Historische Snapshots entstehen ausschließlich "
         "über die zehn fachlichen Collector-Slots."
     )
+    if fotmob_service is not None:
+        fotmob = fotmob_service.metrics()
+        st.subheader("FotMob-Enrichment")
+        fotmob_columns = st.columns(5)
+        fotmob_columns[0].metric("Feature", "AN" if fotmob_service.enabled else "AUS")
+        fotmob_columns[1].metric("Matches", fotmob["matches"])
+        fotmob_columns[2].metric("Links", fotmob["links"])
+        fotmob_columns[3].metric("Current", fotmob["current_state"])
+        fotmob_columns[4].metric("Snapshots", fotmob["snapshots"])
+        st.caption(
+            f"FotMob HT-Stats: {fotmob['ht_stats']} · Outbox pending: "
+            f"{fotmob['outbox_pending']} · Auto-Link-Rate: "
+            f"{fotmob['automatic_match_rate'] * 100:.1f}% · getrennt von Tipico-Strategie und Paper Trading."
+        )
     st.subheader("Persistenz")
     persistence_columns = st.columns(4)
     persistence_columns[0].metric("Historische Snapshots", database.count_rows("snapshots"))

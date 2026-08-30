@@ -2797,6 +2797,15 @@ class Database:
             "paper_signal_log",
             "paper_runtime_settings",
             "paper_worker_runs",
+            "matches",
+            "match_provider_links",
+            "teams",
+            "team_provider_aliases",
+            "competition_provider_aliases",
+            "fotmob_current_state",
+            "fotmob_snapshots",
+            "fotmob_snapshot_outbox",
+            "match_data_quality",
         }
         if table not in allowed:
             raise ValueError(f"Unsupported table: {table}")

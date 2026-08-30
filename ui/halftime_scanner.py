@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import streamlit as st
 
+from fotmob.service import FotMobService
 from services.halftime_scanner import HalftimeScanItem, HalftimeScannerService
 
 
@@ -21,6 +22,7 @@ def render_halftime_scanner(
     scanner: HalftimeScannerService,
     *,
     total_stake: float,
+    fotmob_service: FotMobService | None = None,
 ) -> None:
     st.title("Halftime Scanner")
     st.caption(
@@ -60,13 +62,14 @@ def render_halftime_scanner(
         except ValueError:
             state_age = None
     event_ids = [event.event_id for event in events]
-    if (
+    scan_started = (
         requested
         or not isinstance(state, dict)
         or state.get("event_ids") != event_ids
         or state_age is None
         or state_age >= scanner.settings.max_live_odds_age_seconds
-    ):
+    )
+    if scan_started:
         with st.spinner("Halbzeitmärkte werden gelesen …"):
             items = scanner.scan(
                 events=events,
@@ -80,9 +83,29 @@ def render_halftime_scanner(
     else:
         items = state.get("items", [])
 
+    fotmob_errors: list[str] = []
+    if (
+        fotmob_service is not None
+        and fotmob_service.enabled
+        and scan_started
+    ):
+        # This is the explicit Tipico-HZ -> FotMob coordination point.  It
+        # only refreshes confirmed links and writes the idempotent HALFTIME
+        # slot; the Tipico ranking below is not recalculated from these stats.
+        for event in events:
+            internal_id = fotmob_service.ensure_tipico_event(event)
+            link = fotmob_service.store.link_for_internal(internal_id)
+            if link is None or link["match_status"] not in {"EXACT", "HIGH_CONFIDENCE", "MANUALLY_CONFIRMED"}:
+                continue
+            result = fotmob_service.refresh_for_tipico_event(event, snapshot_type="HALFTIME")
+            if not result.success and result.error:
+                fotmob_errors.append(f"{event.home_team} – {event.away_team}: {result.error}")
+
     if not items:
         st.info("Keine analysierbaren Halbzeitdaten vorhanden.")
         return
+    if fotmob_errors:
+        st.caption("FotMob-HZ-Enrichment: " + " · ".join(fotmob_errors[:3]))
     rankable = [item for item in items if isinstance(item, HalftimeScanItem) and item.rankable]
     incomplete = [item for item in items if item not in rankable]
     summary = st.columns(3)
@@ -96,6 +119,19 @@ def render_halftime_scanner(
         assert analysis is not None
         strategy = analysis.strategy
         event = item.event
+        fotmob_state = (
+            fotmob_service.current_for_tipico_event(event)
+            if fotmob_service is not None and fotmob_service.enabled
+            else None
+        )
+        fotmob_stats = {}
+        if fotmob_state is not None:
+            try:
+                import json
+
+                fotmob_stats = json.loads(str(fotmob_state["stats_json"]))
+            except (KeyError, TypeError, ValueError):
+                fotmob_stats = {}
         rows.append(
             {
                 "Rang": index,
@@ -111,6 +147,23 @@ def render_halftime_scanner(
                 "P1-Puffer": _pct(strategy.p1_buffer),
                 "Win-ROI": _pct(strategy.win_roi),
                 "Quelle": item.source,
+                **(
+                    {
+                        "FotMob xG": (
+                            f"{fotmob_stats.get('xg_home'):.2f} : {fotmob_stats.get('xg_away'):.2f}"
+                            if fotmob_stats.get("xg_home") is not None and fotmob_stats.get("xg_away") is not None
+                            else "—"
+                        ),
+                        "FotMob SOT": (
+                            f"{fotmob_stats.get('shots_on_target_home'):g} : {fotmob_stats.get('shots_on_target_away'):g}"
+                            if fotmob_stats.get("shots_on_target_home") is not None and fotmob_stats.get("shots_on_target_away") is not None
+                            else "—"
+                        ),
+                        "FotMob State": fotmob_state["status"] if fotmob_state is not None else "—",
+                    }
+                    if fotmob_service is not None and fotmob_service.enabled
+                    else {}
+                ),
             }
         )
     st.subheader("Transparenter Marktstruktur-Ranking")
