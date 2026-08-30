@@ -27,7 +27,17 @@ defensive parser: explicit HT + FT + timeline + nullable stats
 
 Discovery/Indexierung und Detailscan sind getrennte Jobs. Der Index kennt nur
 Metadaten und behauptet keine Detaildaten. Der Scan wird durch eine
-transaktionale SQLite-Claim-Operation worker-aware und resumierbar.
+transaktionale SQLite-Claim-Operation worker-aware und resumierbar. Die
+verifizierten aktuellen öffentlichen Pfade sind:
+
+```text
+/leagues/{league_id}
+/leagues/{league_id}?season={season_label}
+/match/{match_id}
+```
+
+Die Antworten sind HTML mit eingebettetem Next.js-`__NEXT_DATA__`; die
+historischen IDs stammen aus `stats.seasonStatLinks[].TournamentId`.
 
 ## SQLite contract
 
@@ -59,11 +69,15 @@ ohne die maximale Versuchszahl zu überschreiten.
 
 ## Detail contract
 
-Der Parser übernimmt nur explizit gelieferte HT-Scores und HT-Statistiken.
-Ein fehlender HT-Wert wird nicht aus dem Endstand oder aus Vollzeitstatistiken
-abgeleitet. FT- und HT-Statistiken erhalten getrennte Spaltenpräfixe;
-unbekannte Paare bleiben in JSON erhalten. Timeline-Ereignisse werden
-normalisiert und zusätzlich raw-nah gespeichert.
+Der Parser übernimmt explizit gelieferte HT-Scores und HT-Statistiken. Bei der
+aktuellen öffentlichen Payload wird der HT-Score, falls FotMob ihn nicht als
+eigenes Feld liefert, ausschließlich aus der Goal-Timeline abgeleitet:
+`newScore` nach einem Tor in Halbzeit 1 bzw. der Score vor dem ersten Tor in
+Halbzeit 2. Ein beendetes 0:0 ist mathematisch eindeutig 0:0 zur Halbzeit.
+Eine Ableitung aus Vollzeitstatistiken findet nicht statt. FT- und
+HT-Statistiken erhalten getrennte Spaltenpräfixe; unbekannte Paare bleiben in
+JSON erhalten. Timeline-Ereignisse werden normalisiert und zusätzlich raw-nah
+gespeichert.
 
 Das Ziel `second_half_goals` ist nur bei vollständigen, nicht widersprüchlichen
 HT-/FT-Scores definiert. Die Klassen sind `0`, `1` und `2_PLUS`.
@@ -73,8 +87,8 @@ HT-/FT-Scores definiert. Die Klassen sind `0`, `1` und `2_PLUS`.
 ```text
 data/archive/fotmob/historical/
 └── league_id=54/
-    ├── season=2025-26/*.parquet
-    └── season=2024-25/*.parquet
+    ├── season=2025-2026/*.parquet
+    └── season=2024-2025/*.parquet
 ```
 
 Parquet wird batchweise mit `PARQUET_COMPRESSION=zstd` und atomarem
@@ -89,16 +103,26 @@ unter `data/raw/fotmob/historical/league_id=.../season=.../`.
 
 ## Policy boundary
 
-Die Pipeline akzeptiert lokale Fixtures für Tests. Externe Discovery und
-Detailrequests verlangen gleichzeitig:
+Die Pipeline akzeptiert lokale Fixtures für Tests. Der permanente Worker
+verlangt gleichzeitig:
 
 ```text
 FOTMOB_ENABLED=true
 FOTMOB_HISTORY_ENABLED=true
+FOTMOB_NETWORK_MODE=worker
 FOTMOB_PROVIDER_DECISION=PRODUCTION_READY
 FOTMOB_AUTOMATED_USAGE=ACCEPTABLE_FOR_PROJECT
 ```
 
-Bei den aktuellen V0.5.1-Werten `LIMITED_USE`/`UNCLEAR` wird kein externer
-Historical-Request ausgeführt. Das schützt zugleich Tipico-/Paper-Betrieb
-vor einer FotMob-Abhängigkeit.
+Für einen bewusst gestarteten, begrenzten CLI-Lauf gilt dagegen ausschließlich:
+
+```text
+FOTMOB_ENABLED=true
+FOTMOB_HISTORY_ENABLED=true
+FOTMOB_NETWORK_MODE=manual
+```
+
+Damit kann die V0.5.2-Abnahme ohne Worker-Automation erfolgen. Standard ist
+`FOTMOB_NETWORK_MODE=off`; bei den aktuellen V0.5.1-Werten
+`LIMITED_USE`/`UNCLEAR` bleibt der permanente Worker gesperrt. Das schützt
+Tipico-/Paper-Betrieb vor einer FotMob-Abhängigkeit.

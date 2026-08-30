@@ -29,6 +29,7 @@ def main() -> None:
     settings = Settings.from_env(args.root.resolve())
     result: dict[str, object] = {
         "enabled": settings.fotmob_enabled,
+        "network_mode": settings.fotmob_network_mode,
         "provider_decision": settings.fotmob_provider_decision,
         "automated_usage": settings.fotmob_automated_usage,
         "base_url": settings.fotmob_base_url,
@@ -46,6 +47,11 @@ def main() -> None:
     if not settings.fotmob_enabled:
         result["status"] = "DISABLED"
         result["error"] = "Set FOTMOB_ENABLED=true explicitly for a one-match probe."
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+    if settings.fotmob_network_mode not in {"manual", "worker"}:
+        result["status"] = "BLOCKED_BY_POLICY"
+        result["error"] = "Set FOTMOB_NETWORK_MODE=manual for an explicit one-match probe."
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return
     if (

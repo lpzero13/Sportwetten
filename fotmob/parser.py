@@ -68,8 +68,29 @@ def _find_first(value: Any, keys: set[str]) -> Any:
     return _MISSING
 
 
+def _path_value(value: Any, *keys: str) -> Any:
+    """Read a case-insensitive nested path without confusing sibling fields."""
+
+    current = value
+    for key in keys:
+        if not isinstance(current, Mapping):
+            return _MISSING
+        current = _first(current, key)
+        if current is _MISSING:
+            return _MISSING
+    return current
+
+
+def _first_path(value: Any, paths: tuple[tuple[str, ...], ...]) -> Any:
+    for path in paths:
+        found = _path_value(value, *path)
+        if found is not _MISSING:
+            return found
+    return _MISSING
+
+
 def _number(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
+    if value is None or isinstance(value, bool) or isinstance(value, (Mapping, list, tuple)):
         return None
     if isinstance(value, (int, float)):
         return float(value)
@@ -127,6 +148,16 @@ def _score_pair(value: Any) -> tuple[int | None, int | None]:
     if isinstance(value, (list, tuple)) and len(value) >= 2:
         return _integer(value[0]), _integer(value[1])
     if isinstance(value, Mapping):
+        # FotMob match incidents expose ``homeScore``/``awayScore`` as the
+        # score immediately before the incident and ``newScore`` afterwards.
+        # Prefer the latter when it is present so an event's normalized score
+        # is the observable post-event score.
+        for key in ("newScore", "scoreAfter", "currentScore", "score", "fullTimeScore", "ftScore"):
+            nested = _first(value, key)
+            if nested is not _MISSING:
+                result = _score_pair(nested)
+                if result != (None, None):
+                    return result
         home = _first(value, "home", "homeScore", "home_score", "currentHome")
         away = _first(value, "away", "awayScore", "away_score", "currentAway")
         if home is not _MISSING or away is not _MISSING:
@@ -134,12 +165,6 @@ def _score_pair(value: Any) -> tuple[int | None, int | None]:
                 _integer(None if home is _MISSING else home),
                 _integer(None if away is _MISSING else away),
             )
-        for key in ("currentScore", "score", "fullTimeScore", "ftScore"):
-            nested = _first(value, key)
-            if nested is not _MISSING:
-                result = _score_pair(nested)
-                if result != (None, None):
-                    return result
     return None, None
 
 
@@ -152,7 +177,7 @@ def _stat_kind(label: str) -> str | None:
     normalized = _normal_label(label)
     if "expected goals" in normalized or normalized in {"xg", "expected_goals"}:
         return "xg"
-    if "big chance" in normalized:
+    if "big chance" in normalized and "missed" not in normalized:
         return "big_chances"
     if "shots on target" in normalized or "shots on goal" in normalized:
         return "shots_on_target"
@@ -162,7 +187,11 @@ def _stat_kind(label: str) -> str | None:
         return "shots_inside_box"
     if "outside box" in normalized and "shot" in normalized:
         return "shots_outside_box"
-    if "touches in box" in normalized or "touches inside box" in normalized:
+    if (
+        "touches in box" in normalized
+        or "touches inside box" in normalized
+        or "touches in opposition box" in normalized
+    ):
         return "touches_in_box"
     if "corner" in normalized:
         return "corners"
@@ -188,22 +217,25 @@ def _stat_kind(label: str) -> str | None:
 
 
 def _pair(value: Any) -> tuple[float | None, float | None] | None:
+    def usable(home: float | None, away: float | None) -> tuple[float | None, float | None] | None:
+        return (home, away) if home is not None or away is not None else None
+
     if isinstance(value, (list, tuple)) and len(value) >= 2:
-        return _number(value[0]), _number(value[1])
+        return usable(_number(value[0]), _number(value[1]))
     if isinstance(value, Mapping):
         home = _first(value, "home", "homeValue", "home_value", "valueHome")
         away = _first(value, "away", "awayValue", "away_value", "valueAway")
         if home is not _MISSING or away is not _MISSING:
-            return (
+            return usable(
                 _number(None if home is _MISSING else home),
                 _number(None if away is _MISSING else away),
             )
         stats_value = _first(value, "stats")
         if isinstance(stats_value, (list, tuple)) and len(stats_value) >= 2:
-            return _number(stats_value[0]), _number(stats_value[1])
+            return usable(_number(stats_value[0]), _number(stats_value[1]))
         values = _first(value, "values", "value")
         if values is not _MISSING and isinstance(values, (list, tuple)) and len(values) >= 2:
-            return _number(values[0]), _number(values[1])
+            return usable(_number(values[0]), _number(values[1]))
     return None
 
 
@@ -281,13 +313,29 @@ def _collect_unknown_pairs(value: Any) -> Iterable[tuple[str, tuple[float | None
 def _period_nodes(payload: Mapping[str, Any]) -> tuple[Any, Any, Any]:
     """Return (all-period node, first-half node, source stats object)."""
 
-    stats_root = _find_first(payload, {"stats"})
-    if stats_root is _MISSING:
-        stats_root = _find_first(payload, {"statistics"})
+    # The current public page nests this under Next.js pageProps.  Prefer the
+    # known paths because a recursive search can encounter an event's small
+    # ``stats`` list before the match-level statistics object.
+    stats_root = _first_path(
+        payload,
+        (
+            ("props", "pageProps", "content", "stats"),
+            ("pageProps", "content", "stats"),
+            ("content", "stats"),
+            ("data", "content", "stats"),
+            ("stats",),
+            ("statistics",),
+        ),
+    )
+    if not isinstance(stats_root, Mapping):
+        recursive = _find_first(payload, {"stats", "statistics"})
+        stats_root = recursive if isinstance(recursive, Mapping) else _MISSING
     if stats_root is _MISSING:
         return _MISSING, _MISSING, _MISSING
 
-    periods = _find_first(stats_root, {"periods"})
+    periods = _first(stats_root, "periods")
+    if periods is _MISSING:
+        periods = _find_first(stats_root, {"periods"})
     if not isinstance(periods, Mapping):
         return stats_root, _MISSING, stats_root
 
@@ -298,7 +346,7 @@ def _period_nodes(payload: Mapping[str, Any]) -> tuple[Any, Any, Any]:
         if normalized in {"all", "full time", "full", "match"} or str(key) == "0":
             all_node = value
         elif normalized in {
-            "1", "1st", "1st half", "first half", "first", "1h", "ht",
+            "1", "1st", "1st half", "first half", "firsthalf", "first", "1h", "ht",
         }:
             ht_node = value
     if all_node is _MISSING and periods:
@@ -326,6 +374,24 @@ def _parse_minute(value: Any) -> tuple[int | None, int | None]:
 
 
 def _incidents(payload: Mapping[str, Any]) -> list[Any]:
+    # On the current public page the actual timeline is
+    # ``content.matchFacts.events.events``.  ``header.events`` and
+    # ``eventTypes`` are metadata and must not be mistaken for incidents.
+    preferred = _first_path(
+        payload,
+        (
+            ("props", "pageProps", "content", "matchFacts", "events", "events"),
+            ("pageProps", "content", "matchFacts", "events", "events"),
+            ("content", "matchFacts", "events", "events"),
+            ("content", "matchFacts", "events"),
+            ("content", "events"),
+            ("events",),
+            ("timeline",),
+            ("incidents",),
+        ),
+    )
+    if isinstance(preferred, list) and all(isinstance(item, Mapping) for item in preferred):
+        return preferred
     for key in ("incidents", "events", "timeline"):
         value = _find_first(payload, {key})
         if isinstance(value, list) and value and all(isinstance(item, Mapping) for item in value):
@@ -369,13 +435,60 @@ def _parse_events(payload: Mapping[str, Any]) -> list[FotMobEvent]:
     return result
 
 
+def _derive_halftime_score(
+    payload: Mapping[str, Any],
+    events: list[FotMobEvent],
+    score_home: int | None,
+    score_away: int | None,
+) -> tuple[int | None, int | None]:
+    """Derive HT only from the provider's goal timeline or a 0-0 FT score."""
+
+    raw_incidents = _incidents(payload)
+    raw_goals: list[tuple[int, Mapping[str, Any]]] = []
+    for raw in raw_incidents:
+        kind = _text(_first(raw, "incidentType", "type", "eventType", "kind", "action")) or ""
+        if "goal" not in kind.casefold():
+            continue
+        minute_value = _first(raw, "time", "minute", "min", "matchMinute")
+        minute, _ = _parse_minute(None if minute_value is _MISSING else minute_value)
+        if minute is not None:
+            raw_goals.append((minute, raw))
+    raw_goals.sort(key=lambda item: item[0])
+
+    first_half = [item for item in raw_goals if item[0] <= 45]
+    if first_half:
+        home, away = _score_pair(first_half[-1][1])
+        if home is not None and away is not None:
+            return home, away
+
+    # If the first recorded goal is after half-time, its pre-incident score is
+    # the HT score.  This also handles legitimate 0-0 half-times without
+    # inventing a score from unrelated statistics.
+    second_half = [item for item in raw_goals if item[0] > 45]
+    if second_half:
+        first = second_half[0][1]
+        home = _integer(_first(first, "homeScore", "home_score"))
+        away = _integer(_first(first, "awayScore", "away_score"))
+        if home is not None and away is not None:
+            return home, away
+
+    # A finished 0-0 match has no other mathematically possible HT score.
+    if score_home == 0 and score_away == 0:
+        return 0, 0
+    return None, None
+
+
 def _header_teams(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    header = _find_first(payload, {"header"})
+    header = _first_path(payload, (("props", "pageProps", "header"), ("pageProps", "header"), ("header",)))
+    if not isinstance(header, Mapping):
+        header = _find_first(payload, {"header"})
     if isinstance(header, Mapping):
         teams = _first(header, "teams")
         if isinstance(teams, list):
             return [item for item in teams if isinstance(item, Mapping)]
-    general = _find_first(payload, {"general"})
+    general = _first_path(payload, (("props", "pageProps", "general"), ("pageProps", "general"), ("general",)))
+    if not isinstance(general, Mapping):
+        general = _find_first(payload, {"general"})
     if isinstance(general, Mapping):
         items = []
         for key in ("homeTeam", "awayTeam"):
@@ -395,9 +508,13 @@ def parse_fotmob_payload(
 
     if not isinstance(payload, Mapping):
         raise TypeError("FotMob payload must be a mapping")
-    general = _find_first(payload, {"general"})
+    general = _first_path(payload, (("props", "pageProps", "general"), ("pageProps", "general"), ("general",)))
+    if not isinstance(general, Mapping):
+        general = _find_first(payload, {"general"})
     general = general if isinstance(general, Mapping) else {}
-    header = _find_first(payload, {"header"})
+    header = _first_path(payload, (("props", "pageProps", "header"), ("pageProps", "header"), ("header",)))
+    if not isinstance(header, Mapping):
+        header = _find_first(payload, {"header"})
     header = header if isinstance(header, Mapping) else {}
 
     identifier = _first(general, "matchId", "id")
@@ -470,13 +587,23 @@ def parse_fotmob_payload(
     competition_name = _first(general, "leagueName", "competitionName", "parentLeagueName")
     if competition_name is _MISSING:
         competition_name = _first(competition, "name", "title")
-    country = _first(general, "country", "countryName", "leagueCountry")
+    country = _first(general, "country", "countryName", "leagueCountry", "countryCode", "country_code")
     if country is _MISSING:
         country = _first(competition, "country", "countryName")
     season = _first(general, "season")
     round_name = _first(general, "matchRound", "round", "roundName")
     status_node = _first(header, "status")
-    status = _text(status_node if status_node is not _MISSING else _first(general, "matchStatus", "status"))
+    status_value = status_node if status_node is not _MISSING else _first(general, "matchStatus", "status")
+    status = _text(status_value)
+    if status is None and isinstance(status_value, Mapping):
+        reason = _first(status_value, "reason")
+        if isinstance(reason, Mapping):
+            reason_value = _first(reason, "longKey", "shortKey", "long", "short")
+            status = _text(None if reason_value is _MISSING else reason_value)
+        if status is None and _first(status_value, "finished") is True:
+            status = "finished"
+        elif status is None and _first(status_value, "started") is True:
+            status = "started"
     period_value = _first(header, "period", "matchPeriod")
     if period_value is _MISSING:
         period_value = _first(general, "period", "matchPeriod")
@@ -485,7 +612,7 @@ def parse_fotmob_payload(
         minute_value = _first(general, "minute", "matchMinute", "liveTime")
     minute, added_time = _parse_minute(None if minute_value is _MISSING else minute_value)
 
-    kickoff = _first(general, "matchTimeUTC", "startTime", "kickoff", "kickoffTime")
+    kickoff = _first(general, "matchTimeUTCDate", "matchTimeUTC", "startTime", "kickoff", "kickoffTime")
     if kickoff is _MISSING:
         kickoff = _first(header, "startTime", "kickoff", "kickoffTime")
     all_node, first_half_node, stats_source = _period_nodes(payload)
@@ -493,15 +620,7 @@ def parse_fotmob_payload(
     ht_stats = None if first_half_node is _MISSING else _period_stats(first_half_node)
     events = _parse_events(payload)
     if ht_home is None or ht_away is None:
-        # Only derive the score from explicit goal events.  There is no
-        # inference from full-time statistics or final score.
-        goals = [
-            event for event in events
-            if "goal" in event.event_type and event.minute is not None and event.minute <= 45
-        ]
-        if goals and all(event.score_home is not None and event.score_away is not None for event in goals):
-            last = goals[-1]
-            ht_home, ht_away = last.score_home, last.score_away
+        ht_home, ht_away = _derive_halftime_score(payload, events, score_home, score_away)
 
     country_text = _text(country if country is not _MISSING else None)
     if isinstance(country, Mapping):

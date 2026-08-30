@@ -477,21 +477,39 @@ class FotMobHistoryStore:
             )
         return int(cursor.rowcount if cursor.rowcount is not None else 0)
 
-    def status(self, league_id: str, season_id: str, provider: str = "FOTMOB") -> dict[str, Any]:
+    def status(
+        self,
+        league_id: str,
+        season_id: str,
+        provider: str = "FOTMOB",
+        *,
+        only_sample: bool = False,
+    ) -> dict[str, Any]:
+        sample_join = ""
+        if only_sample:
+            sample_join = """
+                INNER JOIN fotmob_history_samples s
+                    ON s.provider = i.provider
+                   AND s.league_id = i.league_id
+                   AND s.season_id = i.season_id
+                   AND s.fotmob_match_id = i.fotmob_match_id
+            """
         with self._lock:
             rows = self.connection.execute(
-                """
+                f"""
                 SELECT detail_status, COUNT(*) AS n
-                FROM fotmob_match_index
-                WHERE provider = ? AND league_id = ? AND season_id = ?
+                FROM fotmob_match_index i
+                {sample_join}
+                WHERE i.provider = ? AND i.league_id = ? AND i.season_id = ?
                 GROUP BY detail_status
                 """,
                 (provider.upper(), str(league_id), str(season_id)),
             ).fetchall()
             archive_row = self.connection.execute(
-                """
+                f"""
                 SELECT COUNT(DISTINCT a.fotmob_match_id) AS n
                 FROM fotmob_match_index i
+                {sample_join}
                 INNER JOIN fotmob_historical_archive_index a
                     ON a.provider = i.provider
                    AND a.fotmob_match_id = i.fotmob_match_id

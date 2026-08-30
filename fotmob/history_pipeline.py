@@ -1,8 +1,9 @@
 """League-to-season-to-match historical pipeline for FotMob.
 
 The pipeline intentionally separates index discovery from detail fetching.  It
-is safe to use with local fixtures in tests, while the CLI applies the
-V0.5.1 provider-policy gate before any external request.
+is safe to use with local fixtures in tests. Explicit CLI jobs use the
+``manual`` network mode; a permanent worker remains behind the stricter
+V0.5.1 provider-policy gate.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -59,15 +61,46 @@ class MatchIndexResult:
     error: str | None = None
 
 
-def historical_automation_allowed(settings: Settings) -> bool:
-    """Return whether an external historical request is explicitly allowed."""
+def _network_mode(settings: Settings) -> str:
+    mode = str(getattr(settings, "fotmob_network_mode", "off")).strip().casefold()
+    return mode if mode in {"off", "manual", "worker"} else "off"
+
+
+def manual_history_allowed(settings: Settings) -> bool:
+    """Return whether an explicitly started CLI history job may use the network."""
 
     return bool(
         settings.fotmob_enabled
         and settings.fotmob_history_enabled
+        and _network_mode(settings) == "manual"
+    )
+
+
+def worker_history_allowed(settings: Settings) -> bool:
+    """Return whether a permanent/background historical worker may use the network."""
+
+    return bool(
+        settings.fotmob_enabled
+        and settings.fotmob_history_enabled
+        and _network_mode(settings) == "worker"
         and settings.fotmob_provider_decision == "PRODUCTION_READY"
         and settings.fotmob_automated_usage == "ACCEPTABLE_FOR_PROJECT"
     )
+
+
+def historical_automation_allowed(settings: Settings) -> bool:
+    """Backward-compatible name for the deliberately stricter worker gate."""
+
+    return worker_history_allowed(settings)
+
+
+def _history_network_allowed(settings: Settings, execution_mode: str) -> bool:
+    mode = str(execution_mode).strip().casefold()
+    if mode == "manual":
+        return manual_history_allowed(settings)
+    if mode == "worker":
+        return worker_history_allowed(settings)
+    return False
 
 
 def _now() -> str:
@@ -131,10 +164,12 @@ class FotMobHistoryPipeline:
         self.archive = FotMobHistoricalArchive(settings.archive_path, settings.parquet_compression)
         self._archive_lock = threading.RLock()
 
-    def _network_error(self) -> str:
+    def _network_error(self, execution_mode: str) -> str:
         return (
-            "FotMob Historical-Netzwerkzugriff ist gesperrt. Setze nur nach "
-            "ausdrücklicher Providerfreigabe FOTMOB_HISTORY_ENABLED=true, "
+            "FotMob Historical-Netzwerkzugriff ist gesperrt. Für einen bewusst "
+            "manuell gestarteten CLI-Job setze FOTMOB_ENABLED=true, "
+            "FOTMOB_HISTORY_ENABLED=true und FOTMOB_NETWORK_MODE=manual. "
+            f"Der Modus {execution_mode!r} verlangt zusätzlich die Worker-Gates "
             "FOTMOB_PROVIDER_DECISION=PRODUCTION_READY und "
             "FOTMOB_AUTOMATED_USAGE=ACCEPTABLE_FOR_PROJECT."
         )
@@ -157,10 +192,15 @@ class FotMobHistoryPipeline:
         league_id: str,
         *,
         payload: dict[str, Any] | None = None,
+        execution_mode: str = "worker",
     ) -> LeagueDiscoveryResult:
         if payload is None:
-            if not historical_automation_allowed(self.settings):
-                return LeagueDiscoveryResult(False, str(league_id), error=self._network_error())
+            if not _history_network_allowed(self.settings, execution_mode):
+                return LeagueDiscoveryResult(
+                    False,
+                    str(league_id),
+                    error=self._network_error(execution_mode),
+                )
             payload, error = self._fetch_json(
                 self._endpoint(self.settings.fotmob_league_path, league_id=league_id)
             )
@@ -205,17 +245,23 @@ class FotMobHistoryPipeline:
         season: FotMobSeasonRef,
         *,
         payload: dict[str, Any] | None = None,
+        execution_mode: str = "worker",
     ) -> MatchIndexResult:
         if payload is None:
-            if not historical_automation_allowed(self.settings):
+            if not _history_network_allowed(self.settings, execution_mode):
                 return MatchIndexResult(
-                    False, str(league_id), season.season_id, season.season_label, error=self._network_error()
+                    False,
+                    str(league_id),
+                    season.season_id,
+                    season.season_label,
+                    error=self._network_error(execution_mode),
                 )
             payload, error = self._fetch_json(
                 self._endpoint(
                     self.settings.fotmob_season_path,
                     league_id=league_id,
                     season_id=season.season_id,
+                    season_label=season.season_label,
                 )
             )
             if payload is None:
@@ -309,17 +355,27 @@ class FotMobHistoryPipeline:
         only_sample: bool = False,
         limit: int | None = None,
         batch_size: int | None = None,
+        execution_mode: str = "worker",
     ) -> dict[str, Any]:
-        if not historical_automation_allowed(self.settings):
+        if not _history_network_allowed(self.settings, execution_mode):
             return {
                 "status": "BLOCKED_BY_POLICY",
                 "league_id": str(league_id),
                 "season_id": str(season_id),
-                "error": self._network_error(),
+                "error": self._network_error(execution_mode),
             }
         workers = max(1, min(8, int(workers)))
         batch_size = max(1, int(batch_size or self.settings.fotmob_history_batch_size))
         worker_id = f"history-{uuid.uuid4().hex[:12]}"
+        target_rows = self.store.match_index(
+            str(league_id),
+            str(season_id),
+            only_sample=only_sample,
+        )
+        target_total = len(target_rows)
+        if limit is not None:
+            target_total = min(target_total, max(0, int(limit)))
+        started_monotonic = time.monotonic()
         processed = fetched_count = partial_count = failed_count = error_count = 0
         archive_files: list[str] = []
         buffer: list[dict[str, Any]] = []
@@ -350,6 +406,29 @@ class FotMobHistoryPipeline:
                 else:
                     partial_count += 1
             buffer = []
+
+        def progress_snapshot(status: dict[str, Any] | None = None) -> dict[str, Any]:
+            current_status = status or self.store.status(
+                league_id,
+                season_id,
+                only_sample=only_sample,
+            )
+            elapsed_seconds = max(0.0, time.monotonic() - started_monotonic)
+            remaining = int(current_status.get("remaining", 0))
+            completed = max(0, int(current_status.get("total", target_total)) - remaining)
+            rate = processed / elapsed_seconds if elapsed_seconds > 0 else 0.0
+            eta_seconds = (remaining / rate) if rate > 0 and remaining > 0 else None
+            fraction = (completed / target_total) if target_total > 0 else 1.0
+            return {
+                "processed": processed,
+                "completed": min(target_total, completed),
+                "target": target_total,
+                "remaining": remaining,
+                "fraction": round(min(1.0, max(0.0, fraction)), 4),
+                "elapsed_seconds": round(elapsed_seconds, 3),
+                "rate_per_second": round(rate, 4),
+                "eta_seconds": round(eta_seconds, 3) if eta_seconds is not None else None,
+            }
 
         def submit(executor: ThreadPoolExecutor, pending: set[Any]) -> None:
             if limit is not None and processed + len(pending) >= limit:
@@ -403,6 +482,14 @@ class FotMobHistoryPipeline:
                                     failed_count += 1
                         if len(buffer) >= batch_size:
                             flush()
+                            progress = progress_snapshot()
+                            self.logger.info(
+                                "FotMob history progress %s/%s (%.1f%%), ETA=%s s",
+                                progress["completed"],
+                                progress["target"],
+                                progress["fraction"] * 100,
+                                progress["eta_seconds"] if progress["eta_seconds"] is not None else "unknown",
+                            )
                     while not exhausted and len(pending) < workers:
                         before = len(pending)
                         submit(executor, pending)
@@ -415,7 +502,8 @@ class FotMobHistoryPipeline:
             raise
         finally:
             self.store.release_worker(worker_id)
-        status = self.store.status(league_id, season_id)
+        status = self.store.status(league_id, season_id, only_sample=only_sample)
+        progress = progress_snapshot(status)
         return {
             "status": "PASS" if failed_count == 0 else "PARTIAL",
             "league_id": str(league_id),
@@ -427,6 +515,10 @@ class FotMobHistoryPipeline:
             "failed": failed_count,
             "errors": error_count,
             "remaining": status["remaining"],
+            "failed_queue": status.get("failed", 0),
+            "elapsed_seconds": progress["elapsed_seconds"],
+            "eta_seconds": progress["eta_seconds"],
+            "progress": progress,
             "archive_files": sorted(set(archive_files)),
             "access": getattr(self.client, "metrics_snapshot", lambda: {})(),
         }

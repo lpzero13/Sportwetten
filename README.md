@@ -170,6 +170,7 @@ aktuellen Provider-Entscheidung automatisch:
 
 ~~~powershell
 $env:FOTMOB_ENABLED="true"
+$env:FOTMOB_NETWORK_MODE="manual"
 python scripts/discover_fotmob.py --root . --match-id 5881143
 python scripts/run_fotmob.py --root . --once
 ~~~
@@ -191,14 +192,24 @@ Minuten zurück. Halbzeit- und Endstand werden getrennt gespeichert; fehlende
 Werte bleiben `NULL`, und `second_half_goals` wird ausschließlich aus
 `FT total - HT total` für gültige Scores berechnet.
 
-Die Jobs sind bewusst getrennt:
+Die Jobs sind bewusst getrennt. Standardmäßig ist `FOTMOB_NETWORK_MODE=off`;
+ein bewusst manuell gestarteter Discovery-/Index-/Fetch-Job benötigt zusätzlich
+`FOTMOB_ENABLED=true` und `FOTMOB_HISTORY_ENABLED=true`. Das ist eine
+begrenzte technische Abnahme und aktiviert keinen dauerhaften Worker:
 
 ~~~powershell
-# ohne Providerfreigabe: gibt BLOCKED_BY_POLICY aus und macht keinen Request
+# ohne Opt-in: gibt BLOCKED_BY_POLICY aus und macht keinen Request
 python scripts/fotmob_history.py seasons --league 54 --root .
 python scripts/fotmob_history.py index --league 54 --season 2025/26 --root .
 
-# Katalog ausführen, wenn die Season bereits indexiert ist
+$env:FOTMOB_ENABLED="true"
+$env:FOTMOB_HISTORY_ENABLED="true"
+$env:FOTMOB_NETWORK_MODE="manual"
+
+# expliziter manueller Katalog-/Index-/Sample-/Detail-Lauf
+python scripts/fotmob_history.py seasons --league 54 --root .
+python scripts/fotmob_history.py index --league 54 --season 2025/26 --root .
+python scripts/fotmob_history.py index --league 54 --season 2024/25 --root .
 python scripts/fotmob_history.py sample --league 54 --season 2025/26 --matches 5 --root .
 python scripts/fotmob_history.py fetch --league 54 --season 2025/26 --sample-only --root .
 python scripts/fotmob_history.py status --league 54 --season 2025/26 --root .
@@ -206,10 +217,12 @@ python scripts/fotmob_history.py status --league 54 --season 2025/26 --root .
 
 Für reproduzierbare Offline-Tests akzeptieren die Discovery- und Indexjobs
 zusätzlich `--payload <lokale-datei.json>`. Ein echter historischer PASS wird
-nicht aus Fixtures simuliert. Der aktuelle Stand und die nicht ausgeführten
-externen Abnahmekriterien stehen in `outputs/V052_STATUS.md`,
-`outputs/FOTMOB_BUNDESLIGA_DISCOVERY.md` und
-`outputs/FOTMOB_BUNDESLIGA_SAMPLE.md`.
+nicht aus Fixtures simuliert; der aktuelle manuelle Real-Lauf ist in
+`outputs/V052_STATUS.md`, `outputs/FOTMOB_BUNDESLIGA_DISCOVERY.md` und
+`outputs/FOTMOB_BUNDESLIGA_SAMPLE.md` dokumentiert. Der dauerhafte Worker
+verlangt weiterhin `FOTMOB_NETWORK_MODE=worker` sowie
+`FOTMOB_PROVIDER_DECISION=PRODUCTION_READY` und
+`FOTMOB_AUTOMATED_USAGE=ACCEPTABLE_FOR_PROJECT`.
 
 ### Paper Trading
 
@@ -271,9 +284,9 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | COLLECTOR_RETRY_DELAYS_SECONDS | 1,3,10 | Retry-Verzögerungen |
 | MAX_LIVE_ODDS_AGE_SECONDS | 10 | Freshness-Grenze für Live-Quoten |
 | DEFAULT_TOTAL_STAKE_EUR | 30 | Default-Einsatz für Szenarien |
-| FOTMOB_ENABLED | false | optionales FotMob-Enrichment und Worker |
-| FOTMOB_API_BASE_URL | https://www.fotmob.com/api | konfigurierbarer FotMob-API-Bereich |
-| FOTMOB_MATCH_DETAILS_PATH | /matchDetails?matchId={match_id} | ein einzelner Match-Details-Pfad |
+| FOTMOB_ENABLED | false | optionales FotMob-Enrichment und Worker; Historical-CLI benötigt zusätzlich `FOTMOB_HISTORY_ENABLED` |
+| FOTMOB_API_BASE_URL | https://www.fotmob.com/api | Legacy-/Kompatibilitätsbasis für ausdrücklich konfigurierte alte API-Pfade |
+| FOTMOB_MATCH_DETAILS_PATH | /match/{match_id} | öffentliche Match-Details-Seite mit eingebettetem Next.js-Payload |
 | FOTMOB_TIMEOUT_SECONDS | 10 | FotMob-Timeout |
 | FOTMOB_MAX_RETRIES | 3 | FotMob-Retry-Anzahl, Delays 1/3/10 s |
 | FOTMOB_MIN_REQUEST_INTERVAL_SECONDS | 1 | Mindestabstand zwischen FotMob-Requests |
@@ -281,9 +294,10 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | FOTMOB_POLL_SECONDS | 30 | optionaler Worker-Poll |
 | FOTMOB_PROVIDER_DECISION | LIMITED_USE | V0.5.1-Providerentscheidung; Worker benötigt PRODUCTION_READY |
 | FOTMOB_AUTOMATED_USAGE | UNCLEAR | Nutzungsfreigabe; Worker benötigt ACCEPTABLE_FOR_PROJECT |
-| FOTMOB_LEAGUE_PATH | /leagues?id={league_id} | konfigurierbarer League-/Season-Discovery-Pfad |
-| FOTMOB_SEASON_PATH | /leagues?id={league_id}&season={season_id} | konfigurierbarer Fixture-/Result-Pfad |
+| FOTMOB_LEAGUE_PATH | /leagues/{league_id} | öffentliche League-Seite für Discovery |
+| FOTMOB_SEASON_PATH | /leagues/{league_id}?season={season_label} | öffentliche Fixture-/Result-Seite; Label wird als sichtbares `YYYY/YYYY` übergeben |
 | FOTMOB_HISTORY_ENABLED | false | Historical-Netzwerkzugriff, zusätzlich zur Providerfreigabe |
+| FOTMOB_NETWORK_MODE | off | `off`, `manual` für explizite CLI-Jobs, `worker` nur mit Worker-Gates |
 | FOTMOB_HISTORY_WORKERS | 1 | Historical-Detailworker, maximal 8 |
 | FOTMOB_HISTORY_REQUESTS_PER_SECOND | 0.5 | globaler Historical-Request-Limiter |
 | FOTMOB_HISTORY_TIMEOUT_SECONDS | 10 | Historical-HTTP-Timeout |

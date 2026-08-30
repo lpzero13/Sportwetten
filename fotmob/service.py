@@ -117,6 +117,7 @@ class FotMobService:
     ) -> None:
         self.settings = settings
         self.enabled = bool(settings.fotmob_enabled)
+        self.network_mode = str(getattr(settings, "fotmob_network_mode", "off")).casefold()
         self.provider_decision = str(settings.fotmob_provider_decision).upper()
         self.automated_usage = str(settings.fotmob_automated_usage).upper()
         self.manual_use_allowed = (
@@ -126,6 +127,7 @@ class FotMobService:
         )
         self.automated_worker_allowed = (
             self.enabled
+            and self.network_mode == "worker"
             and self.provider_decision == "PRODUCTION_READY"
             and self.automated_usage == "ACCEPTABLE_FOR_PROJECT"
         )
@@ -544,6 +546,7 @@ class FotMobService:
         metrics = self.store.metrics_for_date()
         client_metrics = getattr(self.client, "metrics_snapshot", lambda: {})()
         metrics["enabled"] = self.enabled
+        metrics["network_mode"] = self.network_mode
         metrics["provider_decision"] = self.provider_decision
         metrics["automated_usage"] = self.automated_usage
         metrics["manual_use_allowed"] = self.manual_use_allowed

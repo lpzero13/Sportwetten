@@ -109,6 +109,84 @@ def test_parser_preserves_nullable_stats_and_explicit_first_half() -> None:
     assert match.events[1].added_time == 1
 
 
+def test_parser_handles_current_public_next_payload_shape() -> None:
+    payload = {
+        "props": {
+            "pageProps": {
+                "general": {
+                    "matchId": "9001",
+                    "matchTimeUTCDate": "2025-08-22T18:30:00.000Z",
+                    "homeTeam": {"id": 27, "name": "Bayern München"},
+                    "awayTeam": {"id": 28, "name": "RB Leipzig"},
+                    "leagueId": 54,
+                    "leagueName": "Bundesliga",
+                    "countryCode": "GER",
+                },
+                "header": {
+                    "status": {"finished": True, "reason": {"longKey": "finished"}},
+                    "teams": [
+                        {"id": 27, "name": "Bayern München", "score": 2},
+                        {"id": 28, "name": "RB Leipzig", "score": 1},
+                    ],
+                },
+                "content": {
+                    "matchFacts": {
+                        "events": {
+                            "events": [
+                                {
+                                    "type": "Goal",
+                                    "time": 25,
+                                    "isHome": True,
+                                    "homeScore": 0,
+                                    "awayScore": 0,
+                                    "newScore": [1, 0],
+                                },
+                                {
+                                    "type": "Goal",
+                                    "time": 65,
+                                    "isHome": False,
+                                    "homeScore": 1,
+                                    "awayScore": 0,
+                                    "newScore": [1, 1],
+                                },
+                            ]
+                        }
+                    },
+                    "stats": {
+                        "Periods": {
+                            "All": {
+                                "stats": [
+                                    {"title": "Expected goals (xG)", "stats": ["1.2", "0.8"]},
+                                    {"title": "Total shots", "stats": [12, 8]},
+                                ]
+                            },
+                            "FirstHalf": {
+                                "stats": [
+                                    {"title": "Expected goals (xG)", "stats": ["0.7", "0.2"]},
+                                    {"title": "Total shots", "stats": [7, 3]},
+                                ]
+                            },
+                        }
+                    },
+                },
+            }
+        }
+    }
+
+    match = parse_fotmob_payload(payload)
+
+    assert match.provider_match_id == "9001"
+    assert match.kickoff_at == "2025-08-22T18:30:00+00:00"
+    assert match.competition_country == "GER"
+    assert match.status == "finished"
+    assert (match.ht_score_home, match.ht_score_away) == (1, 0)
+    assert (match.score_home, match.score_away) == (2, 1)
+    assert (match.stats.xg_home, match.stats.xg_away) == (1.2, 0.8)
+    assert (match.ht_stats.xg_home, match.ht_stats.xg_away) == (0.7, 0.2)
+    assert len(match.events) == 2
+    assert (match.events[0].score_home, match.events[0].score_away) == (1, 0)
+
+
 def test_matcher_requires_order_country_and_kickoff() -> None:
     tipico = MatchIdentity.from_tipico_event(tipico_event())
     matcher = MatchMatcher(tolerance_minutes=15)

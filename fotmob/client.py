@@ -99,7 +99,7 @@ class FotMobClient:
         *,
         base_url: str = "https://www.fotmob.com",
         api_base_url: str = "https://www.fotmob.com/api",
-        match_details_path: str = "/matchDetails?matchId={match_id}",
+        match_details_path: str = "/match/{match_id}",
         timeout_seconds: int = 10,
         max_retries: int = 3,
         min_request_interval_seconds: float = 1.0,
@@ -133,7 +133,8 @@ class FotMobClient:
         root = (
             self.api_base_url
             if path.startswith("/matchDetails")
-            or path.startswith("/leagues")
+            or path.startswith("/leagues?id=")
+            or path.startswith("/leagues?")
             or path.startswith("/api/")
             else self.base_url
         )

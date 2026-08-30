@@ -188,24 +188,45 @@ def extract_seasons(
     discovered_at: str | None = None,
 ) -> list[FotMobSeasonRef]:
     metadata = extract_league_metadata(payload, league_id)
-    seasons_node = _find_named(
-        payload,
+    season_items: list[Any] = []
+    # The current public league page exposes real provider IDs as
+    # stats.seasonStatLinks[].TournamentId.  Prefer that catalog over the
+    # human-readable winner/history list, which contains labels only.
+    for names in (
+        {"seasonStatLinks", "seasonLinks"},
         {"seasons", "availableSeasons", "seasonList", "seasonSelector", "seasonSelection"},
-    )
-    if seasons_node is _MISSING:
+    ):
+        seasons_node = _find_named(payload, names)
+        if seasons_node is not _MISSING:
+            season_items = _season_items(seasons_node)
+            if season_items:
+                break
+    if not season_items:
         return []
     result: dict[str, FotMobSeasonRef] = {}
-    for item in _season_items(seasons_node):
+    for item in season_items:
         if not isinstance(item, Mapping):
             continue
-        raw_id = _first(item, "seasonId", "season_id", "id", "key", "valueId")
-        raw_label = _first(item, "seasonLabel", "seasonName", "label", "name", "text", "displayName")
+        raw_id = _first(
+            item,
+            "seasonId", "season_id", "tournamentId", "tournament_id", "id", "key", "valueId",
+        )
+        raw_label = _first(
+            item,
+            "seasonLabel", "seasonName", "label", "name", "text", "displayName", "Name",
+        )
         nested_season = _first(item, "season")
         if isinstance(nested_season, Mapping):
             if raw_id is _MISSING:
-                raw_id = _first(nested_season, "seasonId", "season_id", "id", "key", "valueId")
+                raw_id = _first(
+                    nested_season,
+                    "seasonId", "season_id", "tournamentId", "tournament_id", "id", "key", "valueId",
+                )
             if raw_label is _MISSING:
-                raw_label = _first(nested_season, "seasonLabel", "seasonName", "label", "name", "text", "displayName")
+                raw_label = _first(
+                    nested_season,
+                    "seasonLabel", "seasonName", "label", "name", "text", "displayName", "Name",
+                )
         if raw_id is _MISSING or raw_id is None:
             continue
         season_id = _id(raw_id)
@@ -376,4 +397,20 @@ def season_matches_selector(season: FotMobSeasonRef | Mapping[str, Any], selecto
             season_id = ""
             label = ""
     wanted = selector.strip()
-    return wanted in {season_id, label, normalize_season_label(wanted)}
+    if wanted == season_id:
+        return True
+    return bool(_season_label_forms(wanted) & _season_label_forms(label))
+
+
+def _season_label_forms(value: Any) -> set[str]:
+    text = (_text(value) or "").replace("–", "-").replace("—", "-")
+    forms = {text, normalize_season_label(text)}
+    match = _SEASON_RE.match(text)
+    if match:
+        first = match.group("first")
+        second = match.group("second")
+        if len(second) == 4:
+            forms.add(f"{first}/{second[2:]}")
+        elif len(second) == 2:
+            forms.add(f"{first}/{first[:2]}{second}")
+    return {item for item in forms if item}

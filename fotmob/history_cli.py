@@ -49,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="fotmob_history",
         description=(
             "Opt-in FotMob Historical Discovery. Ohne --payload werden externe "
-            "Requests nur bei expliziter Providerfreigabe ausgeführt."
+            "Requests nur im ausdrücklich aktivierten manuellen CLI-Modus ausgeführt."
         ),
     )
     _add_root(parser)
@@ -166,7 +166,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     try:
         payload = _load_payload(getattr(args, "payload", None))
         if args.command == "seasons":
-            result = pipeline.discover_league(args.league_id, payload=payload)
+            result = pipeline.discover_league(
+                args.league_id,
+                payload=payload,
+                execution_mode="manual",
+            )
             return {
                 "status": _result_status(result.success, result.error),
                 "league_id": result.league_id,
@@ -176,6 +180,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "error": result.error,
                 "policy": {
                     "history_enabled": settings.fotmob_history_enabled,
+                    "network_mode": settings.fotmob_network_mode,
                     "provider_decision": settings.fotmob_provider_decision,
                     "automated_usage": settings.fotmob_automated_usage,
                 },
@@ -192,7 +197,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             # discovery endpoint.  For offline fixtures this is still fully
             # local; an explicit ID + label is the final fallback and no ID is
             # invented.
-            discovery = pipeline.discover_league(args.league_id, payload=payload)
+            discovery = pipeline.discover_league(
+                args.league_id,
+                payload=payload,
+                execution_mode="manual",
+            )
             season = _resolve_season(pipeline, args)
             if season is None:
                 season = _explicit_season(args)
@@ -205,7 +214,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             }
 
         if args.command == "index":
-            result = pipeline.index_season(args.league_id, season, payload=payload)
+            result = pipeline.index_season(
+                args.league_id,
+                season,
+                payload=payload,
+                execution_mode="manual",
+            )
             return {
                 "status": _result_status(result.success, result.error),
                 "league_id": result.league_id,
@@ -238,6 +252,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 only_sample=args.sample_only,
                 limit=args.limit,
                 batch_size=args.batch_size or settings.fotmob_history_batch_size,
+                execution_mode="manual",
             )
         raise ValueError(f"Unbekannter Befehl: {args.command}")
     finally:

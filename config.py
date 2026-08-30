@@ -64,8 +64,11 @@ def _env_choice(name: str, default: str, choices: tuple[str, ...]) -> str:
     value = os.getenv(name)
     if value is None:
         return default
-    normalized = value.strip().upper()
-    return normalized if normalized in choices else default
+    normalized = value.strip().casefold()
+    for choice in choices:
+        if normalized == choice.casefold():
+            return choice
+    return default
 
 
 LIVE_EVENT_REFRESH_SECONDS = 10
@@ -111,7 +114,7 @@ SNAPSHOT_FINAL_ENABLED = True
 FOTMOB_ENABLED = False
 FOTMOB_BASE_URL = "https://www.fotmob.com"
 FOTMOB_API_BASE_URL = "https://www.fotmob.com/api"
-FOTMOB_MATCH_DETAILS_PATH = "/matchDetails?matchId={match_id}"
+FOTMOB_MATCH_DETAILS_PATH = "/match/{match_id}"
 FOTMOB_POLL_SECONDS = 30
 FOTMOB_TIMEOUT_SECONDS = 10
 FOTMOB_MAX_RETRIES = 3
@@ -128,8 +131,8 @@ FOTMOB_AUTOMATED_USAGE_VALUES = (
     "UNCLEAR",
     "NOT_ACCEPTABLE",
 )
-FOTMOB_LEAGUE_PATH = "/leagues?id={league_id}"
-FOTMOB_SEASON_PATH = "/leagues?id={league_id}&season={season_id}"
+FOTMOB_LEAGUE_PATH = "/leagues/{league_id}"
+FOTMOB_SEASON_PATH = "/leagues/{league_id}?season={season_label}"
 FOTMOB_HISTORY_ENABLED = False
 FOTMOB_HISTORY_WORKERS = 1
 FOTMOB_HISTORY_REQUESTS_PER_SECOND = 0.5
@@ -139,6 +142,8 @@ FOTMOB_HISTORY_STALE_MINUTES = 30
 FOTMOB_HISTORY_MAX_RETRY_ATTEMPTS = 3
 FOTMOB_HISTORY_BATCH_SIZE = 100
 STORE_FOTMOB_HISTORICAL_RAW = False
+FOTMOB_NETWORK_MODE = "off"
+FOTMOB_NETWORK_MODE_VALUES = ("off", "manual", "worker")
 
 
 @dataclass(slots=True)
@@ -212,6 +217,7 @@ class Settings:
     fotmob_history_max_retry_attempts: int = FOTMOB_HISTORY_MAX_RETRY_ATTEMPTS
     fotmob_history_batch_size: int = FOTMOB_HISTORY_BATCH_SIZE
     store_fotmob_historical_raw: bool = STORE_FOTMOB_HISTORICAL_RAW
+    fotmob_network_mode: str = FOTMOB_NETWORK_MODE
 
     @property
     def database_path(self) -> Path:
@@ -396,6 +402,11 @@ class Settings:
             ),
             store_fotmob_historical_raw=_env_bool(
                 "STORE_FOTMOB_HISTORICAL_RAW", STORE_FOTMOB_HISTORICAL_RAW
+            ),
+            fotmob_network_mode=_env_choice(
+                "FOTMOB_NETWORK_MODE",
+                FOTMOB_NETWORK_MODE,
+                FOTMOB_NETWORK_MODE_VALUES,
             ),
         )
 

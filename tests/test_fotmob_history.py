@@ -17,7 +17,12 @@ from fotmob.history_models import (
     historical_row_from_match,
     score_target,
 )
-from fotmob.history_pipeline import FotMobHistoryPipeline, historical_automation_allowed
+from fotmob.history_pipeline import (
+    FotMobHistoryPipeline,
+    historical_automation_allowed,
+    manual_history_allowed,
+    worker_history_allowed,
+)
 from fotmob.history_storage import FotMobHistoryStore
 from fotmob.client import FotMobClient
 from fotmob.history_cli import main as history_cli_main
@@ -102,6 +107,7 @@ def history_settings(root: Path, **overrides: object) -> Settings:
         "fotmob_history_max_retry_attempts": 3,
         "store_fotmob_historical_raw": False,
         "fotmob_history_batch_size": 2,
+        "fotmob_network_mode": "worker",
     }
     values.update(overrides)
     return Settings(**values)
@@ -123,6 +129,7 @@ def test_history_league_paths_use_fotmob_api_base() -> None:
         min_request_interval_seconds=0,
     )
     assert client._url("/leagues?id=54") == "https://www.fotmob.com/api/leagues?id=54"
+    assert client._url("/match/123") == "https://www.fotmob.com/match/123"
 
 
 def test_index_deduplicates_and_samples_finished_matches() -> None:
@@ -303,6 +310,9 @@ def test_history_pipeline_fetches_sample_in_batches_and_is_resumable(tmp_path: P
     assert first["failed"] == 0
     assert len(client.calls) == 5
     assert database.count_rows("fotmob_historical_archive_index") == 5
+    assert first["progress"]["target"] == 5
+    assert first["progress"]["fraction"] == 1.0
+    assert first["eta_seconds"] is None
 
     archive_files = list(
         (tmp_path / "data" / "archive" / "fotmob" / "historical" / "league_id=54" / "season=2025-26").glob("*.parquet")
@@ -335,11 +345,65 @@ def test_policy_gate_blocks_network_without_calling_client(tmp_path: Path) -> No
     client = CountingClient()
     settings = Settings(root_dir=tmp_path)
     assert historical_automation_allowed(settings) is False
+    assert manual_history_allowed(settings) is False
+    assert worker_history_allowed(settings) is False
     pipeline = FotMobHistoryPipeline(settings, database, client=client)
     result = pipeline.discover_league("54")
     assert result.success is False
     assert "gesperrt" in (result.error or "")
     assert client.calls == 0
+    database.close()
+
+
+def test_manual_history_mode_does_not_need_worker_provider_gates(tmp_path: Path) -> None:
+    manual = Settings(
+        root_dir=tmp_path,
+        fotmob_enabled=True,
+        fotmob_history_enabled=True,
+        fotmob_network_mode="manual",
+        fotmob_provider_decision="LIMITED_USE",
+        fotmob_automated_usage="UNCLEAR",
+    )
+    assert manual_history_allowed(manual) is True
+    assert worker_history_allowed(manual) is False
+    assert historical_automation_allowed(manual) is False
+
+    worker = Settings(
+        root_dir=tmp_path,
+        fotmob_enabled=True,
+        fotmob_history_enabled=True,
+        fotmob_network_mode="worker",
+        fotmob_provider_decision="PRODUCTION_READY",
+        fotmob_automated_usage="ACCEPTABLE_FOR_PROJECT",
+    )
+    assert worker_history_allowed(worker) is True
+
+
+def test_manual_history_mode_allows_explicit_discovery(tmp_path: Path) -> None:
+    class CountingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch_json(self, endpoint: str) -> FotMobFetchResult:
+            self.calls += 1
+            return FotMobFetchResult(success=True, payload=league_payload())
+
+    database = Database(tmp_path / "data" / "tipico.db")
+    client = CountingClient()
+    settings = Settings(
+        root_dir=tmp_path,
+        fotmob_enabled=True,
+        fotmob_history_enabled=True,
+        fotmob_network_mode="manual",
+        fotmob_provider_decision="LIMITED_USE",
+        fotmob_automated_usage="UNCLEAR",
+    )
+    result = FotMobHistoryPipeline(settings, database, client=client).discover_league(
+        "54",
+        execution_mode="manual",
+    )
+    assert result.success is True
+    assert client.calls == 1
     database.close()
 
 

@@ -37,7 +37,8 @@ def run_once(service: FotMobService, logger: logging.Logger) -> dict[str, int]:
         return {"refreshed": 0, "errors": 0}
     if not service.automated_worker_allowed:
         logger.info(
-            "FotMob worker disabled by provider policy: decision=%s automated_usage=%s",
+            "FotMob worker disabled: network_mode=%s decision=%s automated_usage=%s",
+            service.network_mode,
             service.provider_decision,
             service.automated_usage,
         )
