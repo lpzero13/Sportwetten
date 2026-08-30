@@ -5,8 +5,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from config import Settings
+from fotmob.client import FotMobClient
 from fotmob.matching import MatchIdentity, MatchMatcher
-from fotmob.models import FotMobFetchResult, FotMobMatch, FotMobStats
+from fotmob.models import FOTMOB_SNAPSHOT_TYPES, FotMobFetchResult, FotMobMatch, FotMobStats
 from fotmob.parser import parse_fotmob_payload
 from fotmob.service import FotMobService, compare_halftime, compare_results
 from storage.database import Database
@@ -155,6 +156,78 @@ class FakeFotMobClient:
         return {"requests": self.calls, "successes": 0 if self.fail else self.calls}
 
 
+class FakeResponse:
+    def __init__(self, status_code: int, payload: dict | None = None) -> None:
+        self.status_code = status_code
+        self.content = (
+            __import__("json").dumps(payload or {}).encode("utf-8") if payload is not None else b""
+        )
+        self._payload = payload
+
+    def json(self) -> dict:
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+class FakeSession:
+    def __init__(self, responses: list[FakeResponse]) -> None:
+        self.headers: dict[str, str] = {}
+        self.responses = responses
+
+    def get(self, url: str, *, timeout: int) -> FakeResponse:
+        return self.responses.pop(0)
+
+
+def test_access_metrics_expose_latency_http_and_parse_failures() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(200, sample_payload(match_id=1)),
+            FakeResponse(200, sample_payload(match_id=2)),
+            FakeResponse(429),
+        ]
+    )
+    client = FotMobClient(session=session, max_retries=0, min_request_interval_seconds=0)
+    assert client.fetch_match_details("1").success
+    assert client.fetch_match_details("2").success
+    assert client.fetch_match_details("3").success is False
+    metrics = client.metrics_snapshot()
+    assert metrics["requests"] == 3
+    assert metrics["successes"] == 2
+    assert metrics["http_failures"] == 1
+    assert metrics["rate_limit_responses"] == 1
+    assert metrics["median_response_ms"] >= 0
+    assert metrics["p95_response_ms"] >= 0
+    assert metrics["status_counts"]["429"] == 1
+
+    parse_failure_client = FotMobClient(
+        session=FakeSession([FakeResponse(200, {"general": {}})]),
+        max_retries=0,
+        min_request_interval_seconds=0,
+    )
+    assert parse_failure_client.fetch_match_details("bad").success is False
+    assert parse_failure_client.metrics_snapshot()["parse_failures"] == 1
+
+
+def test_provider_policy_disables_automatic_worker_but_keeps_explicit_service_capability(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "data" / "tipico.db")
+    settings = Settings(root_dir=tmp_path, fotmob_enabled=True)
+    service = FotMobService(settings, database, client=FakeFotMobClient(None, fail=True))
+    assert service.provider_decision == "LIMITED_USE"
+    assert service.automated_usage == "UNCLEAR"
+    assert service.automated_worker_allowed is False
+    metrics = service.metrics()
+    assert metrics["provider_decision"] == "LIMITED_USE"
+    assert metrics["manual_use_allowed"] is True
+    assert metrics["automated_worker_allowed"] is False
+    blocked = service.refresh_for_tipico_event(tipico_event(), snapshot_type="HALFTIME")
+    assert blocked.success is False
+    assert "Provider-Policy" in (blocked.error or "")
+    database.close()
+
+
 def test_service_uses_same_db_and_keeps_current_refresh_out_of_history(tmp_path: Path) -> None:
     database = Database(tmp_path / "data" / "tipico.db")
     match = parse_fotmob_payload(sample_payload())
@@ -191,6 +264,21 @@ def test_ht_snapshot_is_idempotent_and_archive_is_zstd_parquet(tmp_path: Path) -
     database.close()
 
 
+def test_snapshot_contract_has_exactly_seven_slots(tmp_path: Path) -> None:
+    database = Database(tmp_path / "data" / "tipico.db")
+    match = parse_fotmob_payload(sample_payload())
+    settings = Settings(root_dir=tmp_path, fotmob_enabled=True, fotmob_min_request_interval_seconds=0)
+    service = FotMobService(settings, database, client=FakeFotMobClient(match))
+    service.match_tipico_event(tipico_event(), [match])
+    internal_id = service.store.match_row_for_tipico_event("tipico-1")["internal_match_id"]
+    for snapshot_type in FOTMOB_SNAPSHOT_TYPES:
+        assert service.refresh_link(internal_id, snapshot_type=snapshot_type).success
+    rows = service.store.snapshots_for_match(internal_id)
+    assert len(rows) == 7
+    assert {row["snapshot_type"] for row in rows} == set(FOTMOB_SNAPSHOT_TYPES)
+    database.close()
+
+
 def test_result_consistency_is_explicit() -> None:
     match = parse_fotmob_payload(sample_payload())
     result = {"ft_home": 5, "ft_away": 1, "ht_home": 1, "ht_away": 0}
@@ -211,6 +299,7 @@ def test_provider_failure_does_not_break_tipico_database(tmp_path: Path) -> None
     event = tipico_event()
     result = service.discover_and_match(event, "missing")
     assert result.success is False
+    assert result.internal_match_id is not None
     assert service.store.match_row_for_tipico_event(event.event_id) is not None
     assert database.count_rows("events") == 0
     database.close()

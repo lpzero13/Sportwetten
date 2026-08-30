@@ -8,6 +8,11 @@ Stand: 30.08.2026, Europe/Berlin
 
 **Status: browser-verifiziert, Automationsvertrag noch offen.**
 
+Die V0.5.1-Abschlussentscheidung ist in
+[FOTMOB_FINAL_VALIDATION.md](FOTMOB_FINAL_VALIDATION.md) dokumentiert:
+`FOTMOB_PROVIDER_DECISION = LIMITED_USE` und
+`AUTOMATED_USAGE = UNCLEAR`.
+
 Die öffentliche FotMob-Webseite wurde mit dem Browser geprüft. Sichtbar und
 ohne Login gefunden wurden:
 
@@ -101,4 +106,6 @@ python scripts/discover_fotmob.py --root . --match-id 5881143
 ```
 
 Dieser Probeabruf ist absichtlich auf ein Match begrenzt. Die Nutzung muss
-mit den jeweils geltenden Bedingungen der Quelle vereinbar sein.
+mit den jeweils geltenden Bedingungen der Quelle vereinbar sein. Ein
+periodischer Worker ist in V0.5.1 wegen der Provider-Entscheidung deaktiviert;
+Details stehen in [FOTMOB_PROVIDER_DECISION.md](FOTMOB_PROVIDER_DECISION.md).

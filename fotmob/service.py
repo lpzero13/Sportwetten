@@ -117,6 +117,18 @@ class FotMobService:
     ) -> None:
         self.settings = settings
         self.enabled = bool(settings.fotmob_enabled)
+        self.provider_decision = str(settings.fotmob_provider_decision).upper()
+        self.automated_usage = str(settings.fotmob_automated_usage).upper()
+        self.manual_use_allowed = (
+            self.enabled
+            and self.provider_decision != "NOT_SUITABLE"
+            and self.automated_usage != "NOT_ACCEPTABLE"
+        )
+        self.automated_worker_allowed = (
+            self.enabled
+            and self.provider_decision == "PRODUCTION_READY"
+            and self.automated_usage == "ACCEPTABLE_FOR_PROJECT"
+        )
         self.logger = logger or logging.getLogger("tipico.fotmob")
         self.store = FotMobStore(database, settings.archive_path)
         self.client = client or FotMobClient(
@@ -414,13 +426,23 @@ class FotMobService:
                 internal_match_id=internal_match_id,
                 error="FotMob ist deaktiviert (FOTMOB_ENABLED=false).",
             )
+        if not self.manual_use_allowed:
+            return FotMobRefreshResult(
+                False,
+                internal_match_id=internal_match_id,
+                error=(
+                    "FotMob-Einzelspielnutzung ist durch die Provider-Policy "
+                    f"deaktiviert (decision={self.provider_decision}, "
+                    f"automated_usage={self.automated_usage})."
+                ),
+            )
         fetched = self.client.fetch_match_details(str(provider_match_id))
         if not isinstance(fetched, FotMobFetchResult):
             fetched = FotMobFetchResult(success=True, match=fetched)
         if not fetched.success or fetched.match is None:
             error = fetched.error or "FotMob-Match konnte nicht gelesen werden."
             self.last_error = error
-            result = FotMobRefreshResult(False, error=error)
+            result = FotMobRefreshResult(False, internal_match_id=internal_match_id, error=error)
             self.last_result = result
             return result
         match_result = self.match_tipico_event(event, [fetched.match])
@@ -449,6 +471,15 @@ class FotMobService:
     ) -> FotMobRefreshResult:
         if not self.enabled:
             return FotMobRefreshResult(False, internal_match_id=internal_match_id, error="FotMob ist deaktiviert.")
+        if not self.manual_use_allowed:
+            return FotMobRefreshResult(
+                False,
+                internal_match_id=internal_match_id,
+                error=(
+                    "FotMob-Refresh ist durch die Provider-Policy deaktiviert "
+                    f"(decision={self.provider_decision}, automated_usage={self.automated_usage})."
+                ),
+            )
         link = self.store.link_for_internal(internal_match_id)
         if link is None or link["match_status"] in {"REJECTED", "UNMATCHED", "AMBIGUOUS"}:
             return FotMobRefreshResult(False, internal_match_id=internal_match_id, error="Kein bestätigter FotMob-Link vorhanden.")
@@ -475,6 +506,16 @@ class FotMobService:
         snapshot_type: str | None = None,
     ) -> FotMobRefreshResult:
         internal_match_id = self.ensure_tipico_event(event)
+        if not self.automated_worker_allowed:
+            return FotMobRefreshResult(
+                False,
+                internal_match_id=internal_match_id,
+                error=(
+                    "Automatisches FotMob-Refresh ist durch die Provider-Policy "
+                    f"deaktiviert (decision={self.provider_decision}, "
+                    f"automated_usage={self.automated_usage})."
+                ),
+            )
         if snapshot_type == "HALFTIME":
             current = self.store.current_state(internal_match_id)
             observed = _parse_time(str(current["observed_at"])) if current is not None else None
@@ -503,5 +544,9 @@ class FotMobService:
         metrics = self.store.metrics_for_date()
         client_metrics = getattr(self.client, "metrics_snapshot", lambda: {})()
         metrics["enabled"] = self.enabled
+        metrics["provider_decision"] = self.provider_decision
+        metrics["automated_usage"] = self.automated_usage
+        metrics["manual_use_allowed"] = self.manual_use_allowed
+        metrics["automated_worker_allowed"] = self.automated_worker_allowed
         metrics["access"] = client_metrics
         return metrics

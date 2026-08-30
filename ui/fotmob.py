@@ -77,7 +77,8 @@ def render_fotmob_tab(service: FotMobService, event: Any) -> None:
     st.subheader("FotMob Enrichment")
     st.caption(
         "Optionale zweite Datenquelle. FotMob-Werte beeinflussen keine Quoten, "
-        "kein Ranking und keinen Paper-Trade."
+        "kein Ranking und keinen Paper-Trade. "
+        f"Entscheidung: {service.provider_decision} · Automatisierung: {service.automated_usage}."
     )
     internal_match_id = service.ensure_tipico_event(event)
     link = service.store.link_for_internal(internal_match_id)
@@ -96,6 +97,13 @@ def render_fotmob_tab(service: FotMobService, event: Any) -> None:
     if not service.enabled:
         st.info("FotMob ist deaktiviert. Für die optionale Nutzung FOTMOB_ENABLED=true setzen.")
         return
+    if not service.manual_use_allowed:
+        st.warning("FotMob-Einzelspielnutzung ist durch die aktuelle Provider-Policy deaktiviert.")
+        return
+    st.info(
+        "V0.5.1: FotMob ist nur für ein ausdrücklich ausgewähltes Einzelspiel aktiv. "
+        "Der periodische Worker bleibt bei dieser Provider-Entscheidung deaktiviert."
+    )
 
     provider_id = st.text_input(
         "FotMob Match-ID",
@@ -174,6 +182,12 @@ def render_fotmob_debug(service: FotMobService) -> None:
     columns[2].metric("Links", metrics["links"])
     columns[3].metric("Current", metrics["current_state"])
     columns[4].metric("Snapshots", metrics["snapshots"])
+    st.caption(
+        f"Provider-Entscheidung: {metrics['provider_decision']} · "
+        f"Automatisierung: {metrics['automated_usage']} · "
+        f"Einzelspiel: {'AN' if metrics['manual_use_allowed'] else 'AUS'} · "
+        f"Worker: {'AN' if metrics['automated_worker_allowed'] else 'AUS'}"
+    )
     st.subheader("FotMob Access")
     st.write(
         {

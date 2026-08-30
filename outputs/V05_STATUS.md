@@ -4,8 +4,10 @@ Stand: 30.08.2026
 
 ## Gesamtstatus
 
-**PARTIAL – Implementierung und lokale Verifikation abgeschlossen; reale
-strukturierte FotMob-Langzeitvalidierung bleibt offen.**
+Die V0.5-Basisimplementierung ist lokal verifiziert. Der Abschluss von
+V0.5.1 ist **PASS**: Die reale strukturierte Serienvalidierung wurde wegen
+`AUTOMATED_USAGE=UNCLEAR` nicht erzwungen, und die Provider-Entscheidung ist
+`LIMITED_USE`.
 
 V0.4.2 bleibt fachlich unverändert. FotMob ist ein optionales Enrichment und
 hat keinen Pfad in Tipico-Marktlogik, Strategie, Ranking, Paper-Entry oder
@@ -38,7 +40,22 @@ Keine FotMob-Quoten, keine beste Quote, keine normalisierte Wettsemantik,
 keine Strategieänderung, keine automatische HZ2-Wette, kein ROI-/Ranking-
 Einfluss, kein Bulk-Historical-Import und keine Schätzung fehlender HT-Stats.
 
-## Offene Validierung
+## V0.5.1-Abschluss
+
+Die vollständige Abschlussprüfung, Coverage-Matrix und Entscheidung stehen in:
+
+- [FOTMOB_FINAL_VALIDATION.md](FOTMOB_FINAL_VALIDATION.md)
+- [FOTMOB_HISTORICAL_COVERAGE.md](FOTMOB_HISTORICAL_COVERAGE.md)
+- [FOTMOB_PROVIDER_DECISION.md](FOTMOB_PROVIDER_DECISION.md)
+- [V051_STATUS.md](V051_STATUS.md)
+
+```text
+FOTMOB_V051_STATUS = PASS
+FOTMOB_PROVIDER_DECISION = LIMITED_USE
+AUTOMATED_USAGE = UNCLEAR
+```
+
+## Historischer Validierungsstand der V0.5-Basis
 
 | Bereich | Status |
 |---|---|
@@ -52,5 +69,6 @@ Einfluss, kein Bulk-Historical-Import und keine Schätzung fehlender HT-Stats.
 | FotMob-Ausfall ohne Tipico/Paper-Ausfall | PASS durch Trennung und Tests |
 
 Die externe Zugriffsgrenze und die konkreten Browserbefunde sind in
-`outputs/FOTMOB_DISCOVERY.md` dokumentiert. Für eine produktive Aktivierung
-muss die Nutzung der Quelle mit ihren aktuellen Bedingungen vereinbar sein.
+`outputs/FOTMOB_DISCOVERY.md` dokumentiert. Bei der V0.5.1-Entscheidung bleibt
+die Nutzung auf manuelle Einzelspiele beschränkt; der periodische Worker ist
+bei der aktuellen Policy deaktiviert.

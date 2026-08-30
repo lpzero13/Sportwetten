@@ -35,6 +35,13 @@ def run_once(service: FotMobService, logger: logging.Logger) -> dict[str, int]:
     if not service.enabled:
         logger.info("FotMob worker disabled: FOTMOB_ENABLED=false")
         return {"refreshed": 0, "errors": 0}
+    if not service.automated_worker_allowed:
+        logger.info(
+            "FotMob worker disabled by provider policy: decision=%s automated_usage=%s",
+            service.provider_decision,
+            service.automated_usage,
+        )
+        return {"refreshed": 0, "errors": 0}
     for link in service.store.links(limit=500):
         if link["match_status"] not in {"EXACT", "HIGH_CONFIDENCE", "MANUALLY_CONFIRMED"}:
             continue
@@ -58,7 +65,7 @@ def main() -> None:
     database = Database(settings.database_path)
     service = FotMobService(settings, database, logger=logger)
     try:
-        if not service.enabled:
+        if not service.enabled or not service.automated_worker_allowed:
             run_once(service, logger)
             return
         if args.once:

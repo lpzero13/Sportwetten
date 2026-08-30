@@ -1,16 +1,26 @@
-# FotMob Matching Report – V0.5
+# FotMob Matching Report – V0.5.1
 
-Stand: 30.08.2026
+Stand: 30.08.2026, Europe/Berlin
 
 ## Aktueller Verifikationsstand
 
 Die Matching-Engine und die persistente Storage-Struktur sind implementiert.
-Ein produktiver Live-Durchlauf mit automatisch gefundenen FotMob-Kandidaten
-wurde in dieser Milestone-Discovery noch nicht ausgeführt: **Coverage 0
-automatisch bestätigte Live-Links / 0 Kandidaten aus einem Bulk-Sample**.
-Das ist bewusst kein erfundener PASS-Wert. Eine einzelne FotMob Match-ID kann
-im Eventdetail eingegeben und anschließend deterministisch bzw. manuell
-bestätigt werden.
+Die reale Browser-Stichprobe umfasst **1 manuell geprüftes FotMob-Match**:
+Bayern München – VfB Stuttgart, Bundesliga, Deutschland, 28.08.2026.
+Für dieses Beispiel wurde in der Abschlussprüfung keine automatische Tipico-
+Serienpaarung ausgeführt. Automatische Coverage ist daher
+`NOT_RUN_BY_POLICY`, nicht ein als Produktionswert misszuverstehendes 0/0.
+
+| Messgröße | Ergebnis |
+|---|---:|
+| reale manuelle FotMob-Identitätsstichprobe | 1 |
+| automatisch verlinkte Tipico-Events | NOT_RUN_BY_POLICY |
+| manuell bestätigte Tipico-Links aus dieser Stichprobe | NOT_RUN_BY_POLICY |
+| Bulk-Candidates | NOT_RUN_BY_POLICY |
+| Browser-Crosscheck | 1 |
+
+Die Begrenzung folgt `AUTOMATED_USAGE=UNCLEAR` und der in der Quelle sichtbaren
+Einschränkung gegen systematische oder regelmäßige automatische Nutzung.
 
 ## Pipeline
 
@@ -57,6 +67,9 @@ Reserve-Schutz, Länder- und Zeitkonflikt, Ambiguität, nullable Stats,
 persistenten Alias, Current-State-Refresh ohne Historienwachstum,
 idempotente Halbzeitslots, Provider-Ausfall und Ergebnisvergleich ab.
 
-Offen für die nächste Validierung sind reale Stichproben aus Live, Upcoming,
-historischen Top-/Second-/Small-Leagues sowie Frauen und Jugend. Diese werden
-bewusst einzeln und moderat ausgeführt, nicht als Bulk-Import.
+Die geforderten Serien aus Live, Upcoming, Top-/Second-/Small-Leagues sowie
+Frauen und Jugend wurden deshalb nicht künstlich erzwungen. Sie sind in
+V0.5.1 `NOT_SAMPLED_BY_POLICY`. Die technische und fachliche Entscheidung
+steht in [FOTMOB_FINAL_VALIDATION.md](FOTMOB_FINAL_VALIDATION.md) und
+[FOTMOB_PROVIDER_DECISION.md](FOTMOB_PROVIDER_DECISION.md); es wird kein
+weiterer FotMob-Discovery-Milestone eröffnet.

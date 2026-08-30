@@ -29,6 +29,8 @@ def main() -> None:
     settings = Settings.from_env(args.root.resolve())
     result: dict[str, object] = {
         "enabled": settings.fotmob_enabled,
+        "provider_decision": settings.fotmob_provider_decision,
+        "automated_usage": settings.fotmob_automated_usage,
         "base_url": settings.fotmob_base_url,
         "api_base_url": settings.fotmob_api_base_url,
         "match_details_path": settings.fotmob_match_details_path,
@@ -44,6 +46,14 @@ def main() -> None:
     if not settings.fotmob_enabled:
         result["status"] = "DISABLED"
         result["error"] = "Set FOTMOB_ENABLED=true explicitly for a one-match probe."
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+    if (
+        settings.fotmob_provider_decision == "NOT_SUITABLE"
+        or settings.fotmob_automated_usage == "NOT_ACCEPTABLE"
+    ):
+        result["status"] = "BLOCKED_BY_POLICY"
+        result["error"] = "FotMob single-match use is blocked by the provider policy."
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return
     client = FotMobClient(

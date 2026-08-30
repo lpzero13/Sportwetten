@@ -86,12 +86,13 @@ def render_halftime_scanner(
     fotmob_errors: list[str] = []
     if (
         fotmob_service is not None
-        and fotmob_service.enabled
+        and fotmob_service.automated_worker_allowed
         and scan_started
     ):
-        # This is the explicit Tipico-HZ -> FotMob coordination point.  It
-        # only refreshes confirmed links and writes the idempotent HALFTIME
-        # slot; the Tipico ranking below is not recalculated from these stats.
+        # This is the explicit Tipico-HZ -> FotMob coordination point.  It is
+        # only active for an explicitly production-approved provider policy,
+        # refreshes confirmed links and writes the idempotent HALFTIME slot;
+        # the Tipico ranking below is not recalculated from these stats.
         for event in events:
             internal_id = fotmob_service.ensure_tipico_event(event)
             link = fotmob_service.store.link_for_internal(internal_id)

@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import math
+import statistics
 import threading
 import time
 from dataclasses import dataclass, field
@@ -40,6 +42,11 @@ class FotMobAccessMetrics:
     last_request_at: str | None = None
     last_success_at: str | None = None
     response_sizes: list[int] = field(default_factory=list)
+    response_times_ms: list[int] = field(default_factory=list)
+    status_counts: dict[str, int] = field(default_factory=dict)
+    http_failures: int = 0
+    rate_limit_responses: int = 0
+    parse_failures: int = 0
 
     @property
     def average_response_ms(self) -> float:
@@ -49,15 +56,33 @@ class FotMobAccessMetrics:
     def average_payload_bytes(self) -> float:
         return sum(self.response_sizes) / len(self.response_sizes) if self.response_sizes else 0.0
 
+    @property
+    def median_response_ms(self) -> float:
+        return statistics.median(self.response_times_ms) if self.response_times_ms else 0.0
+
+    @property
+    def p95_response_ms(self) -> float:
+        if not self.response_times_ms:
+            return 0.0
+        ordered = sorted(self.response_times_ms)
+        index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * 0.95) - 1))
+        return float(ordered[index])
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "requests": self.requests,
             "successes": self.successes,
             "errors": self.errors,
             "retries": self.retries,
+            "http_failures": self.http_failures,
+            "rate_limit_responses": self.rate_limit_responses,
+            "parse_failures": self.parse_failures,
             "average_response_ms": round(self.average_response_ms, 1),
+            "median_response_ms": round(self.median_response_ms, 1),
+            "p95_response_ms": round(self.p95_response_ms, 1),
             "last_response_ms": self.last_response_ms,
             "last_status_code": self.last_status_code,
+            "status_counts": dict(self.status_counts),
             "last_endpoint": self.last_endpoint,
             "last_error": self.last_error,
             "last_request_at": self.last_request_at,
@@ -159,7 +184,13 @@ class FotMobClient:
                 self.metrics.last_response_ms = elapsed_ms
                 self.metrics.last_status_code = status_code
                 self.metrics.response_sizes.append(payload_size)
+                self.metrics.response_times_ms.append(elapsed_ms)
+                status_key = str(status_code)
+                self.metrics.status_counts[status_key] = self.metrics.status_counts.get(status_key, 0) + 1
                 if status_code >= 400:
+                    self.metrics.http_failures += 1
+                    if status_code == 429:
+                        self.metrics.rate_limit_responses += 1
                     raise FotMobAccessError(f"FotMob HTTP {status_code}")
                 try:
                     payload = response.json()
@@ -190,7 +221,22 @@ class FotMobClient:
         started = time.perf_counter()
         try:
             payload, status_code, response_ms, payload_size = self._get_json(endpoint)
-            match = parse_fotmob_payload(payload, provider_match_id=str(provider_match_id))
+            try:
+                match = parse_fotmob_payload(payload, provider_match_id=str(provider_match_id))
+            except (TypeError, ValueError, KeyError) as exc:
+                self.metrics.parse_failures += 1
+                self.metrics.errors += 1
+                self.metrics.last_error = str(exc)
+                return FotMobFetchResult(
+                    success=False,
+                    payload=payload,
+                    status_code=status_code,
+                    response_time_ms=response_ms,
+                    payload_size=payload_size,
+                    endpoint=self._url(endpoint),
+                    error=str(exc),
+                    attempts=self._last_attempts,
+                )
             return FotMobFetchResult(
                 success=True,
                 match=match,

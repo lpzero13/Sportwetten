@@ -60,6 +60,14 @@ def _env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(values) or default
 
 
+def _env_choice(name: str, default: str, choices: tuple[str, ...]) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().upper()
+    return normalized if normalized in choices else default
+
+
 LIVE_EVENT_REFRESH_SECONDS = 10
 EVENT_MARKET_REFRESH_SECONDS = 5
 STORE_RAW_RESPONSES = True
@@ -112,6 +120,14 @@ FOTMOB_MATCHING_TOLERANCE_MINUTES = 15
 FOTMOB_HT_STABLE_DELAY_SECONDS = 45
 FOTMOB_SNAPSHOT_OUTBOX_EXPORT_INTERVAL_SECONDS = 300
 FOTMOB_SNAPSHOT_OUTBOX_BATCH_SIZE = 100
+FOTMOB_PROVIDER_DECISION = "LIMITED_USE"
+FOTMOB_AUTOMATED_USAGE = "UNCLEAR"
+FOTMOB_PROVIDER_DECISION_VALUES = ("PRODUCTION_READY", "LIMITED_USE", "NOT_SUITABLE")
+FOTMOB_AUTOMATED_USAGE_VALUES = (
+    "ACCEPTABLE_FOR_PROJECT",
+    "UNCLEAR",
+    "NOT_ACCEPTABLE",
+)
 
 
 @dataclass(slots=True)
@@ -172,6 +188,8 @@ class Settings:
     fotmob_ht_stable_delay_seconds: int = FOTMOB_HT_STABLE_DELAY_SECONDS
     fotmob_snapshot_outbox_export_interval_seconds: int = FOTMOB_SNAPSHOT_OUTBOX_EXPORT_INTERVAL_SECONDS
     fotmob_snapshot_outbox_batch_size: int = FOTMOB_SNAPSHOT_OUTBOX_BATCH_SIZE
+    fotmob_provider_decision: str = FOTMOB_PROVIDER_DECISION
+    fotmob_automated_usage: str = FOTMOB_AUTOMATED_USAGE
 
     @property
     def database_path(self) -> Path:
@@ -314,6 +332,16 @@ class Settings:
             fotmob_snapshot_outbox_batch_size=_env_int(
                 "FOTMOB_SNAPSHOT_OUTBOX_BATCH_SIZE",
                 FOTMOB_SNAPSHOT_OUTBOX_BATCH_SIZE,
+            ),
+            fotmob_provider_decision=_env_choice(
+                "FOTMOB_PROVIDER_DECISION",
+                FOTMOB_PROVIDER_DECISION,
+                FOTMOB_PROVIDER_DECISION_VALUES,
+            ),
+            fotmob_automated_usage=_env_choice(
+                "FOTMOB_AUTOMATED_USAGE",
+                FOTMOB_AUTOMATED_USAGE,
+                FOTMOB_AUTOMATED_USAGE_VALUES,
             ),
         )
 

@@ -152,18 +152,21 @@ Die Seite **Data Collection** liest ausschließlich Current State, SQLite,
 Parquet-Metadaten und `data/collector_status.json`; sie startet keinen Collector
 und entscheidet nicht über die Datensammlung.
 
-### Optionales FotMob-Enrichment
+### Optionales FotMob-Enrichment (V0.5.1 abgeschlossen)
 
 FotMob ist vollständig vom Tipico-Collector getrennt und standardmäßig
 deaktiviert. Der FotMob-Tab zeigt nach einer bestätigten Verknüpfung nur
 Matchstatus und Fußballstatistiken. FotMob-Werte werden weder für das
 Tipico-Market-Ranking noch für Paper-Trades oder Settlement verwendet.
 
-Die öffentliche Browser-Discovery und die Einschränkung, dass eine sichtbare
-Seite keinen stabilen Automationsvertrag garantiert, stehen in
-`outputs/FOTMOB_DISCOVERY.md`. Für einen einzelnen ausdrücklich gewünschten
-Probeabruf gibt es `scripts/discover_fotmob.py`. Der optionale Worker liest nur
-bestätigte Match-Links:
+Die V0.5.1-Entscheidung lautet `FOTMOB_PROVIDER_DECISION=LIMITED_USE` bei
+`AUTOMATED_USAGE=UNCLEAR`. Die öffentliche Browser-Discovery, historische
+Coverage und Begründung stehen in `outputs/FOTMOB_FINAL_VALIDATION.md`,
+`outputs/FOTMOB_HISTORICAL_COVERAGE.md` und
+`outputs/FOTMOB_PROVIDER_DECISION.md`. Standardmäßig bleibt FotMob aus. Für
+ein einzelnes ausdrücklich gewünschtes Match gibt es
+`scripts/discover_fotmob.py`; der periodische Worker verweigert sich bei der
+aktuellen Provider-Entscheidung automatisch:
 
 ~~~powershell
 $env:FOTMOB_ENABLED="true"
@@ -172,9 +175,9 @@ python scripts/run_fotmob.py --root . --once
 ~~~
 
 Für Proxmox ist `wetten-fotmob.service` vorhanden, wird vom Installationsskript
-aber nicht automatisch aktiviert. Der Service muss nur nach Prüfung der
-aktuellen Nutzungsbedingungen und nach Setzen von `FOTMOB_ENABLED=true`
-manuell gestartet werden.
+nicht aktiviert und bleibt bei `LIMITED_USE`/`UNCLEAR` ohne periodische
+Requests. Eine Freigabe für produktive Automation wäre eine neue, ausdrücklich
+zulässige Provider-Entscheidung; sie ist in V0.5.1 nicht gesetzt.
 
 ### Paper Trading
 
@@ -244,10 +247,13 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | FOTMOB_MIN_REQUEST_INTERVAL_SECONDS | 1 | Mindestabstand zwischen FotMob-Requests |
 | FOTMOB_MATCHING_TOLERANCE_MINUTES | 15 | Kickoff-Matchingfenster |
 | FOTMOB_POLL_SECONDS | 30 | optionaler Worker-Poll |
+| FOTMOB_PROVIDER_DECISION | LIMITED_USE | V0.5.1-Providerentscheidung; Worker benötigt PRODUCTION_READY |
+| FOTMOB_AUTOMATED_USAGE | UNCLEAR | Nutzungsfreigabe; Worker benötigt ACCEPTABLE_FOR_PROJECT |
 
 Die verifizierten Tipico-Endpunkte stehen in outputs/DISCOVERY.md. Die FotMob-
-Discovery und Matching-Grenzen stehen in outputs/FOTMOB_DISCOVERY.md und
-outputs/FOTMOB_MATCHING_REPORT.md.
+Discovery, Abschlussvalidierung und Providerentscheidung stehen in
+outputs/FOTMOB_DISCOVERY.md, outputs/FOTMOB_FINAL_VALIDATION.md,
+outputs/FOTMOB_MATCHING_REPORT.md und outputs/FOTMOB_PROVIDER_DECISION.md.
 
 ### Storage-Migration und Cleanup
 
