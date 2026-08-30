@@ -128,6 +128,17 @@ FOTMOB_AUTOMATED_USAGE_VALUES = (
     "UNCLEAR",
     "NOT_ACCEPTABLE",
 )
+FOTMOB_LEAGUE_PATH = "/leagues?id={league_id}"
+FOTMOB_SEASON_PATH = "/leagues?id={league_id}&season={season_id}"
+FOTMOB_HISTORY_ENABLED = False
+FOTMOB_HISTORY_WORKERS = 1
+FOTMOB_HISTORY_REQUESTS_PER_SECOND = 0.5
+FOTMOB_HISTORY_TIMEOUT_SECONDS = 10
+FOTMOB_HISTORY_MAX_RETRIES = 3
+FOTMOB_HISTORY_STALE_MINUTES = 30
+FOTMOB_HISTORY_MAX_RETRY_ATTEMPTS = 3
+FOTMOB_HISTORY_BATCH_SIZE = 100
+STORE_FOTMOB_HISTORICAL_RAW = False
 
 
 @dataclass(slots=True)
@@ -190,6 +201,17 @@ class Settings:
     fotmob_snapshot_outbox_batch_size: int = FOTMOB_SNAPSHOT_OUTBOX_BATCH_SIZE
     fotmob_provider_decision: str = FOTMOB_PROVIDER_DECISION
     fotmob_automated_usage: str = FOTMOB_AUTOMATED_USAGE
+    fotmob_league_path: str = FOTMOB_LEAGUE_PATH
+    fotmob_season_path: str = FOTMOB_SEASON_PATH
+    fotmob_history_enabled: bool = FOTMOB_HISTORY_ENABLED
+    fotmob_history_workers: int = FOTMOB_HISTORY_WORKERS
+    fotmob_history_requests_per_second: float = FOTMOB_HISTORY_REQUESTS_PER_SECOND
+    fotmob_history_timeout_seconds: int = FOTMOB_HISTORY_TIMEOUT_SECONDS
+    fotmob_history_max_retries: int = FOTMOB_HISTORY_MAX_RETRIES
+    fotmob_history_stale_minutes: int = FOTMOB_HISTORY_STALE_MINUTES
+    fotmob_history_max_retry_attempts: int = FOTMOB_HISTORY_MAX_RETRY_ATTEMPTS
+    fotmob_history_batch_size: int = FOTMOB_HISTORY_BATCH_SIZE
+    store_fotmob_historical_raw: bool = STORE_FOTMOB_HISTORICAL_RAW
 
     @property
     def database_path(self) -> Path:
@@ -342,6 +364,38 @@ class Settings:
                 "FOTMOB_AUTOMATED_USAGE",
                 FOTMOB_AUTOMATED_USAGE,
                 FOTMOB_AUTOMATED_USAGE_VALUES,
+            ),
+            fotmob_league_path=os.getenv("FOTMOB_LEAGUE_PATH", FOTMOB_LEAGUE_PATH),
+            fotmob_season_path=os.getenv("FOTMOB_SEASON_PATH", FOTMOB_SEASON_PATH),
+            fotmob_history_enabled=_env_bool("FOTMOB_HISTORY_ENABLED", FOTMOB_HISTORY_ENABLED),
+            fotmob_history_workers=min(
+                8,
+                _env_int("FOTMOB_HISTORY_WORKERS", FOTMOB_HISTORY_WORKERS),
+            ),
+            fotmob_history_requests_per_second=max(
+                0.01,
+                _env_float(
+                    "FOTMOB_HISTORY_REQUESTS_PER_SECOND",
+                    FOTMOB_HISTORY_REQUESTS_PER_SECOND,
+                ),
+            ),
+            fotmob_history_timeout_seconds=_env_int(
+                "FOTMOB_HISTORY_TIMEOUT_SECONDS", FOTMOB_HISTORY_TIMEOUT_SECONDS
+            ),
+            fotmob_history_max_retries=_env_nonnegative_int(
+                "FOTMOB_HISTORY_MAX_RETRIES", FOTMOB_HISTORY_MAX_RETRIES
+            ),
+            fotmob_history_stale_minutes=_env_int(
+                "FOTMOB_HISTORY_STALE_MINUTES", FOTMOB_HISTORY_STALE_MINUTES
+            ),
+            fotmob_history_max_retry_attempts=_env_int(
+                "FOTMOB_HISTORY_MAX_RETRY_ATTEMPTS", FOTMOB_HISTORY_MAX_RETRY_ATTEMPTS
+            ),
+            fotmob_history_batch_size=_env_int(
+                "FOTMOB_HISTORY_BATCH_SIZE", FOTMOB_HISTORY_BATCH_SIZE
+            ),
+            store_fotmob_historical_raw=_env_bool(
+                "STORE_FOTMOB_HISTORICAL_RAW", STORE_FOTMOB_HISTORICAL_RAW
             ),
         )
 

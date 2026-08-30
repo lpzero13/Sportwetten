@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import math
+import re
 import statistics
 import threading
 import time
@@ -130,7 +130,13 @@ class FotMobClient:
     def _url(self, path: str) -> str:
         if path.startswith("http://") or path.startswith("https://"):
             return path
-        root = self.api_base_url if path.startswith("/matchDetails") or path.startswith("/api/") else self.base_url
+        root = (
+            self.api_base_url
+            if path.startswith("/matchDetails")
+            or path.startswith("/leagues")
+            or path.startswith("/api/")
+            else self.base_url
+        )
         if root.endswith("/api") and path.startswith("/api/"):
             path = path[4:]
         return f"{root}/{path.lstrip('/')}"
@@ -216,30 +222,14 @@ class FotMobClient:
         self.metrics.errors += 1
         raise FotMobAccessError(str(last_error or "FotMob request failed"))
 
-    def fetch_match_details(self, provider_match_id: str) -> FotMobFetchResult:
-        endpoint = self.match_details_path.format(match_id=str(provider_match_id))
+    def fetch_json(self, endpoint: str) -> FotMobFetchResult:
+        """Fetch one configured public endpoint without assuming its payload shape."""
+
         started = time.perf_counter()
         try:
             payload, status_code, response_ms, payload_size = self._get_json(endpoint)
-            try:
-                match = parse_fotmob_payload(payload, provider_match_id=str(provider_match_id))
-            except (TypeError, ValueError, KeyError) as exc:
-                self.metrics.parse_failures += 1
-                self.metrics.errors += 1
-                self.metrics.last_error = str(exc)
-                return FotMobFetchResult(
-                    success=False,
-                    payload=payload,
-                    status_code=status_code,
-                    response_time_ms=response_ms,
-                    payload_size=payload_size,
-                    endpoint=self._url(endpoint),
-                    error=str(exc),
-                    attempts=self._last_attempts,
-                )
             return FotMobFetchResult(
                 success=True,
-                match=match,
                 payload=payload,
                 status_code=status_code,
                 response_time_ms=response_ms,
@@ -256,6 +246,38 @@ class FotMobClient:
                 error=str(exc),
                 attempts=self._last_attempts,
             )
+
+    def fetch_match_details(self, provider_match_id: str) -> FotMobFetchResult:
+        endpoint = self.match_details_path.format(match_id=str(provider_match_id))
+        fetched = self.fetch_json(endpoint)
+        if not fetched.success or fetched.payload is None:
+            return fetched
+        try:
+            match = parse_fotmob_payload(fetched.payload, provider_match_id=str(provider_match_id))
+        except (TypeError, ValueError, KeyError) as exc:
+            self.metrics.parse_failures += 1
+            self.metrics.errors += 1
+            self.metrics.last_error = str(exc)
+            return FotMobFetchResult(
+                success=False,
+                payload=fetched.payload,
+                status_code=fetched.status_code,
+                response_time_ms=fetched.response_time_ms,
+                payload_size=fetched.payload_size,
+                endpoint=fetched.endpoint,
+                error=str(exc),
+                attempts=fetched.attempts,
+            )
+        return FotMobFetchResult(
+            success=True,
+            match=match,
+            payload=fetched.payload,
+            status_code=fetched.status_code,
+            response_time_ms=fetched.response_time_ms,
+            payload_size=fetched.payload_size,
+            endpoint=fetched.endpoint,
+            attempts=fetched.attempts,
+        )
 
     def metrics_snapshot(self) -> dict[str, Any]:
         return self.metrics.as_dict()

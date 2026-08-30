@@ -179,6 +179,38 @@ nicht aktiviert und bleibt bei `LIMITED_USE`/`UNCLEAR` ohne periodische
 Requests. Eine Freigabe für produktive Automation wäre eine neue, ausdrücklich
 zulässige Provider-Entscheidung; sie ist in V0.5.1 nicht gesetzt.
 
+### FotMob Historical Foundation (V0.5.2)
+
+V0.5.2 ergänzt die getrennte, resumierbare Historical-Schicht. Sie entdeckt
+Liga-/Season-Metadaten, übernimmt ausschließlich echte Provider-Season-IDs,
+indexiert Fixtures/Results und kann anschließend Matchdetails in eine
+SQLite-Queue und ein flaches, zstd-komprimiertes Parquet-Archiv schreiben.
+Die Queue kennt `NOT_FETCHED`, `IN_PROGRESS`, `FETCHED`, `PARTIAL` und
+`FAILED`, führt Versuchs-/Fehlerdaten und setzt verwaiste Claims nach 30
+Minuten zurück. Halbzeit- und Endstand werden getrennt gespeichert; fehlende
+Werte bleiben `NULL`, und `second_half_goals` wird ausschließlich aus
+`FT total - HT total` für gültige Scores berechnet.
+
+Die Jobs sind bewusst getrennt:
+
+~~~powershell
+# ohne Providerfreigabe: gibt BLOCKED_BY_POLICY aus und macht keinen Request
+python scripts/fotmob_history.py seasons --league 54 --root .
+python scripts/fotmob_history.py index --league 54 --season 2025/26 --root .
+
+# Katalog ausführen, wenn die Season bereits indexiert ist
+python scripts/fotmob_history.py sample --league 54 --season 2025/26 --matches 5 --root .
+python scripts/fotmob_history.py fetch --league 54 --season 2025/26 --sample-only --root .
+python scripts/fotmob_history.py status --league 54 --season 2025/26 --root .
+~~~
+
+Für reproduzierbare Offline-Tests akzeptieren die Discovery- und Indexjobs
+zusätzlich `--payload <lokale-datei.json>`. Ein echter historischer PASS wird
+nicht aus Fixtures simuliert. Der aktuelle Stand und die nicht ausgeführten
+externen Abnahmekriterien stehen in `outputs/V052_STATUS.md`,
+`outputs/FOTMOB_BUNDESLIGA_DISCOVERY.md` und
+`outputs/FOTMOB_BUNDESLIGA_SAMPLE.md`.
+
 ### Paper Trading
 
 Paper Trading arbeitet vollständig ohne Wettschein und ohne Wettabgabe. Im
@@ -249,6 +281,17 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | FOTMOB_POLL_SECONDS | 30 | optionaler Worker-Poll |
 | FOTMOB_PROVIDER_DECISION | LIMITED_USE | V0.5.1-Providerentscheidung; Worker benötigt PRODUCTION_READY |
 | FOTMOB_AUTOMATED_USAGE | UNCLEAR | Nutzungsfreigabe; Worker benötigt ACCEPTABLE_FOR_PROJECT |
+| FOTMOB_LEAGUE_PATH | /leagues?id={league_id} | konfigurierbarer League-/Season-Discovery-Pfad |
+| FOTMOB_SEASON_PATH | /leagues?id={league_id}&season={season_id} | konfigurierbarer Fixture-/Result-Pfad |
+| FOTMOB_HISTORY_ENABLED | false | Historical-Netzwerkzugriff, zusätzlich zur Providerfreigabe |
+| FOTMOB_HISTORY_WORKERS | 1 | Historical-Detailworker, maximal 8 |
+| FOTMOB_HISTORY_REQUESTS_PER_SECOND | 0.5 | globaler Historical-Request-Limiter |
+| FOTMOB_HISTORY_TIMEOUT_SECONDS | 10 | Historical-HTTP-Timeout |
+| FOTMOB_HISTORY_MAX_RETRIES | 3 | HTTP-Retries für transiente Fehler |
+| FOTMOB_HISTORY_STALE_MINUTES | 30 | Rücksetzung verwaister IN_PROGRESS-Claims |
+| FOTMOB_HISTORY_MAX_RETRY_ATTEMPTS | 3 | maximale Detailversuche je Match |
+| FOTMOB_HISTORY_BATCH_SIZE | 100 | Parquet-Batchgröße |
+| STORE_FOTMOB_HISTORICAL_RAW | false | optionales zstd-Raw nur für Historical-Details |
 
 Die verifizierten Tipico-Endpunkte stehen in outputs/DISCOVERY.md. Die FotMob-
 Discovery, Abschlussvalidierung und Providerentscheidung stehen in
@@ -274,7 +317,9 @@ Paper-Trades, Settlements, Ledger, Match Results und Paper-Entry-Raw bleiben erh
 - SQLite: data/tipico.db
 - Parquet: data/archive/tipico/snapshots/year=YYYY/month=MM/date=YYYY-MM-DD/
 - FotMob-Parquet: data/archive/fotmob/snapshots/year=YYYY/month=MM/date=YYYY-MM-DD/
+- FotMob-Historical-Parquet: data/archive/fotmob/historical/league_id=.../season=...
 - Raw-JSON: data/raw/YYYY-MM-DD/ (Debug und Paper-Entry, je nach Kompression)
+- FotMob-Historical-Raw: data/raw/fotmob/historical/league_id=.../season=.../ (optional)
 - Halbzeit-Raw: .../events/<event_id>/halftime/ nur bei `RAW_AT_HALFTIME=true`
 - Logdatei: logs/tipico.log
 
@@ -290,7 +335,9 @@ Die Datenbank enthält die Tabellen `events`, `event_states`, `current_event_sta
 und `paper_worker_runs` sowie die optionalen V0.5-Tabellen `matches`,
 `match_provider_links`, `teams`, `team_provider_aliases`,
 `competition_provider_aliases`, `fotmob_current_state`, `fotmob_snapshots`,
-`fotmob_snapshot_outbox` und `match_data_quality`. `current_event_state`, `current_canonical_outcomes` und
+`fotmob_snapshot_outbox`, `fotmob_seasons`, `fotmob_match_index`,
+`fotmob_history_samples`, `fotmob_historical_archive_index` und
+`match_data_quality`. `current_event_state`, `current_canonical_outcomes` und
 `current_strategy_evaluations` sind ersetzbare Betriebsdaten. `snapshots` ist
 die kurze SQLite-Staging-/Indexschicht; die historische Zeile wird als flache
 Parquet-Zeile mit `schema_version` archiviert. `market_presence`, `odds_history`
@@ -311,6 +358,10 @@ Signalfilter, alle Settlement-Klassen, HT1:1/FT2:2, Idempotenz und Snapshot-
 Unveränderlichkeit ab. Die V0.4.2-Tests prüfen Current-State-Upserts,
 Snapshot-Idempotenz, fachliche Trigger, FINAL-Ergebniszeilen, Outbox-/Parquet-
 Export und die Trennung von UI-Refresh und Historie.
+Die V0.5.2-Tests prüfen echte Season-ID-Übernahme ohne Hardcoding,
+deduplizierte Matchindexierung, deterministisches Sampling, nullable
+HT-/FT-Normalisierung, Zielklassen, Queue-Claims/Retry/Stale-Recovery,
+Policy-Gating und resumierbare zstd-Parquet-Batches.
 
 Der reproduzierbare Live-Smoke-Test ruft den aktuellen Feed und genau ein Eventdetail ab:
 

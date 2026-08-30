@@ -567,6 +567,85 @@ CREATE TABLE IF NOT EXISTS paper_worker_runs (
 
 CREATE INDEX IF NOT EXISTS idx_paper_worker_runs_started
     ON paper_worker_runs(started_at DESC, run_id DESC);
+
+-- Optional FotMob V0.5.2 historical catalog.  The tables live in the core
+-- schema so a database opened by the UI already has the catalog contract;
+-- fotmob.history_storage repeats the IF NOT EXISTS script for older DBs.
+CREATE TABLE IF NOT EXISTS fotmob_seasons (
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    league_id TEXT NOT NULL,
+    season_id TEXT NOT NULL,
+    season_label TEXT NOT NULL,
+    league_name TEXT,
+    country TEXT,
+    discovered_at TEXT NOT NULL,
+    last_checked_at TEXT,
+    PRIMARY KEY (provider, league_id, season_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_seasons_league
+    ON fotmob_seasons(provider, league_id, season_label);
+
+CREATE TABLE IF NOT EXISTS fotmob_match_index (
+    fotmob_match_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    league_id TEXT NOT NULL,
+    season_id TEXT NOT NULL,
+    season_label TEXT NOT NULL,
+    league_name TEXT,
+    country TEXT,
+    kickoff_at TEXT,
+    home_team_id TEXT,
+    home_team_name TEXT NOT NULL,
+    away_team_id TEXT,
+    away_team_name TEXT NOT NULL,
+    round TEXT,
+    match_status TEXT,
+    detail_status TEXT NOT NULL DEFAULT 'NOT_FETCHED',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    last_checked_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    last_error TEXT,
+    worker_id TEXT,
+    data_quality TEXT,
+    ml_eligible INTEGER,
+    parser_version TEXT,
+    schema_version TEXT,
+    raw_payload_path TEXT,
+    payload_hash TEXT,
+    second_half_goals INTEGER,
+    second_half_goal_class TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_match_index_season
+    ON fotmob_match_index(provider, league_id, season_id, kickoff_at, fotmob_match_id);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_match_index_queue
+    ON fotmob_match_index(detail_status, league_id, season_id, kickoff_at);
+
+CREATE TABLE IF NOT EXISTS fotmob_history_samples (
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    league_id TEXT NOT NULL,
+    season_id TEXT NOT NULL,
+    sample_rank INTEGER NOT NULL,
+    fotmob_match_id TEXT NOT NULL,
+    selected_at TEXT NOT NULL,
+    PRIMARY KEY (provider, league_id, season_id, sample_rank),
+    UNIQUE (provider, league_id, season_id, fotmob_match_id)
+);
+
+CREATE TABLE IF NOT EXISTS fotmob_historical_archive_index (
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    fotmob_match_id TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    parser_version TEXT NOT NULL,
+    archive_path TEXT NOT NULL,
+    payload_hash TEXT,
+    written_at TEXT NOT NULL,
+    PRIMARY KEY (provider, fotmob_match_id, schema_version)
+);
 """
 
 
@@ -2806,6 +2885,10 @@ class Database:
             "fotmob_snapshots",
             "fotmob_snapshot_outbox",
             "match_data_quality",
+            "fotmob_seasons",
+            "fotmob_match_index",
+            "fotmob_history_samples",
+            "fotmob_historical_archive_index",
         }
         if table not in allowed:
             raise ValueError(f"Unsupported table: {table}")
