@@ -60,10 +60,12 @@ class PaperTradingService:
         settings: Settings | None = None,
         *,
         logger: logging.Logger | None = None,
+        entry_raw_store: Callable[[str], str | None] | None = None,
     ) -> None:
         self.database = database
         self.settings = settings or Settings()
         self.logger = logger or logging.getLogger("tipico")
+        self.entry_raw_store = entry_raw_store
 
     def is_enabled(self) -> bool:
         return self.database.get_paper_runtime_setting("enabled", "1") == "1"
@@ -250,16 +252,26 @@ class PaperTradingService:
     def _entry_quotes(self, evaluation: Any) -> tuple[Any | None, Any | None]:
         event_id = str(evaluation["event_id"])
         observed_at = str(evaluation["observed_at"])
-        zero_rows = self.database.canonical_quotes_for_evaluation(
+        zero_rows = self.database.current_canonical_quotes_for_evaluation(
+            event_id,
+            ("REMAINING_TOTAL_UNDER", "NEXT_GOAL_NONE", "MATCH_TOTAL_UNDER"),
+        )
+        if not zero_rows:
+            zero_rows = self.database.canonical_quotes_for_evaluation(
             event_id,
             observed_at,
             ("REMAINING_TOTAL_UNDER", "NEXT_GOAL_NONE", "MATCH_TOTAL_UNDER"),
+            )
+        two_rows = self.database.current_canonical_quotes_for_evaluation(
+            event_id,
+            ("REMAINING_TOTAL_OVER", "MATCH_TOTAL_OVER"),
         )
-        two_rows = self.database.canonical_quotes_for_evaluation(
+        if not two_rows:
+            two_rows = self.database.canonical_quotes_for_evaluation(
             event_id,
             observed_at,
             ("REMAINING_TOTAL_OVER", "MATCH_TOTAL_OVER"),
-        )
+            )
         return (
             self._quote_row(zero_rows, _float(evaluation["q_zero"])),
             self._quote_row(two_rows, _float(evaluation["q_two_plus"])),
@@ -287,7 +299,7 @@ class PaperTradingService:
             {
                 "portfolio_id": portfolio.portfolio_id,
                 "event_id": str(evaluation["event_id"]),
-                "evaluation_id": evaluation["evaluation_id"],
+                "evaluation_id": evaluation["evaluation_id"] or 0,
                 "observed_at": str(evaluation["observed_at"]),
                 "decision": decision,
                 "reason": reason,
@@ -322,7 +334,10 @@ class PaperTradingService:
         # before the idempotent entry check below.
         evaluations = sorted(
             evaluations,
-            key=lambda row: (str(row["observed_at"]), int(row["evaluation_id"])),
+            key=lambda row: (
+                str(row["observed_at"]),
+                int(row["evaluation_id"] or 0),
+            ),
         )
         result["evaluations_seen"] = len(evaluations)
         for evaluation in evaluations:
@@ -375,6 +390,16 @@ class PaperTradingService:
                     source_zero=str(evaluation["source_zero"] or "Tipico"),
                     source_two_plus=str(evaluation["source_two_plus"] or "Tipico"),
                 )
+                entry_raw_path: str | None = None
+                if self.settings.raw_paper_entry and self.entry_raw_store is not None:
+                    try:
+                        entry_raw_path = self.entry_raw_store(str(evaluation["event_id"]))
+                    except Exception as exc:  # raw audit must not block the trade
+                        self.logger.warning(
+                            "Paper entry raw capture failed for %s: %s",
+                            evaluation["event_id"],
+                            exc,
+                        )
                 snapshot = {
                     "paper_trade_id": f"pt-{uuid.uuid4().hex[:16]}",
                     "portfolio_id": portfolio.portfolio_id,
@@ -383,7 +408,11 @@ class PaperTradingService:
                     "competition_name": str(evaluation["competition_name"] or "Unbekannter Wettbewerb"),
                     "competition_country": evaluation["competition_country"],
                     "created_at": current.isoformat(),
-                    "strategy_evaluation_id": int(evaluation["evaluation_id"]),
+                    "strategy_evaluation_id": (
+                        int(evaluation["evaluation_id"])
+                        if evaluation["evaluation_id"] is not None
+                        else None
+                    ),
                     "strategy_type": str(evaluation["strategy_type"]),
                     "strategy_version": str(evaluation["strategy_version"]),
                     "normalizer_version": str(evaluation["normalizer_version"]),
@@ -419,6 +448,7 @@ class PaperTradingService:
                     "p1_tipico": strategy.p1_tipico,
                     "p1_buffer": strategy.p1_buffer,
                     "win_roi": strategy.win_roi,
+                    "entry_raw_payload_path": entry_raw_path,
                     "bankroll_before": available,
                     "bankroll_after": available - float(decision.stake),
                     "rank": 1,
@@ -439,6 +469,21 @@ class PaperTradingService:
                     {"stake": float(decision.stake), "age_seconds": age},
                 )
                 if created:
+                    entry_evaluation_id = self.database.record_strategy_evaluation_event(
+                        dict(evaluation),
+                        trigger_type="PAPER_TRADE_ENTRY",
+                        is_eligible=True,
+                    )
+                    self.database.attach_strategy_evaluation_to_paper_trade(
+                        str(snapshot["paper_trade_id"]),
+                        entry_evaluation_id,
+                    )
+                    self.database.mark_strategy_entry_evaluation(
+                        str(evaluation["event_id"]),
+                        str(evaluation["strategy_type"]),
+                        entry_evaluation_id,
+                        str(evaluation["observed_at"]),
+                    )
                     result["trades_created"] += 1
         return result
 
@@ -515,6 +560,7 @@ class PaperTradingService:
         for trade in self.database.paper_trade_rows(status="OPEN", limit=1000):
             result["open_seen"] += 1
             final = self.database.final_snapshot_for_event(str(trade["event_id"]))
+            result_row = self.database.match_result_for_event(str(trade["event_id"]))
             values: Mapping[str, Any] | None = None
             if final is not None:
                 values = {
@@ -523,6 +569,14 @@ class PaperTradingService:
                     "status": final["match_status"] or "FINISHED",
                     "extra_time": False,
                     "penalties": False,
+                }
+            elif result_row is not None:
+                values = {
+                    "final_score_home": result_row["ft_home"],
+                    "final_score_away": result_row["ft_away"],
+                    "status": result_row["final_status"] or "FINISHED",
+                    "extra_time": result_row["extra_time"],
+                    "penalties": result_row["penalties"],
                 }
             elif resolver is not None:
                 values = resolver(str(trade["event_id"]))

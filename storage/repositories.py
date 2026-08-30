@@ -13,7 +13,7 @@ class EventRepository:
 
     def save_observation(self, event: LiveEvent, observed_at: str) -> bool:
         self.database.upsert_event(event, observed_at)
-        return self.database.record_event_state_if_changed(
+        return self.database.upsert_current_event_state(
             state_from_event(event, observed_at)
         )
 
@@ -47,3 +47,15 @@ class MarketRepository:
                 ):
                     changes += 1
         return changes
+
+    def save_current_details(self, details: EventDetails, observed_at: str) -> None:
+        """Update only operational event/market state; never append history."""
+
+        self.database.upsert_event(details.event, observed_at)
+        self.database.upsert_current_event_state(
+            state_from_event(details.event, observed_at)
+        )
+        for market in details.markets:
+            self.database.upsert_market(market, observed_at)
+            for outcome in market.outcomes:
+                self.database.upsert_outcome(outcome, details.event.event_id, observed_at)

@@ -45,7 +45,8 @@ python3 -m venv "$INSTALL_DIR/.venv"
 mkdir -p \
     "$INSTALL_DIR/data/raw" \
     "$INSTALL_DIR/data/halftime_reports" \
-    "$INSTALL_DIR/logs"
+    "$INSTALL_DIR/logs" \
+    "/var/lib/wetten/archive"
 
 # Quellcode bleibt root-owned; der Dienst erhält Leserechte sowie Schreibrechte
 # ausschließlich für seine Laufzeitdaten und Logs.
@@ -53,6 +54,8 @@ chown -R root:"$SERVICE_GROUP" "$INSTALL_DIR"
 chmod -R g+rX "$INSTALL_DIR"
 chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
 chmod -R g+rwX "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
+chown -R "$SERVICE_USER":"$SERVICE_GROUP" /var/lib/wetten
+chmod -R g+rwX /var/lib/wetten
 
 if [[ ! -f "$ENV_FILE" ]]; then
     install -D -m 0640 -o root -g "$SERVICE_GROUP" \
@@ -77,15 +80,28 @@ sed \
     -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
     "$INSTALL_DIR/deploy/wetten-paper.service" \
     > /etc/systemd/system/wetten-paper.service
+sed \
+    -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
+    -e "s|__SERVICE_USER__|$SERVICE_USER|g" \
+    -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
+    "$INSTALL_DIR/deploy/wetten-cleanup.service" \
+    > /etc/systemd/system/wetten-cleanup.service
+sed \
+    -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
+    -e "s|__SERVICE_USER__|$SERVICE_USER|g" \
+    -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
+    "$INSTALL_DIR/deploy/wetten-cleanup.timer" \
+    > /etc/systemd/system/wetten-cleanup.timer
 
 # V0.3 service names are retired in favour of the explicit V0.4 names.
 systemctl disable --now tipico-observer.service tipico-collector.service 2>/dev/null || true
 
 systemctl daemon-reload
-systemctl enable wetten-ui.service wetten-collector.service wetten-paper.service
+systemctl enable wetten-ui.service wetten-collector.service wetten-paper.service wetten-cleanup.timer
 systemctl restart wetten-ui.service
 systemctl restart wetten-collector.service
 systemctl restart wetten-paper.service
+systemctl start wetten-cleanup.timer
 
 LXC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo

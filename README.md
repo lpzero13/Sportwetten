@@ -11,12 +11,14 @@ Der aktuelle Projektumfang umfasst:
   `Bundesliga · Österreich`, in Events und `competitions` persistiert
 - Spielstand, Spielminute und Phase
 - vollständige Märkte und Outcomes für genau ein geöffnetes Event
-- Quoten-/Status-Historie in SQLite
-- deduplizierte Raw-Tipico-JSON-Payloads
+- flüchtiger Current State für Events, Markets und aktuelle Analyse
+- lean historische Snapshots über eine SQLite-Outbox nach Parquet
+- Raw-Tipico-JSON nur für Paper-Entries und Parser-/Mapping-Debug
 - REST-Polling und System-/Debugansicht
 - unabhängiger Background Collector für historische Snapshots
 - Pre-Match-Discovery über den verifizierten Tipico-Hour-Events-REST-Pfad
-- Halbzeit-Phasen, Goal-/Final-Trigger und Core-Market-Tracking
+- zehn fachliche Snapshot-Slots: PRE, HT, HT_STABLE, 60, 70, 80,
+  FIRST_H2_GOAL_REOPEN, 85, 90 und FINAL
 - Data-Collection-Seite mit Coverage-Metriken und Event Inspector
 - deterministische Canonical-Market-Normalisierung mit UNKNOWN-Fallback
 - scoreabhängige Äquivalenzauflösung für 0 bzw. 2+ verbleibende Tore
@@ -85,7 +87,9 @@ bash deploy/install_proxmox.sh
 
 Das Installationsskript richtet eine virtuelle Python-Umgebung ein, installiert
 die Abhängigkeiten und aktiviert drei getrennte systemd-Dienste: Dashboard,
-historischen Collector und Paper-Worker. Danach ist die Oberfläche unter
+historischen Collector und Paper-Worker. Zusätzlich läuft ein täglicher
+`wetten-cleanup.timer` für Debug-Raw, temporäre Archivdateien und exportierte
+Outbox-Zeilen. Danach ist die Oberfläche unter
 `http://<LXC-ODER-VM-IP>:8506` erreichbar.
 
 ~~~bash
@@ -117,6 +121,8 @@ Event-Detail-Endpunkt abgerufen. Die Detailansicht enthält die Tabs Analyse,
 Alle Tipico Märkte, Odds History und Raw / Debug. Auto Refresh ist
 standardmäßig deaktiviert und ruft bei Aktivierung nur dieses Event alle
 5 Sekunden ab.
+Dieser Refresh aktualisiert ausschließlich Current State; er erzeugt keinen
+historischen Snapshot.
 
 Der Halftime Scanner betrachtet ausschließlich aktuell in Halbzeit befindliche
 Events. Ein frischer Collector-HZ-Snapshot wird wiederverwendet; ansonsten
@@ -134,13 +140,15 @@ python scripts/run_collector.py --root . --once
 
 Er pollt den Livefeed alle 10 Sekunden und den kommenden Fußballtag über den
 verifizierten Hour-Events-Endpunkt. Detailabrufe laufen mit maximal drei
-konfigurierbaren Workern über eine Queue. Halbzeitdetails werden bei Erkennung,
-nach 20 Sekunden und nach 60 Sekunden geladen. Vor dem Anpfiff werden, soweit
-der Zeitpunkt noch nicht verpasst ist, T−60, T−15, T−5 und T−1 geplant.
+konfigurierbaren Workern über eine Queue. Historische Detailabrufe werden nur
+bei den fachlichen Slots ausgelöst: einmal T−1, sofort bei Halbzeit, einmal
+nach der HT-Stabilisierung, beim ersten Überschreiten von 60/70/80/85/90,
+beim ersten wieder handelbaren Markt nach dem ersten HZ2-Tor und bei FINAL.
+Die zehn Slots sind pro Event hart idempotent.
 
-Die Seite **Data Collection** liest ausschließlich SQLite und
-`data/collector_status.json`; sie startet keinen Collector und entscheidet
-nicht über die Datensammlung.
+Die Seite **Data Collection** liest ausschließlich Current State, SQLite,
+Parquet-Metadaten und `data/collector_status.json`; sie startet keinen Collector
+und entscheidet nicht über die Datensammlung.
 
 ### Paper Trading
 
@@ -176,8 +184,16 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 |---|---:|---|
 | LIVE_EVENT_REFRESH_SECONDS | 10 | Übersichtspolling |
 | EVENT_MARKET_REFRESH_SECONDS | 5 | Detailpolling bei Auto Refresh |
-| STORE_RAW_RESPONSES | true | Raw-Payloads schreiben |
-| STORE_ODDS_HISTORY | true | Quotenänderungen historisieren |
+| STORE_RAW_RESPONSES | true | Legacy-Kompatibilität für Raw-Storage; kein Poll-Archiv |
+| STORE_ODDS_HISTORY | true | Legacy-Kompatibilität für direkte Repository-Aufrufe |
+| PERSIST_UI_REFRESH | false | Current-Analyse bei UI-Refresh optional persistieren |
+| RAW_EVERY_POLL | false | niemals vollständige Payload je Poll archivieren |
+| RAW_PAPER_ENTRY | true | Raw-Payload beim Paper-Entry dauerhaft archivieren |
+| RAW_AT_HALFTIME | false | optionaler vollständiger HZ-Raw zusätzlich zum Snapshot |
+| RAW_COMPRESSION | zstd | Raw-Kompression, Fallback gzip |
+| PARQUET_COMPRESSION | zstd | Parquet-Kompression |
+| DEBUG_RAW_RETENTION_DAYS | 7 | Aufbewahrung von Parser-/Mapping-Debug-Raw |
+| WETTEN_ARCHIVE_PATH | data/archive | Parquet-Root, unter Proxmox `/var/lib/wetten/archive` |
 | TIPICO_LANGUAGE | de | API-Sprache |
 | TIPICO_LICENSE_REGION | DE | Lizenzregion |
 | REQUEST_TIMEOUT_SECONDS | 10 | HTTP-Timeout |
@@ -186,34 +202,54 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | COLLECTOR_FEED_REFRESH_SECONDS | 10 | Livefeed-Intervall |
 | COLLECTOR_PREMATCH_REFRESH_SECONDS | 60 | Upcoming-Feed-Intervall |
 | COLLECTOR_DETAIL_WORKERS | 3 | maximale parallele Eventdetails, max. 5 |
-| COLLECTOR_CORE_REFRESH_SECONDS | 30 | HZ2-Core-Tracking |
-| COLLECTOR_HALFTIME_DELAYS_SECONDS | 0,20,60 | Halbzeit-Phasen |
-| COLLECTOR_STRATEGIC_MINUTES | 55,60,65,70,75,80,85,90 | gezielte Zeitpunkte |
+| COLLECTOR_CORE_REFRESH_SECONDS | 30 | Legacy-Kompatibilität |
+| SNAPSHOT_HT_STABLE_DELAY_SECONDS | 45 | Verzögerung für HT_STABLE |
+| SNAPSHOT_OUTBOX_EXPORT_INTERVAL_SECONDS | 300 | Parquet-Exportintervall |
+| SNAPSHOT_OUTBOX_BATCH_SIZE | 100 | maximale Exportbatchgröße |
+| SNAPSHOT_PRE_ENABLED ... SNAPSHOT_FINAL_ENABLED | true | einzelne historische Slots ein-/ausschalten |
 | COLLECTOR_RETRY_DELAYS_SECONDS | 1,3,10 | Retry-Verzögerungen |
 | MAX_LIVE_ODDS_AGE_SECONDS | 10 | Freshness-Grenze für Live-Quoten |
 | DEFAULT_TOTAL_STAKE_EUR | 30 | Default-Einsatz für Szenarien |
 
 Die verifizierten Endpunkte und Discovery-Ergebnisse stehen in outputs/DISCOVERY.md.
 
+### Storage-Migration und Cleanup
+
+Bestehende SQLite-Snapshots können ohne Löschung exportiert und geprüft werden:
+
+~~~powershell
+python scripts/migrate_v042_storage.py --root .
+python scripts/cleanup_storage.py --root .
+~~~
+
+Die Migration erzeugt `outputs/STORAGE_MIGRATION_REPORT.md` bzw. den angegebenen
+Report. Der erste Lauf löscht keine SQLite-Historie. Der Cleanup entfernt nur
+exportierte Outbox-Rows, temporäre Parquet-Dateien und abgelaufene Debug-Raw;
+Paper-Trades, Settlements, Ledger, Match Results und Paper-Entry-Raw bleiben erhalten.
+
 ## Daten und Logs
 
 - SQLite: data/tipico.db
-- Raw-JSON: data/raw/YYYY-MM-DD/live/ und data/raw/YYYY-MM-DD/events/<event_id>/
-- Halbzeit-Raw-JSON: .../events/<event_id>/halftime/
+- Parquet: data/archive/tipico/snapshots/year=YYYY/month=MM/date=YYYY-MM-DD/
+- Raw-JSON: data/raw/YYYY-MM-DD/ (Debug und Paper-Entry, je nach Kompression)
+- Halbzeit-Raw: .../events/<event_id>/halftime/ nur bei `RAW_AT_HALFTIME=true`
 - Logdatei: logs/tipico.log
 
 Raw-Payloads werden kanonisch gehasht. Identische Antworten erzeugen keine zweite Datei. Normalisierte Markt- und Outcome-IDs bleiben Strings und werden nie als Float behandelt.
 
-Die Datenbank enthält die Tabellen `events`, `event_states`, `markets`,
-`outcomes`, `odds_history`, `competitions`, `snapshots`, `market_presence`,
-`canonical_outcomes`, `strategy_evaluations`, `paper_portfolios`,
+Die Datenbank enthält die Tabellen `events`, `event_states`, `current_event_state`,
+`markets`, `outcomes`, `odds_history`, `competitions`, `snapshots`,
+`snapshot_outbox`, `match_results`, `market_presence`, `canonical_outcomes`,
+`current_canonical_outcomes`, `strategy_evaluations`,
+`current_strategy_evaluations`, `paper_portfolios`,
 `paper_portfolio_competitions`, `paper_trades`,
 `paper_bankroll_transactions`, `paper_signal_log`, `paper_runtime_settings`
-und `paper_worker_runs`. Der Raw-Layer wird nie
-überschrieben. Canonical Outcomes tragen `normalizer_version = v0.3.1`;
-Strategiezeilen werden nur bei relevanter Quote-, Quellen-, P1- oder
-Statusänderung gespeichert. `market_presence` unterscheidet einen nicht
-angebotenen Markt von einer angebotenen, aber pausierten Quote.
+und `paper_worker_runs`. `current_event_state`, `current_canonical_outcomes` und
+`current_strategy_evaluations` sind ersetzbare Betriebsdaten. `snapshots` ist
+die kurze SQLite-Staging-/Indexschicht; die historische Zeile wird als flache
+Parquet-Zeile mit `schema_version` archiviert. `market_presence`, `odds_history`
+und `canonical_outcomes` bleiben für Migration und Altbestände lesbar, werden
+aber durch den V0.4.2-Collector nicht bei jedem Refresh erweitert.
 
 ## Tests
 
@@ -226,7 +262,9 @@ Die fachlichen V0.3-Tests decken Normalisierung, dynamische Score-Linien,
 Inkonsistenz-Markierung, Strategy Engine, Cent-Rundung und Rescue-Arithmetik
 ab. Die V0.4-Tests decken Portfolio-Regeln, Einsatzmodi, Bankroll-Grenzen,
 Signalfilter, alle Settlement-Klassen, HT1:1/FT2:2, Idempotenz und Snapshot-
-Unveränderlichkeit ab.
+Unveränderlichkeit ab. Die V0.4.2-Tests prüfen Current-State-Upserts,
+Snapshot-Idempotenz, fachliche Trigger, FINAL-Ergebniszeilen, Outbox-/Parquet-
+Export und die Trennung von UI-Refresh und Historie.
 
 Der reproduzierbare Live-Smoke-Test ruft den aktuellen Feed und genau ein Eventdetail ab:
 

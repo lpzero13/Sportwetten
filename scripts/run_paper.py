@@ -15,6 +15,7 @@ if __package__ in {None, ""}:
 from config import Settings, configure_logging
 from paper.service import PaperTradingService
 from storage.database import Database
+from storage.raw_storage import RawStorage
 from tipico.client import TipicoApiError, TipicoClient
 from tipico.parser import parse_event_details
 
@@ -34,7 +35,34 @@ def main() -> None:
     logger = configure_logging(settings)
     database = Database(settings.database_path)
     client = TipicoClient(settings, logger=logger)
-    service = PaperTradingService(database, settings, logger=logger)
+    entry_raw = RawStorage(
+        settings.raw_storage_path,
+        enabled=settings.raw_paper_entry,
+        compression=settings.raw_compression,
+    )
+
+    def store_entry_raw(event_id: str) -> str | None:
+        response = client.get_event_details(event_id)
+        result = entry_raw.store(
+            "paper_entries",
+            event_id,
+            response.payload,
+            observed_at=response.metrics.response_received_at,
+        )
+        resolved = result.path or entry_raw.path_for_hash(
+            "paper_entries",
+            event_id,
+            result.content_hash,
+            observed_at=response.metrics.response_received_at,
+        )
+        return str(resolved) if resolved else None
+
+    service = PaperTradingService(
+        database,
+        settings,
+        logger=logger,
+        entry_raw_store=store_entry_raw,
+    )
 
     def resolve_final(event_id: str) -> dict[str, Any] | None:
         """Refresh only open trades; a live response is never treated as final."""

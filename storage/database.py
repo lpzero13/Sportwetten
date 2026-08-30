@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -70,6 +71,24 @@ CREATE TABLE IF NOT EXISTS event_states (
 
 CREATE INDEX IF NOT EXISTS idx_event_states_event_observed
     ON event_states(event_id, observed_at, id);
+
+-- Volatile state used by the live UI and collector.  Unlike event_states it
+-- is deliberately one row per event and is safe to rebuild after a restart.
+CREATE TABLE IF NOT EXISTS current_event_state (
+    event_id TEXT PRIMARY KEY,
+    observed_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    period TEXT NOT NULL,
+    display_time TEXT NOT NULL,
+    section_number INTEGER,
+    score_home INTEGER,
+    score_away INTEGER,
+    ht_score_home INTEGER,
+    ht_score_away INTEGER,
+    red_cards_home INTEGER,
+    red_cards_away INTEGER,
+    raw_state_json TEXT NOT NULL DEFAULT '{}'
+);
 
 CREATE TABLE IF NOT EXISTS markets (
     market_id TEXT PRIMARY KEY,
@@ -157,7 +176,41 @@ CREATE TABLE IF NOT EXISTS snapshots (
     snapshot_quality TEXT,
     raw_payload_path TEXT,
     second_half_goals INTEGER,
-    second_half_goal_class TEXT
+    second_half_goal_class TEXT,
+    competition_id TEXT,
+    competition_name TEXT,
+    competition_country TEXT,
+    home_team TEXT,
+    away_team TEXT,
+    kickoff_time TEXT,
+    match_minute INTEGER,
+    q_zero_best REAL,
+    q_zero_source_type TEXT,
+    q_zero_market_id TEXT,
+    q_zero_outcome_id TEXT,
+    q_two_plus_best REAL,
+    q_two_plus_source_type TEXT,
+    q_two_plus_market_id TEXT,
+    q_two_plus_outcome_id TEXT,
+    remaining_under_05 REAL,
+    remaining_over_05 REAL,
+    remaining_under_15 REAL,
+    remaining_over_15 REAL,
+    p0_market REAL,
+    p1_market REAL,
+    p2plus_market REAL,
+    p1_break_even REAL,
+    p1_buffer REAL,
+    win_roi REAL,
+    normalizer_version TEXT,
+    strategy_version TEXT,
+    relevant_markets_json TEXT NOT NULL DEFAULT '[]',
+    goal_at TEXT,
+    reopen_at TEXT,
+    reopen_delay_seconds REAL,
+    archive_path TEXT,
+    exported_at TEXT,
+    payload_hash TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_event_observed
@@ -165,6 +218,49 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_event_observed
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_observed_type
     ON snapshots(observed_at, snapshot_type);
+
+CREATE TABLE IF NOT EXISTS snapshot_outbox (
+    snapshot_id INTEGER PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    snapshot_type TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    exported INTEGER NOT NULL DEFAULT 0,
+    exported_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(event_id, snapshot_type),
+    FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_outbox_pending
+    ON snapshot_outbox(exported, captured_at, snapshot_id);
+
+CREATE TABLE IF NOT EXISTS match_results (
+    event_id TEXT PRIMARY KEY,
+    competition_id TEXT,
+    competition_name TEXT,
+    competition_country TEXT,
+    home_team TEXT NOT NULL,
+    away_team TEXT NOT NULL,
+    kickoff_at TEXT,
+    ht_home INTEGER,
+    ht_away INTEGER,
+    ft_home INTEGER,
+    ft_away INTEGER,
+    first_half_goals INTEGER,
+    second_half_goals INTEGER,
+    second_half_goal_class TEXT,
+    final_status TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    extra_time INTEGER,
+    penalties INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_match_results_finished_at
+    ON match_results(finished_at, event_id);
 
 CREATE TABLE IF NOT EXISTS market_presence (
     presence_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -220,6 +316,34 @@ CREATE INDEX IF NOT EXISTS idx_canonical_outcomes_event_observed
 CREATE INDEX IF NOT EXISTS idx_canonical_outcomes_type
     ON canonical_outcomes(canonical_type, raw_market_type);
 
+CREATE TABLE IF NOT EXISTS current_canonical_outcomes (
+    event_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    outcome_id TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    canonical_type TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    period TEXT NOT NULL,
+    side TEXT,
+    line REAL,
+    team TEXT,
+    odds REAL,
+    status TEXT NOT NULL,
+    available INTEGER NOT NULL DEFAULT 0,
+    raw_market_type TEXT NOT NULL,
+    raw_market_caption TEXT NOT NULL,
+    raw_fixed_param TEXT NOT NULL,
+    raw_choice_param TEXT,
+    raw_outcome_caption TEXT NOT NULL,
+    settlement_scope TEXT NOT NULL DEFAULT 'UNKNOWN',
+    normalizer_version TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(event_id, market_id, outcome_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_current_canonical_event_type
+    ON current_canonical_outcomes(event_id, canonical_type, available);
+
 CREATE TABLE IF NOT EXISTS strategy_evaluations (
     evaluation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id TEXT NOT NULL,
@@ -245,11 +369,49 @@ CREATE TABLE IF NOT EXISTS strategy_evaluations (
     p1_buffer REAL,
     p_zero REAL,
     p_one REAL,
-    p_two_plus REAL
+    p_two_plus REAL,
+    trigger_type TEXT,
+    is_eligible INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_strategy_evaluations_event_observed
     ON strategy_evaluations(event_id, strategy_type, observed_at, evaluation_id);
+
+CREATE TABLE IF NOT EXISTS current_strategy_evaluations (
+    event_id TEXT NOT NULL,
+    strategy_type TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    normalizer_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    total_stake REAL NOT NULL,
+    q_zero REAL,
+    q_two_plus REAL,
+    source_zero TEXT,
+    source_two_plus TEXT,
+    stake_zero REAL,
+    stake_two_plus REAL,
+    payout_zero REAL,
+    payout_two_plus REAL,
+    payout_difference REAL,
+    covered_profit REAL,
+    win_roi REAL,
+    p1_max REAL,
+    p1_tipico REAL,
+    p1_buffer REAL,
+    p_zero REAL,
+    p_one REAL,
+    p_two_plus REAL,
+    last_transition_type TEXT,
+    last_transition_at TEXT,
+    last_evaluation_id INTEGER,
+    updated_at TEXT NOT NULL,
+    is_eligible INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(event_id, strategy_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_current_strategy_updated
+    ON current_strategy_evaluations(updated_at, strategy_type, is_eligible);
 
 CREATE TABLE IF NOT EXISTS paper_portfolios (
     portfolio_id TEXT PRIMARY KEY,
@@ -328,6 +490,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     p1_tipico REAL,
     p1_buffer REAL,
     win_roi REAL,
+    entry_raw_payload_path TEXT,
     bankroll_before REAL NOT NULL,
     bankroll_after REAL NOT NULL,
     rank INTEGER,
@@ -415,6 +578,25 @@ def _bool_int(value: bool | None) -> int | None:
     return None if value is None else int(bool(value))
 
 
+SNAPSHOT_COLUMNS = (
+    "event_id", "observed_at", "snapshot_type", "trigger_reason",
+    "match_status", "display_time", "score_home", "score_away",
+    "ht_score_home", "ht_score_away", "market_count", "outcome_count",
+    "open_outcome_count", "paused_outcome_count", "snapshot_quality",
+    "raw_payload_path", "second_half_goals", "second_half_goal_class",
+    "competition_id", "competition_name", "competition_country",
+    "home_team", "away_team", "kickoff_time", "match_minute",
+    "q_zero_best", "q_zero_source_type", "q_zero_market_id", "q_zero_outcome_id",
+    "q_two_plus_best", "q_two_plus_source_type", "q_two_plus_market_id",
+    "q_two_plus_outcome_id", "remaining_under_05", "remaining_over_05",
+    "remaining_under_15", "remaining_over_15", "p0_market", "p1_market",
+    "p2plus_market", "p1_break_even", "p1_buffer", "win_roi",
+    "normalizer_version", "strategy_version", "relevant_markets_json",
+    "goal_at", "reopen_at", "reopen_delay_seconds", "archive_path",
+    "exported_at", "payload_hash",
+)
+
+
 class Database:
     """Thread-safe SQLite wrapper with explicit observation semantics."""
 
@@ -438,9 +620,50 @@ class Database:
         self._ensure_column("strategy_evaluations", "p_zero", "REAL")
         self._ensure_column("strategy_evaluations", "p_one", "REAL")
         self._ensure_column("strategy_evaluations", "p_two_plus", "REAL")
+        self._ensure_column("strategy_evaluations", "trigger_type", "TEXT")
+        self._ensure_column("strategy_evaluations", "is_eligible", "INTEGER")
+        for column, definition in (
+            ("competition_id", "TEXT"),
+            ("competition_name", "TEXT"),
+            ("competition_country", "TEXT"),
+            ("home_team", "TEXT"),
+            ("away_team", "TEXT"),
+            ("kickoff_time", "TEXT"),
+            ("match_minute", "INTEGER"),
+            ("q_zero_best", "REAL"),
+            ("q_zero_source_type", "TEXT"),
+            ("q_zero_market_id", "TEXT"),
+            ("q_zero_outcome_id", "TEXT"),
+            ("q_two_plus_best", "REAL"),
+            ("q_two_plus_source_type", "TEXT"),
+            ("q_two_plus_market_id", "TEXT"),
+            ("q_two_plus_outcome_id", "TEXT"),
+            ("remaining_under_05", "REAL"),
+            ("remaining_over_05", "REAL"),
+            ("remaining_under_15", "REAL"),
+            ("remaining_over_15", "REAL"),
+            ("p0_market", "REAL"),
+            ("p1_market", "REAL"),
+            ("p2plus_market", "REAL"),
+            ("p1_break_even", "REAL"),
+            ("p1_buffer", "REAL"),
+            ("win_roi", "REAL"),
+            ("normalizer_version", "TEXT"),
+            ("strategy_version", "TEXT"),
+            ("relevant_markets_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("goal_at", "TEXT"),
+            ("reopen_at", "TEXT"),
+            ("reopen_delay_seconds", "REAL"),
+            ("archive_path", "TEXT"),
+            ("exported_at", "TEXT"),
+            ("payload_hash", "TEXT"),
+        ):
+            self._ensure_column("snapshots", column, definition)
+        self._ensure_column("paper_trades", "entry_raw_payload_path", "TEXT")
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_odds_history_snapshot ON odds_history(snapshot_id)"
         )
+        self._ensure_snapshot_unique_index()
         self._backfill_competitions()
         self.connection.execute(
             """
@@ -451,6 +674,61 @@ class Database:
             (datetime.now(timezone.utc).isoformat(),),
         )
         self.connection.commit()
+
+    def _ensure_snapshot_unique_index(self) -> None:
+        """Enforce one standard historical slot per event without deleting legacy rows."""
+
+        standard = (
+            "PRE_KICKOFF", "HALFTIME", "HT_STABLE", "MINUTE_60", "MINUTE_70",
+            "MINUTE_80", "FIRST_H2_GOAL_REOPEN", "MINUTE_85", "MINUTE_90", "FINAL",
+        )
+        placeholders = ", ".join("?" for _ in standard)
+        duplicate = self.connection.execute(
+            f"""
+            SELECT 1 FROM snapshots
+            WHERE snapshot_type IN ({placeholders})
+            GROUP BY event_id, snapshot_type
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """,
+            standard,
+        ).fetchone()
+        if duplicate is not None:
+            # Existing V0.3 databases may contain duplicate legacy-style
+            # observations. Keep them for the migration report and let the
+            # application-level idempotency guard protect new writes.
+            pass
+        else:
+            self.connection.execute(
+                f"""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_event_type_unique
+                ON snapshots(event_id, snapshot_type)
+                WHERE snapshot_type IN (
+                    'PRE_KICKOFF', 'HALFTIME', 'HT_STABLE', 'MINUTE_60', 'MINUTE_70',
+                    'MINUTE_80', 'FIRST_H2_GOAL_REOPEN', 'MINUTE_85', 'MINUTE_90', 'FINAL'
+                )
+                """
+            )
+        # A trigger also protects a database that already contains duplicate
+        # legacy rows and therefore cannot accept the unique index yet. It
+        # never removes those rows; migration/cleanup remains explicit.
+        self.connection.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS prevent_duplicate_standard_snapshot
+            BEFORE INSERT ON snapshots
+            WHEN NEW.snapshot_type IN (
+                'PRE_KICKOFF', 'HALFTIME', 'HT_STABLE', 'MINUTE_60', 'MINUTE_70',
+                'MINUTE_80', 'FIRST_H2_GOAL_REOPEN', 'MINUTE_85', 'MINUTE_90', 'FINAL'
+            )
+            AND EXISTS (
+                SELECT 1 FROM snapshots
+                WHERE event_id = NEW.event_id AND snapshot_type = NEW.snapshot_type
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'duplicate standard snapshot slot');
+            END;
+            """
+        )
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         """Apply small additive migrations to databases created by V0.1."""
@@ -672,6 +950,61 @@ class Database:
                 observed_at,
             )
 
+    def upsert_current_event_state(self, state: EventState) -> bool:
+        """Replace the volatile state for an event and report semantic changes."""
+
+        with self._lock:
+            previous = self.connection.execute(
+                """
+                SELECT status, period, display_time, section_number,
+                       score_home, score_away, ht_score_home, ht_score_away,
+                       red_cards_home, red_cards_away
+                FROM current_event_state
+                WHERE event_id = ?
+                """,
+                (str(state.event_id),),
+            ).fetchone()
+            changed = previous is None or tuple(previous) != state.relevant_key
+            with self.connection:
+                self.connection.execute(
+                    """
+                    INSERT INTO current_event_state (
+                        event_id, observed_at, status, period, display_time,
+                        section_number, score_home, score_away,
+                        ht_score_home, ht_score_away, red_cards_home,
+                        red_cards_away, raw_state_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        observed_at = excluded.observed_at,
+                        status = excluded.status,
+                        period = excluded.period,
+                        display_time = excluded.display_time,
+                        section_number = excluded.section_number,
+                        score_home = excluded.score_home,
+                        score_away = excluded.score_away,
+                        ht_score_home = excluded.ht_score_home,
+                        ht_score_away = excluded.ht_score_away,
+                        red_cards_home = excluded.red_cards_home,
+                        red_cards_away = excluded.red_cards_away,
+                        raw_state_json = excluded.raw_state_json
+                    """,
+                    (
+                        state.event_id, state.observed_at, state.status,
+                        state.period, state.display_time, state.section_number,
+                        state.score_home, state.score_away, state.ht_score_home,
+                        state.ht_score_away, state.red_cards_home,
+                        state.red_cards_away, _json(state.raw_state or {}),
+                    ),
+                )
+            return changed
+
+    def current_event_state(self, event_id: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.connection.execute(
+                "SELECT * FROM current_event_state WHERE event_id = ?",
+                (str(event_id),),
+            ).fetchone()
+
     def record_event_state_if_changed(self, state: EventState) -> bool:
         """Store a state only when it differs from the latest state."""
 
@@ -719,6 +1052,232 @@ class Database:
                     ),
                 )
             return True
+
+    def upsert_current_strategy_state(self, values: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist current analysis and append only meaningful strategy transitions."""
+
+        event_id = str(values["event_id"])
+        strategy_type = str(values["strategy_type"])
+        status = str(values.get("status") or "UNKNOWN")
+        eligible = bool(values.get("is_eligible", status == "OK"))
+        with self._lock:
+            previous = self.connection.execute(
+                """
+                SELECT status, is_eligible, source_zero, source_two_plus,
+                       last_transition_type, last_transition_at, last_evaluation_id
+                FROM current_strategy_evaluations
+                WHERE event_id = ? AND strategy_type = ?
+                """,
+                (event_id, strategy_type),
+            ).fetchone()
+            previous_eligible = bool(previous["is_eligible"]) if previous is not None else False
+            previous_sources = (
+                previous["source_zero"], previous["source_two_plus"]
+            ) if previous is not None else (None, None)
+            transition: str | None = None
+            if eligible and (
+                previous is None
+                or previous["last_evaluation_id"] is None
+            ):
+                transition = "FIRST_ELIGIBLE"
+            elif eligible and not previous_eligible:
+                transition = "ELIGIBLE"
+            elif not eligible and previous_eligible:
+                transition = "INELIGIBLE"
+            elif (
+                eligible
+                and previous is not None
+                and previous_sources
+                != (values.get("source_zero"), values.get("source_two_plus"))
+            ):
+                transition = "BEST_ODDS_SOURCE_CHANGED"
+
+            evaluation_id: int | None = None
+            transition_at = str(values.get("observed_at"))
+            with self.connection:
+                if transition is not None:
+                    cursor = self.connection.execute(
+                        """
+                        INSERT INTO strategy_evaluations (
+                            event_id, observed_at, strategy_type, strategy_version,
+                            normalizer_version, status, total_stake, q_zero,
+                            q_two_plus, source_zero, source_two_plus, stake_zero,
+                            stake_two_plus, payout_zero, payout_two_plus,
+                            payout_difference, covered_profit, win_roi, p1_max,
+                            p1_tipico, p1_buffer, p_zero, p_one, p_two_plus,
+                            trigger_type, is_eligible
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event_id, values["observed_at"], strategy_type,
+                            values.get("strategy_version") or "",
+                            values.get("normalizer_version") or "",
+                            status, values.get("total_stake") or 0,
+                            values.get("q_zero"), values.get("q_two_plus"),
+                            values.get("source_zero"), values.get("source_two_plus"),
+                            values.get("stake_zero"), values.get("stake_two_plus"),
+                            values.get("payout_zero"), values.get("payout_two_plus"),
+                            values.get("payout_difference"), values.get("covered_profit"),
+                            values.get("win_roi"), values.get("p1_max"),
+                            values.get("p1_tipico"), values.get("p1_buffer"),
+                            values.get("p_zero"), values.get("p_one"),
+                            values.get("p_two_plus"), transition, int(eligible),
+                        ),
+                    )
+                    evaluation_id = int(cursor.lastrowid)
+                self.connection.execute(
+                    """
+                    INSERT INTO current_strategy_evaluations (
+                        event_id, strategy_type, observed_at, strategy_version,
+                        normalizer_version, status, total_stake, q_zero, q_two_plus,
+                        source_zero, source_two_plus, stake_zero, stake_two_plus,
+                        payout_zero, payout_two_plus, payout_difference, covered_profit,
+                        win_roi, p1_max, p1_tipico, p1_buffer, p_zero, p_one, p_two_plus,
+                        last_transition_type, last_transition_at, last_evaluation_id,
+                        updated_at, is_eligible
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(event_id, strategy_type) DO UPDATE SET
+                        observed_at = excluded.observed_at,
+                        strategy_version = excluded.strategy_version,
+                        normalizer_version = excluded.normalizer_version,
+                        status = excluded.status,
+                        total_stake = excluded.total_stake,
+                        q_zero = excluded.q_zero,
+                        q_two_plus = excluded.q_two_plus,
+                        source_zero = excluded.source_zero,
+                        source_two_plus = excluded.source_two_plus,
+                        stake_zero = excluded.stake_zero,
+                        stake_two_plus = excluded.stake_two_plus,
+                        payout_zero = excluded.payout_zero,
+                        payout_two_plus = excluded.payout_two_plus,
+                        payout_difference = excluded.payout_difference,
+                        covered_profit = excluded.covered_profit,
+                        win_roi = excluded.win_roi,
+                        p1_max = excluded.p1_max,
+                        p1_tipico = excluded.p1_tipico,
+                        p1_buffer = excluded.p1_buffer,
+                        p_zero = excluded.p_zero,
+                        p_one = excluded.p_one,
+                        p_two_plus = excluded.p_two_plus,
+                        last_transition_type = COALESCE(excluded.last_transition_type,
+                                                         current_strategy_evaluations.last_transition_type),
+                        last_transition_at = COALESCE(excluded.last_transition_at,
+                                                      current_strategy_evaluations.last_transition_at),
+                        last_evaluation_id = COALESCE(excluded.last_evaluation_id,
+                                                      current_strategy_evaluations.last_evaluation_id),
+                        updated_at = excluded.updated_at,
+                        is_eligible = excluded.is_eligible
+                    """,
+                    (
+                        event_id, strategy_type, values["observed_at"],
+                        values.get("strategy_version") or "",
+                        values.get("normalizer_version") or "", status,
+                        values.get("total_stake") or 0, values.get("q_zero"),
+                        values.get("q_two_plus"), values.get("source_zero"),
+                        values.get("source_two_plus"), values.get("stake_zero"),
+                        values.get("stake_two_plus"), values.get("payout_zero"),
+                        values.get("payout_two_plus"), values.get("payout_difference"),
+                        values.get("covered_profit"), values.get("win_roi"),
+                        values.get("p1_max"), values.get("p1_tipico"),
+                        values.get("p1_buffer"), values.get("p_zero"),
+                        values.get("p_one"), values.get("p_two_plus"),
+                        transition, transition_at if transition else None,
+                        evaluation_id, datetime.now(timezone.utc).isoformat(), int(eligible),
+                    ),
+                )
+            return {
+                "transition_type": transition,
+                "evaluation_id": evaluation_id,
+                "is_eligible": eligible,
+            }
+
+    def record_strategy_evaluation_event(
+        self,
+        values: Mapping[str, Any],
+        *,
+        trigger_type: str,
+        is_eligible: bool,
+    ) -> int:
+        """Append one explicitly requested strategy audit event and return its ID."""
+
+        columns = (
+            "event_id", "observed_at", "strategy_type", "strategy_version",
+            "normalizer_version", "status", "total_stake", "q_zero",
+            "q_two_plus", "source_zero", "source_two_plus", "stake_zero",
+            "stake_two_plus", "payout_zero", "payout_two_plus",
+            "payout_difference", "covered_profit", "win_roi", "p1_max",
+            "p1_tipico", "p1_buffer", "p_zero", "p_one", "p_two_plus",
+            "trigger_type", "is_eligible",
+        )
+        available = values.keys() if hasattr(values, "keys") else ()
+
+        def value(column: str) -> Any:
+            return values[column] if column in available else None
+
+        params = tuple(
+            value(column)
+            for column in columns[:-2]
+        ) + (str(trigger_type), int(bool(is_eligible)))
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                f"""
+                INSERT INTO strategy_evaluations ({', '.join(columns)})
+                VALUES ({', '.join('?' for _ in columns)})
+                """,
+                params,
+            )
+            evaluation_id = int(cursor.lastrowid)
+        return evaluation_id
+
+    def attach_strategy_evaluation_to_paper_trade(
+        self,
+        paper_trade_id: str,
+        evaluation_id: int,
+    ) -> None:
+        """Link the audit evaluation created at entry to the immutable trade row."""
+
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                UPDATE paper_trades
+                SET strategy_evaluation_id = ?
+                WHERE paper_trade_id = ?
+                """,
+                (int(evaluation_id), str(paper_trade_id)),
+            )
+
+    def mark_strategy_entry_evaluation(
+        self,
+        event_id: str,
+        strategy_type: str,
+        evaluation_id: int,
+        observed_at: str,
+    ) -> None:
+        """Make a paper-entry audit row the current strategy audit anchor."""
+
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                UPDATE current_strategy_evaluations
+                SET last_transition_type = 'PAPER_TRADE_ENTRY',
+                    last_transition_at = ?, last_evaluation_id = ?
+                WHERE event_id = ? AND strategy_type = ?
+                """,
+                (str(observed_at), int(evaluation_id), str(event_id), str(strategy_type)),
+            )
+
+    def current_strategy_evaluation_row(
+        self,
+        event_id: str,
+        strategy_type: str = "ZERO_OR_2PLUS",
+    ) -> sqlite3.Row | None:
+        with self._lock:
+            return self.connection.execute(
+                "SELECT * FROM current_strategy_evaluations WHERE event_id = ? AND strategy_type = ?",
+                (str(event_id), str(strategy_type)),
+            ).fetchone()
 
     def upsert_market(self, market: Market, observed_at: str) -> None:
         with self._lock, self.connection:
@@ -789,41 +1348,303 @@ class Database:
             )
 
     def create_snapshot(self, snapshot: Snapshot) -> int:
-        """Insert a snapshot and return its database identifier."""
+        """Insert one historical slot and return its stable database identifier."""
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                snapshot_id = self._insert_snapshot_locked(snapshot)
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+        snapshot.snapshot_id = snapshot_id
+        return snapshot_id
 
-        with self._lock, self.connection:
+    def _insert_snapshot_locked(self, snapshot: Snapshot) -> int:
+        """Insert a snapshot while the caller owns the database transaction."""
+
+        existing = self.connection.execute(
+            """
+            SELECT snapshot_id FROM snapshots
+            WHERE event_id = ? AND snapshot_type = ?
+            ORDER BY snapshot_id LIMIT 1
+            """,
+            (str(snapshot.event_id), str(snapshot.snapshot_type)),
+        ).fetchone()
+        if existing is not None:
+            return int(existing["snapshot_id"])
+        values = tuple(
+            getattr(snapshot, column)
+            if column != "relevant_markets_json"
+            else (snapshot.relevant_markets_json or "[]")
+            for column in SNAPSHOT_COLUMNS
+        )
+        try:
             cursor = self.connection.execute(
-                """
-                INSERT INTO snapshots (
-                    event_id, observed_at, snapshot_type, trigger_reason,
-                    match_status, display_time, score_home, score_away,
-                    ht_score_home, ht_score_away, market_count, outcome_count,
-                    open_outcome_count, paused_outcome_count, snapshot_quality,
-                    raw_payload_path, second_half_goals, second_half_goal_class
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    snapshot.event_id,
-                    snapshot.observed_at,
-                    snapshot.snapshot_type,
-                    snapshot.trigger_reason,
-                    snapshot.match_status,
-                    snapshot.display_time,
-                    snapshot.score_home,
-                    snapshot.score_away,
-                    snapshot.ht_score_home,
-                    snapshot.ht_score_away,
-                    snapshot.market_count,
-                    snapshot.outcome_count,
-                    snapshot.open_outcome_count,
-                    snapshot.paused_outcome_count,
-                    snapshot.snapshot_quality,
-                    snapshot.raw_payload_path,
-                    snapshot.second_half_goals,
-                    snapshot.second_half_goal_class,
-                ),
+                f"INSERT INTO snapshots ({', '.join(SNAPSHOT_COLUMNS)}) VALUES ({', '.join('?' for _ in SNAPSHOT_COLUMNS)})",
+                values,
             )
             return int(cursor.lastrowid)
+        except sqlite3.IntegrityError:
+            # Another process may have won the same slot between the read and
+            # insert. Return its ID so idempotent callers converge.
+            existing = self.connection.execute(
+                """
+                SELECT snapshot_id FROM snapshots
+                WHERE event_id = ? AND snapshot_type = ?
+                ORDER BY snapshot_id LIMIT 1
+                """,
+                (str(snapshot.event_id), str(snapshot.snapshot_type)),
+            ).fetchone()
+            if existing is None:
+                raise
+            return int(existing["snapshot_id"])
+
+    def enqueue_historical_snapshot(
+        self,
+        snapshot: Snapshot,
+        payload: Mapping[str, Any],
+    ) -> tuple[int, bool]:
+        """Atomically register a flat snapshot and its Parquet outbox row."""
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                snapshot_id = self._insert_snapshot_locked(snapshot)
+                result = self._enqueue_snapshot_payload_locked(snapshot_id, payload)
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+        snapshot.snapshot_id = snapshot_id
+        return snapshot_id, bool(result)
+
+    def enqueue_snapshot_payload(
+        self,
+        snapshot_id: int,
+        payload: Mapping[str, Any],
+    ) -> tuple[int, bool]:
+        """Queue an already-created snapshot with its final ID in the payload."""
+
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                created = self._enqueue_snapshot_payload_locked(snapshot_id, payload)
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+        return int(snapshot_id), bool(created)
+
+    def _enqueue_snapshot_payload_locked(
+        self,
+        snapshot_id: int,
+        payload: Mapping[str, Any],
+    ) -> bool:
+        """Queue payload while the caller owns an IMMEDIATE transaction."""
+
+        payload_dict = dict(payload)
+        payload_dict["snapshot_id"] = int(snapshot_id)
+        encoded = _json(payload_dict)
+        payload_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        snapshot_row = self.connection.execute(
+            """
+            SELECT event_id, snapshot_type, observed_at, relevant_markets_json
+            FROM snapshots WHERE snapshot_id = ?
+            """,
+            (int(snapshot_id),),
+        ).fetchone()
+        if snapshot_row is None:
+            raise KeyError(f"Unknown snapshot: {snapshot_id}")
+        event_id = str(snapshot_row["event_id"])
+        snapshot_type = str(snapshot_row["snapshot_type"])
+        encoded_captured_at = str(
+            payload_dict.get("captured_at") or snapshot_row["observed_at"]
+        )
+        self.connection.execute(
+            """
+            UPDATE snapshots
+            SET payload_hash = ?, relevant_markets_json = ?
+            WHERE snapshot_id = ?
+            """,
+            (
+                payload_hash,
+                str(
+                    payload_dict.get("relevant_markets_json")
+                    or snapshot_row["relevant_markets_json"]
+                    or "[]"
+                ),
+                int(snapshot_id),
+            ),
+        )
+        outbox = self.connection.execute(
+            "SELECT snapshot_id FROM snapshot_outbox WHERE snapshot_id = ?",
+            (int(snapshot_id),),
+        ).fetchone()
+        if outbox is not None:
+            return False
+        self.connection.execute(
+            """
+            INSERT INTO snapshot_outbox (
+                snapshot_id, event_id, snapshot_type, captured_at,
+                payload_json, payload_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(snapshot_id),
+                event_id,
+                snapshot_type,
+                encoded_captured_at,
+                encoded,
+                payload_hash,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        return True
+
+    def snapshot_exists(self, event_id: str, snapshot_type: str) -> bool:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT 1 FROM snapshots WHERE event_id = ? AND snapshot_type = ? LIMIT 1",
+                (str(event_id), str(snapshot_type)),
+            ).fetchone()
+        return row is not None
+
+    def pending_snapshot_outbox(self, limit: int = 100) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT * FROM snapshot_outbox
+                    WHERE exported = 0
+                    ORDER BY captured_at, snapshot_id
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+            )
+
+    def mark_snapshot_outbox_error(self, snapshot_ids: Iterable[int], error: str) -> None:
+        ids = [int(item) for item in snapshot_ids]
+        if not ids:
+            return
+        placeholders = ", ".join("?" for _ in ids)
+        with self._lock, self.connection:
+            self.connection.execute(
+                f"""
+                UPDATE snapshot_outbox
+                SET attempts = attempts + 1, last_error = ?
+                WHERE snapshot_id IN ({placeholders})
+                """,
+                [str(error), *ids],
+            )
+
+    def mark_snapshots_exported(
+        self,
+        snapshot_ids: Iterable[int],
+        archive_path: str,
+        exported_at: str,
+    ) -> int:
+        ids = [int(item) for item in snapshot_ids]
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        with self._lock:
+            with self.connection:
+                self.connection.execute(
+                    f"""
+                    UPDATE snapshots
+                    SET archive_path = ?, exported_at = ?
+                    WHERE snapshot_id IN ({placeholders})
+                    """,
+                    [str(archive_path), str(exported_at), *ids],
+                )
+                cursor = self.connection.execute(
+                    f"""
+                    UPDATE snapshot_outbox
+                    SET exported = 1, exported_at = ?, last_error = NULL
+                    WHERE snapshot_id IN ({placeholders})
+                    """,
+                    [str(exported_at), *ids],
+                )
+        return int(cursor.rowcount)
+
+    def delete_exported_snapshot_outbox(self, *, before: str | None = None) -> int:
+        clause = "WHERE exported = 1"
+        params: list[Any] = []
+        if before:
+            clause += " AND exported_at <= ?"
+            params.append(str(before))
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                f"DELETE FROM snapshot_outbox {clause}", params
+            )
+        return int(cursor.rowcount)
+
+    def snapshot_archive_rows(self, *, date_text: str | None = None) -> list[sqlite3.Row]:
+        clauses = ["exported_at IS NOT NULL"]
+        params: list[Any] = []
+        if date_text:
+            clauses.append("substr(observed_at, 1, 10) = ?")
+            params.append(str(date_text))
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    "SELECT * FROM snapshots WHERE " + " AND ".join(clauses)
+                    + " ORDER BY observed_at, snapshot_id",
+                    params,
+                ).fetchall()
+            )
+
+    def upsert_match_result(self, values: Mapping[str, Any]) -> sqlite3.Row:
+        columns = (
+            "event_id", "competition_id", "competition_name", "competition_country",
+            "home_team", "away_team", "kickoff_at", "ht_home", "ht_away",
+            "ft_home", "ft_away", "first_half_goals", "second_half_goals",
+            "second_half_goal_class", "final_status", "finished_at", "extra_time",
+            "penalties",
+        )
+        params = tuple(values.get(column) for column in columns)
+        with self._lock:
+            with self.connection:
+                self.connection.execute(
+                    f"""
+                    INSERT INTO match_results ({', '.join(columns)})
+                    VALUES ({', '.join('?' for _ in columns)})
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        competition_id = excluded.competition_id,
+                        competition_name = excluded.competition_name,
+                        competition_country = excluded.competition_country,
+                        home_team = excluded.home_team,
+                        away_team = excluded.away_team,
+                        kickoff_at = excluded.kickoff_at,
+                        ht_home = excluded.ht_home,
+                        ht_away = excluded.ht_away,
+                        ft_home = excluded.ft_home,
+                        ft_away = excluded.ft_away,
+                        first_half_goals = excluded.first_half_goals,
+                        second_half_goals = excluded.second_half_goals,
+                        second_half_goal_class = excluded.second_half_goal_class,
+                        final_status = excluded.final_status,
+                        finished_at = excluded.finished_at,
+                        extra_time = excluded.extra_time,
+                        penalties = excluded.penalties
+                    """,
+                    params,
+                )
+            row = self.connection.execute(
+                "SELECT * FROM match_results WHERE event_id = ?",
+                (str(values["event_id"]),),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Match result was not persisted")
+        return row
+
+    def match_result_for_event(self, event_id: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.connection.execute(
+                "SELECT * FROM match_results WHERE event_id = ?",
+                (str(event_id),),
+            ).fetchone()
 
     def add_market_presence(
         self,
@@ -912,6 +1733,86 @@ class Database:
                     inserted += cursor.rowcount
         return inserted
 
+    def replace_current_canonical_outcomes(
+        self,
+        outcomes: list[Any],
+        *,
+        event_id: str | None = None,
+    ) -> int:
+        """Replace one event's volatile normalized market view in one transaction."""
+
+        grouped: dict[str, list[Any]] = {}
+        for outcome in outcomes:
+            grouped.setdefault(str(outcome.event_id), []).append(outcome)
+        if not grouped and event_id is not None:
+            with self._lock, self.connection:
+                self.connection.execute(
+                    "DELETE FROM current_canonical_outcomes WHERE event_id = ?",
+                    (str(event_id),),
+                )
+            return 0
+        if not grouped:
+            return 0
+        columns = (
+            "event_id", "market_id", "outcome_id", "observed_at", "canonical_type",
+            "scope", "period", "side", "line", "team", "odds", "status",
+            "available", "raw_market_type", "raw_market_caption", "raw_fixed_param",
+            "raw_choice_param", "raw_outcome_caption", "settlement_scope",
+            "normalizer_version", "updated_at",
+        )
+        with self._lock:
+            with self.connection:
+                for event_id, event_outcomes in grouped.items():
+                    self.connection.execute(
+                        "DELETE FROM current_canonical_outcomes WHERE event_id = ?",
+                        (event_id,),
+                    )
+                    now = datetime.now(timezone.utc).isoformat()
+                    for outcome in event_outcomes:
+                        self.connection.execute(
+                            f"""
+                            INSERT INTO current_canonical_outcomes ({', '.join(columns)})
+                            VALUES ({', '.join('?' for _ in columns)})
+                            """,
+                            (
+                                str(outcome.event_id), str(outcome.market_id),
+                                str(outcome.outcome_id), str(outcome.observed_at),
+                                str(outcome.canonical_type), str(outcome.scope),
+                                str(outcome.period), outcome.side, outcome.line,
+                                outcome.team, outcome.odds, str(outcome.status),
+                                int(bool(outcome.available)), str(outcome.raw_market_type),
+                                str(outcome.raw_market_caption), str(outcome.raw_fixed_param),
+                                outcome.raw_choice_param, str(outcome.raw_outcome_caption),
+                                str(outcome.settlement_scope), str(outcome.normalizer_version),
+                                now,
+                            ),
+                        )
+        return sum(len(items) for items in grouped.values())
+
+    def current_canonical_quotes_for_evaluation(
+        self,
+        event_id: str,
+        canonical_types: Iterable[str],
+    ) -> list[sqlite3.Row]:
+        types = [str(item) for item in canonical_types]
+        if not types:
+            return []
+        placeholders = ", ".join("?" for _ in types)
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    f"""
+                    SELECT * FROM current_canonical_outcomes
+                    WHERE event_id = ? AND canonical_type IN ({placeholders})
+                      AND available = 1 AND odds IS NOT NULL
+                      AND lower(status) NOT IN
+                          ('paused', 'suspended', 'stopped', 'closed', 'inactive')
+                    ORDER BY odds ASC, outcome_id DESC
+                    """,
+                    [str(event_id), *types],
+                ).fetchall()
+            )
+
     def record_strategy_evaluation_if_changed(
         self,
         *,
@@ -939,6 +1840,9 @@ class Database:
         p_zero: float | None = None,
         p_one: float | None = None,
         p_two_plus: float | None = None,
+        trigger_type: str | None = None,
+        is_eligible: bool | None = None,
+        force: bool = False,
     ) -> bool:
         """Persist strategy state only when a material input changed."""
 
@@ -966,7 +1870,7 @@ class Database:
                 """,
                 (str(event_id), str(strategy_type)),
             ).fetchone()
-            if previous is not None and tuple(previous) == signature:
+            if not force and previous is not None and tuple(previous) == signature:
                 return False
             with self.connection:
                 self.connection.execute(
@@ -977,9 +1881,10 @@ class Database:
                         q_two_plus, source_zero, source_two_plus, stake_zero,
                         stake_two_plus, payout_zero, payout_two_plus,
                         payout_difference, covered_profit, win_roi, p1_max,
-                        p1_tipico, p1_buffer, p_zero, p_one, p_two_plus
+                        p1_tipico, p1_buffer, p_zero, p_one, p_two_plus,
+                        trigger_type, is_eligible
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                              ?, ?, ?, ?, ?, ?, ?, ?)
+                              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(event_id),
@@ -1006,6 +1911,8 @@ class Database:
                         p_zero,
                         p_one,
                         p_two_plus,
+                        trigger_type,
+                        None if is_eligible is None else int(bool(is_eligible)),
                     ),
                 )
             return True
@@ -1110,10 +2017,17 @@ class Database:
 
     @property
     def database_size_bytes(self) -> int:
-        try:
-            return int(self.path.stat().st_size)
-        except OSError:
-            return 0
+        total = 0
+        for candidate in (
+            self.path,
+            Path(str(self.path) + "-wal"),
+            Path(str(self.path) + "-shm"),
+        ):
+            try:
+                total += int(candidate.stat().st_size)
+            except OSError:
+                pass
+        return total
 
     def canonical_outcomes_for_event(
         self,
@@ -1158,29 +2072,69 @@ class Database:
         since: str | None = None,
         limit: int = 500,
     ) -> list[sqlite3.Row]:
-        """Return evaluations used by the independent paper worker."""
+        """Return current analysis first, with legacy transitions as fallback."""
 
-        clauses = ["se.strategy_type = ?"]
-        params: list[Any] = [str(strategy_type)]
+        current_clauses = ["cs.strategy_type = ?"]
+        legacy_clauses = ["se.strategy_type = ?"]
+        current_params: list[Any] = [str(strategy_type)]
+        legacy_params: list[Any] = [str(strategy_type)]
         if since:
-            clauses.append("se.observed_at >= ?")
-            params.append(str(since))
-        params.append(max(1, int(limit)))
+            current_clauses.append("cs.observed_at >= ?")
+            current_params.append(str(since))
+            legacy_clauses.append("se.observed_at >= ?")
+            legacy_params.append(str(since))
+        query = (
+            """
+            SELECT cs.last_evaluation_id AS evaluation_id,
+                   cs.event_id, cs.observed_at, cs.strategy_type,
+                   cs.strategy_version, cs.normalizer_version, cs.status,
+                   cs.total_stake, cs.q_zero, cs.q_two_plus, cs.source_zero,
+                   cs.source_two_plus, cs.stake_zero, cs.stake_two_plus,
+                   cs.payout_zero, cs.payout_two_plus, cs.payout_difference,
+                   cs.covered_profit, cs.win_roi, cs.p1_max, cs.p1_tipico,
+                   cs.p1_buffer, cs.p_zero, cs.p_one, cs.p_two_plus,
+                   cs.last_transition_type AS trigger_type,
+                   cs.is_eligible, e.competition_id, e.competition_name,
+                   e.competition_country, e.home_team, e.away_team,
+                   e.ht_score_home AS event_ht_score_home,
+                   e.ht_score_away AS event_ht_score_away,
+                   e.sport, e.extra_time, e.penalties
+            FROM current_strategy_evaluations cs
+            LEFT JOIN events e ON e.event_id = cs.event_id
+            WHERE """
+            + " AND ".join(current_clauses)
+            + """
+            UNION ALL
+            SELECT se.evaluation_id, se.event_id, se.observed_at,
+                   se.strategy_type, se.strategy_version, se.normalizer_version,
+                   se.status, se.total_stake, se.q_zero, se.q_two_plus,
+                   se.source_zero, se.source_two_plus, se.stake_zero,
+                   se.stake_two_plus, se.payout_zero, se.payout_two_plus,
+                   se.payout_difference, se.covered_profit, se.win_roi,
+                   se.p1_max, se.p1_tipico, se.p1_buffer, se.p_zero,
+                   se.p_one, se.p_two_plus, se.trigger_type, se.is_eligible,
+                   e.competition_id, e.competition_name, e.competition_country,
+                   e.home_team, e.away_team, e.ht_score_home AS event_ht_score_home,
+                   e.ht_score_away AS event_ht_score_away, e.sport, e.extra_time,
+                   e.penalties
+            FROM strategy_evaluations se
+            LEFT JOIN events e ON e.event_id = se.event_id
+            WHERE """
+            + " AND ".join(legacy_clauses)
+            + """
+              AND NOT EXISTS (
+                  SELECT 1 FROM current_strategy_evaluations cs2
+                  WHERE cs2.event_id = se.event_id
+                    AND cs2.strategy_type = se.strategy_type
+              )
+            ORDER BY observed_at DESC, evaluation_id DESC LIMIT ?
+        """
+        )
         with self._lock:
             return list(
                 self.connection.execute(
-                    """
-                    SELECT se.*, e.competition_id, e.competition_name,
-                           e.competition_country, e.home_team, e.away_team,
-                           e.ht_score_home AS event_ht_score_home,
-                           e.ht_score_away AS event_ht_score_away,
-                           e.sport, e.extra_time, e.penalties
-                    FROM strategy_evaluations se
-                    LEFT JOIN events e ON e.event_id = se.event_id
-                    WHERE """
-                    + " AND ".join(clauses)
-                    + " ORDER BY se.observed_at DESC, se.evaluation_id DESC LIMIT ?",
-                    params,
+                    query,
+                    [*current_params, *legacy_params, max(1, int(limit))],
                 ).fetchall()
             )
 
@@ -1210,6 +2164,29 @@ class Database:
 
     def first_halftime_observed_at(self, event_id: str) -> str | None:
         with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT MIN(observed_at) AS observed_at
+                FROM snapshots
+                WHERE event_id = ? AND snapshot_type = 'HALFTIME'
+                """,
+                (str(event_id),),
+            ).fetchone()
+            if row and row["observed_at"]:
+                return str(row["observed_at"])
+            row = self.connection.execute(
+                """
+                SELECT observed_at
+                FROM current_event_state
+                WHERE event_id = ?
+                  AND (upper(period) IN ('HALF_TIME', 'HALFTIME', 'HT')
+                       OR upper(display_time) = 'HZ')
+                LIMIT 1
+                """,
+                (str(event_id),),
+            ).fetchone()
+            if row and row["observed_at"]:
+                return str(row["observed_at"])
             row = self.connection.execute(
                 """
                 SELECT MIN(observed_at) AS observed_at
@@ -1550,7 +2527,7 @@ class Database:
                     "two_plus_quote_observed_at", "two_plus_quote_age_seconds", "stake_total",
                     "stake_zero", "stake_two_plus", "payout_zero", "payout_two_plus",
                     "p_zero", "p_one", "p_two_plus", "p1_max", "p1_tipico", "p1_buffer",
-                    "win_roi", "bankroll_before", "bankroll_after", "rank", "status",
+                    "win_roi", "entry_raw_payload_path", "bankroll_before", "bankroll_after", "rank", "status",
                     "entry_snapshot_json",
                 )
                 trade_params = tuple(snapshot.get(column) for column in trade_columns[:-1]) + (
@@ -1753,6 +2730,12 @@ class Database:
 
     def latest_event_state(self, event_id: str) -> sqlite3.Row | None:
         with self._lock:
+            current = self.connection.execute(
+                "SELECT * FROM current_event_state WHERE event_id = ?",
+                (str(event_id),),
+            ).fetchone()
+            if current is not None:
+                return current
             return self.connection.execute(
                 """
                 SELECT *
@@ -1794,14 +2777,19 @@ class Database:
         allowed = {
             "events",
             "event_states",
+            "current_event_state",
             "markets",
             "outcomes",
             "odds_history",
             "competitions",
             "snapshots",
+            "snapshot_outbox",
+            "match_results",
             "market_presence",
             "canonical_outcomes",
+            "current_canonical_outcomes",
             "strategy_evaluations",
+            "current_strategy_evaluations",
             "paper_portfolios",
             "paper_portfolio_competitions",
             "paper_trades",
@@ -1816,7 +2804,7 @@ class Database:
             row = self.connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
             return int(row["count"]) if row else 0
 
-    def collection_metrics_for_date(self, date_text: str | None = None) -> dict[str, int]:
+    def collection_metrics_for_date(self, date_text: str | None = None) -> dict[str, Any]:
         """Return collector coverage counts for one UTC calendar date."""
 
         day = date_text or datetime.now(timezone.utc).date().isoformat()
@@ -1868,22 +2856,12 @@ class Database:
             ).fetchone()
             core_events = self.connection.execute(
                 """
-                SELECT COUNT(DISTINCT s.event_id) AS count
-                FROM snapshots s
-                JOIN market_presence p ON p.snapshot_id = s.snapshot_id
-                WHERE substr(s.observed_at, 1, 10) = ?
-                  AND s.snapshot_type = 'LIVE_PERIODIC'
-                  AND p.present = 1
-                  AND (
-                      lower(COALESCE(p.market_type, '')) IN (
-                          'points-more-less-rest', 'next-point',
-                          'team-points-more-less', 'score-both',
-                          'points-more-less', 'section-points-more-less'
-                      )
-                      OR lower(COALESCE(p.market_type, '')) LIKE 'points-more-less%'
-                      OR lower(COALESCE(p.market_type, '')) LIKE 'team-points-more-less%'
-                  )
-                  AND COALESCE(s.snapshot_quality, '') != 'FAILED'
+                SELECT COUNT(DISTINCT event_id) AS count
+                FROM snapshots
+                WHERE substr(observed_at, 1, 10) = ?
+                  AND snapshot_type IN ('MINUTE_60', 'MINUTE_70', 'MINUTE_80',
+                                        'MINUTE_85', 'MINUTE_90')
+                  AND COALESCE(snapshot_quality, '') != 'FAILED'
                 """,
                 (day,),
             ).fetchone()
@@ -1895,6 +2873,36 @@ class Database:
                 """,
                 (day,),
             ).fetchone()
+            matches_today = self.connection.execute(
+                "SELECT COUNT(*) AS count FROM match_results WHERE substr(finished_at, 1, 10) = ?",
+                (day,),
+            ).fetchone()
+            paper_today = self.connection.execute(
+                "SELECT COUNT(*) AS count FROM paper_trades WHERE substr(created_at, 1, 10) = ?",
+                (day,),
+            ).fetchone()
+            standard_types = (
+                "PRE_KICKOFF", "HALFTIME", "HT_STABLE", "MINUTE_60", "MINUTE_70",
+                "MINUTE_80", "FIRST_H2_GOAL_REOPEN", "MINUTE_85", "MINUTE_90", "FINAL",
+            )
+            standard_placeholders = ", ".join("?" for _ in standard_types)
+            total_snapshots = self.connection.execute(
+                f"""
+                SELECT COUNT(*) AS count FROM snapshots
+                WHERE substr(observed_at, 1, 10) = ?
+                  AND snapshot_type IN ({standard_placeholders})
+                """,
+                [day, *standard_types],
+            ).fetchone()
+            finished_snapshot_total = self.connection.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM snapshots s JOIN match_results r ON r.event_id = s.event_id
+                WHERE substr(r.finished_at, 1, 10) = ?
+                  AND s.snapshot_type IN ({standard_placeholders})
+                """,
+                [day, *standard_types],
+            ).fetchone()
 
         snapshot_counts = {str(row["snapshot_type"]): int(row["count"]) for row in snapshot_rows}
         coverage = {str(row["snapshot_type"]): int(row["count"]) for row in coverage_rows}
@@ -1904,17 +2912,50 @@ class Database:
             "prematch_snapshots": snapshot_counts.get("PREMATCH", 0),
             "pre_kickoff_snapshots": snapshot_counts.get("PRE_KICKOFF", 0),
             "halftime_snapshots": snapshot_counts.get("HALFTIME", 0),
-            "periodic_snapshots": snapshot_counts.get("LIVE_PERIODIC", 0),
-            "goal_triggers": snapshot_counts.get("EVENT_TRIGGERED", 0),
+            "ht_stable_snapshots": snapshot_counts.get("HT_STABLE", 0),
+            "minute_60_snapshots": snapshot_counts.get("MINUTE_60", 0),
+            "minute_70_snapshots": snapshot_counts.get("MINUTE_70", 0),
+            "minute_80_snapshots": snapshot_counts.get("MINUTE_80", 0),
+            "goal_reopen_snapshots": snapshot_counts.get("FIRST_H2_GOAL_REOPEN", 0),
+            "minute_85_snapshots": snapshot_counts.get("MINUTE_85", 0),
+            "minute_90_snapshots": snapshot_counts.get("MINUTE_90", 0),
+            "periodic_snapshots": sum(
+                snapshot_counts.get(f"MINUTE_{minute}", 0)
+                for minute in (60, 70, 80, 85, 90)
+            ),
+            "goal_triggers": snapshot_counts.get("FIRST_H2_GOAL_REOPEN", 0),
             "final_snapshots": snapshot_counts.get("FINAL", 0),
             "failed_snapshots": int(failed_snapshots["count"]) if failed_snapshots else 0,
             "events_with_prematch_snapshot": int(prematch_events["count"])
             if prematch_events
             else 0,
             "events_with_halftime_snapshot": coverage.get("HALFTIME", 0),
-            "events_with_final_result": coverage.get("FINAL", 0),
+            "events_with_final_result": int(matches_today["count"]) if matches_today else 0,
             "events_with_core_live_tracking": int(core_events["count"]) if core_events else 0,
+            "snapshots_today": int(total_snapshots["count"]) if total_snapshots else 0,
+            "matches_today": int(matches_today["count"]) if matches_today else 0,
+            "paper_trades_today": int(paper_today["count"]) if paper_today else 0,
+            "average_snapshots_per_finished_match": (
+                float(finished_snapshot_total["count"])
+                / float(matches_today["count"])
+                if matches_today and matches_today["count"]
+                else 0.0
+            ),
+            "outbox_pending": self._scalar_count("snapshot_outbox", "exported = 0"),
+            "last_parquet_export": self._max_value("snapshots", "exported_at"),
         }
+
+    def _scalar_count(self, table: str, clause: str = "1 = 1") -> int:
+        row = self.connection.execute(
+            f"SELECT COUNT(*) AS count FROM {table} WHERE {clause}"
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+
+    def _max_value(self, table: str, column: str) -> str | None:
+        row = self.connection.execute(
+            f"SELECT MAX({column}) AS value FROM {table}"
+        ).fetchone()
+        return str(row["value"]) if row and row["value"] else None
 
     def list_events_for_inspector(self, limit: int = 200) -> list[sqlite3.Row]:
         with self._lock:
@@ -1975,7 +3016,7 @@ class Database:
     def mark_event_no_longer_live(self, event_id: str, observed_at: str) -> bool:
         """Keep historical data and add one state transition for a disappeared event."""
 
-        latest = self.latest_event_state(event_id)
+        latest = self.current_event_state(event_id) or self.latest_event_state(event_id)
         if latest is None or str(latest["status"]).upper() in {"FINISHED", "NO_LONGER_LIVE"}:
             return False
         state = EventState(
@@ -1993,7 +3034,7 @@ class Database:
             red_cards_away=latest["red_cards_away"],
             raw_state={"reason": "event_missing_from_live_feed"},
         )
-        return self.record_event_state_if_changed(state)
+        return self.upsert_current_event_state(state)
 
 
 def state_from_event(event: LiveEvent, observed_at: str) -> EventState:

@@ -125,40 +125,44 @@ class MarketIntelligenceService:
 
     def _persist(self, analysis: MarketAnalysis) -> None:
         try:
-            self.database.save_canonical_outcomes(  # type: ignore[union-attr]
-                analysis.normalized_outcomes,
-                snapshot_id=analysis.snapshot_id,
-            )
             strategy = analysis.strategy
-            self.database.record_strategy_evaluation_if_changed(  # type: ignore[union-attr]
+            status = (
+                strategy.status
+                if analysis.probability.status == "OK"
+                else f"BLOCKED_{analysis.probability.status}"
+            )
+            self.database.replace_current_canonical_outcomes(  # type: ignore[union-attr]
+                analysis.normalized_outcomes,
                 event_id=analysis.event_id,
-                observed_at=analysis.observed_at,
-                strategy_type=strategy.strategy_type,
-                strategy_version=strategy.strategy_version or STRATEGY_VERSION,
-                status=(
-                    strategy.status
-                    if analysis.probability.status == "OK"
-                    else f"BLOCKED_{analysis.probability.status}"
-                ),
-                total_stake=strategy.total_stake,
-                q_zero=strategy.q_zero,
-                q_two_plus=strategy.q_two_plus,
-                source_zero=strategy.source_zero,
-                source_two_plus=strategy.source_two_plus,
-                stake_zero=strategy.stake_zero,
-                stake_two_plus=strategy.stake_two_plus,
-                payout_zero=strategy.payout_zero,
-                payout_two_plus=strategy.payout_two_plus,
-                payout_difference=strategy.payout_difference,
-                covered_profit=strategy.covered_profit,
-                win_roi=strategy.win_roi,
-                p1_max=strategy.p1_max,
-                p1_tipico=strategy.p1_tipico,
-                p1_buffer=strategy.p1_buffer,
-                p_zero=analysis.probability.p0,
-                p_one=analysis.probability.p1,
-                p_two_plus=analysis.probability.p2_plus,
-                normalizer_version=self.normalizer.version,
+            )
+            self.database.upsert_current_strategy_state(  # type: ignore[union-attr]
+                {
+                    "event_id": analysis.event_id,
+                    "observed_at": analysis.observed_at,
+                    "strategy_type": strategy.strategy_type,
+                    "strategy_version": strategy.strategy_version or STRATEGY_VERSION,
+                    "normalizer_version": self.normalizer.version,
+                    "status": status,
+                    "is_eligible": status == "OK",
+                    "total_stake": strategy.total_stake,
+                    "q_zero": strategy.q_zero,
+                    "q_two_plus": strategy.q_two_plus,
+                    "source_zero": strategy.source_zero,
+                    "source_two_plus": strategy.source_two_plus,
+                    "stake_zero": strategy.stake_zero,
+                    "stake_two_plus": strategy.stake_two_plus,
+                    "payout_zero": strategy.payout_zero,
+                    "payout_two_plus": strategy.payout_two_plus,
+                    "payout_difference": strategy.payout_difference,
+                    "covered_profit": strategy.covered_profit,
+                    "win_roi": strategy.win_roi,
+                    "p1_max": strategy.p1_max,
+                    "p1_tipico": strategy.p1_tipico,
+                    "p1_buffer": strategy.p1_buffer,
+                    "p_zero": analysis.probability.p0,
+                    "p_one": analysis.probability.p1,
+                    "p_two_plus": analysis.probability.p2_plus,
+                }
             )
         except Exception as exc:  # persistence must never interrupt live polling
             self.logger.warning(
@@ -191,4 +195,5 @@ class MarketIntelligenceService:
             snapshot_id=int(row["snapshot_id"]),
             total_stake=total_stake,
             now=now,
+            persist=False,
         )

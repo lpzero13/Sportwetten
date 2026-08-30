@@ -19,14 +19,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean, median
-from typing import Callable
+from typing import Any, Callable
 
 from config import Settings
+from intelligence.models import MarketAnalysis
 from intelligence.service import MarketIntelligenceService
 from models.event import LiveEvent
 from models.market import EventDetails
 from models.snapshot import Snapshot
 from storage.database import Database
+from storage.parquet_archive import ParquetArchive, build_snapshot_payload
 from storage.raw_storage import RawStorage
 from storage.repositories import MarketRepository
 from tipico.client import ApiResponse, RequestMetrics, TipicoApiError, TipicoClient
@@ -103,6 +105,8 @@ def _second_half_label(event: LiveEvent) -> tuple[int | None, str | None]:
     goals = (event.score_home + event.score_away) - (
         event.ht_score_home + event.ht_score_away
     )
+    if goals < 0:
+        return None, None
     return goals, "2_PLUS" if goals >= 2 else str(goals)
 
 
@@ -115,6 +119,8 @@ class SnapshotJob:
     raw_full: bool
     fallback_event: LiveEvent | None = None
     sequence: int = 0
+    goal_at: str | None = None
+    reopen_delay_seconds: float | None = None
 
     @property
     def key(self) -> tuple[str, str, str, int]:
@@ -183,16 +189,15 @@ class RequestStats:
 @dataclass(slots=True)
 class CollectorEventState:
     halftime_detected: bool = False
-    second_half_seen: bool = False
-    strategic_minutes_seen: set[int] = field(default_factory=set)
-    core_market_present: bool = False
-    last_core_enqueued_at: float | None = None
-    core_sequence: int = 0
-    goal_sequence: int = 0
+    first_h2_goal_seen: bool = False
+    first_h2_goal_at: str | None = None
+    reopen_enqueued: bool = False
+    minute_slots_seen: set[int] = field(default_factory=set)
+    reopen_probe_sequence: int = 0
     final_enqueued: bool = False
     last_outcome_availability: dict[str, bool] = field(default_factory=dict)
     latest_details: EventDetails | None = None
-    reopen_count: int = 0
+    last_status: str | None = None
 
 
 class Collector:
@@ -228,6 +233,11 @@ class Collector:
             settings,
             logger=self.logger,
         )
+        self.archive = ParquetArchive(
+            settings.archive_path,
+            compression=settings.parquet_compression,
+            logger=self.logger,
+        )
         self.client_factory = client_factory or (
             lambda: TipicoClient(settings, logger=self.logger)
         )
@@ -253,6 +263,7 @@ class Collector:
         self._last_status_write_at = 0.0
         self._executor: ThreadPoolExecutor | None = None
         self._running = False
+        self._last_archive_export_at: float | None = None
 
     @property
     def queue_depth(self) -> int:
@@ -272,6 +283,8 @@ class Collector:
         raw_full: bool,
         fallback_event: LiveEvent | None = None,
         sequence: int = 0,
+        goal_at: str | None = None,
+        reopen_delay_seconds: float | None = None,
     ) -> bool:
         job = SnapshotJob(
             event_id=str(event_id),
@@ -281,7 +294,18 @@ class Collector:
             raw_full=raw_full,
             fallback_event=fallback_event,
             sequence=sequence,
+            goal_at=goal_at,
+            reopen_delay_seconds=reopen_delay_seconds,
         )
+        if snapshot_type not in {"REOPEN_PROBE"} and self.database.snapshot_exists(
+            event_id, snapshot_type
+        ):
+            return False
+        if snapshot_type == "REOPEN_PROBE" and any(
+            key[0] == str(event_id) and key[1] == snapshot_type
+            for key in self._pending_keys | self._active_keys
+        ):
+            return False
         if job.key in self._pending_keys or job.key in self._active_keys:
             return False
         self._pending_keys.add(job.key)
@@ -307,108 +331,100 @@ class Collector:
         for event_id, event in current_events.items():
             previous = previous_events.get(event_id)
             state = self._event_states.setdefault(event_id, CollectorEventState())
-            if previous is None:
+            observed_at = result.metrics.response_received_at if result.metrics else _now_iso()
+            previous_h2 = self._second_half_goals(previous) if previous is not None else None
+            current_h2 = self._second_half_goals(event)
+            if not _is_finished(event) and current_h2 is not None and current_h2 > 0 and (
+                previous_h2 is None or current_h2 > previous_h2
+            ) and not state.first_h2_goal_seen:
+                state.first_h2_goal_seen = True
+                state.first_h2_goal_at = observed_at
+                self.logger.info("First second-half goal detected: event=%s", event_id)
+
+            if _is_halftime(event) and self.settings.snapshot_ht_enabled and not state.halftime_detected:
+                state.halftime_detected = True
                 self._enqueue(
                     event_id,
-                    "LIVE_PERIODIC",
-                    "INITIAL_DISCOVERY",
+                    "HALFTIME",
+                    "FIRST_HALF_TO_HALF_TIME",
+                    raw_full=self.settings.raw_at_halftime,
+                    fallback_event=event,
+                )
+                if self.settings.snapshot_ht_stable_enabled:
+                    self._enqueue(
+                        event_id,
+                        "HT_STABLE",
+                        "HALF_TIME_STABLE_DELAY",
+                        delay_seconds=self.settings.snapshot_ht_stable_delay_seconds,
+                        raw_full=self.settings.raw_at_halftime,
+                        fallback_event=event,
+                    )
+
+            minute = _parse_minute(event.display_minute)
+            if _is_second_half(event) and minute is not None:
+                minute_settings = {
+                    60: self.settings.snapshot_60_enabled,
+                    70: self.settings.snapshot_70_enabled,
+                    80: self.settings.snapshot_80_enabled,
+                    85: self.settings.snapshot_85_enabled,
+                    90: self.settings.snapshot_90_enabled,
+                }
+                for target, enabled in minute_settings.items():
+                    if enabled and minute >= target and target not in state.minute_slots_seen:
+                        state.minute_slots_seen.add(target)
+                        self._enqueue(
+                            event_id,
+                            f"MINUTE_{target}",
+                            f"FIRST_MINUTE_{target}_CROSSING",
+                            raw_full=False,
+                            fallback_event=event,
+                        )
+
+            if (
+                state.first_h2_goal_seen
+                and not state.reopen_enqueued
+                and not _is_finished(event)
+                and self.settings.snapshot_first_h2_goal_reopen_enabled
+            ):
+                state.reopen_probe_sequence += 1
+                self._enqueue(
+                    event_id,
+                    "REOPEN_PROBE",
+                    "WAIT_FOR_FIRST_H2_MARKET_REOPEN",
                     raw_full=False,
                     fallback_event=event,
-                )
-            elif (
-                previous.score_home is not None
-                and previous.score_away is not None
-                and event.score_home is not None
-                and event.score_away is not None
-                and (previous.score_home, previous.score_away)
-                != (event.score_home, event.score_away)
-            ):
-                state.goal_sequence += 1
-                self._enqueue(
-                    event_id,
-                    "EVENT_TRIGGERED",
-                    "GOAL",
-                    raw_full=True,
-                    fallback_event=event,
-                    sequence=state.goal_sequence,
+                    sequence=state.reopen_probe_sequence,
+                    goal_at=state.first_h2_goal_at,
                 )
 
-            halftime = _is_halftime(event)
-            if halftime and not state.halftime_detected:
-                state.halftime_detected = True
-                for phase, delay in enumerate(
-                    self.settings.collector_halftime_delays_seconds,
-                    start=1,
-                ):
-                    self._enqueue(
-                        event_id,
-                        "HALFTIME",
-                        f"HT_PHASE_{phase}",
-                        delay_seconds=delay,
-                        raw_full=True,
-                        fallback_event=event,
-                        sequence=phase,
-                    )
-
-            if _is_second_half(event):
-                state.second_half_seen = True
-                minute = _parse_minute(event.display_minute)
-                if minute is not None and event.status.strip().lower() in {"running", "live"}:
-                    for target in self.settings.collector_strategic_minutes:
-                        if minute >= target and target not in state.strategic_minutes_seen:
-                            state.strategic_minutes_seen.add(target)
-                            self._enqueue(
-                                event_id,
-                                "LIVE_PERIODIC",
-                                f"MINUTE_{target}",
-                                raw_full=False,
-                                fallback_event=event,
-                                sequence=target,
-                            )
-                if (
-                    state.core_market_present
-                    and (
-                        state.last_core_enqueued_at is None
-                        or time.monotonic() - state.last_core_enqueued_at
-                        >= max(1, self.settings.collector_core_refresh_seconds)
-                    )
-                ):
-                    state.core_sequence += 1
-                    state.last_core_enqueued_at = time.monotonic()
-                    self._enqueue(
-                        event_id,
-                        "LIVE_PERIODIC",
-                        "CORE_30S",
-                        raw_full=False,
-                        fallback_event=event,
-                        sequence=state.core_sequence,
-                    )
-
-            if _is_finished(event) and not state.final_enqueued:
+            if _is_finished(event) and self.settings.snapshot_final_enabled and not state.final_enqueued:
                 state.final_enqueued = True
                 self._enqueue(
                     event_id,
                     "FINAL",
-                    "FINISHED",
-                    raw_full=True,
+                    "REGULAR_FINISHED_FEED_STATE",
+                    raw_full=False,
                     fallback_event=event,
-                )
-
-        for event_id in set(previous_events) - set(current_events):
-            previous = previous_events[event_id]
-            state = self._event_states.setdefault(event_id, CollectorEventState())
-            if not state.final_enqueued:
-                state.final_enqueued = True
-                self._enqueue(
-                    event_id,
-                    "FINAL",
-                    "EVENT_DISAPPEARED",
-                    raw_full=True,
-                    fallback_event=previous,
                 )
 
         self._observed_events = current_events
         return result
+
+    @staticmethod
+    def _second_half_goals(event: LiveEvent | None) -> int | None:
+        if event is None:
+            return None
+        if (
+            event.score_home is None
+            or event.score_away is None
+            or event.ht_score_home is None
+            or event.ht_score_away is None
+        ):
+            return None
+        return max(
+            0,
+            int(event.score_home + event.score_away - event.ht_score_home - event.ht_score_away),
+        )
 
     def _poll_prematch(self) -> None:
         """Discover future football events and schedule only future targets."""
@@ -451,27 +467,27 @@ class Collector:
                 continue
             if kickoff <= now:
                 continue
-            for minutes_before in (60, 15, 5, 1):
-                due = kickoff - timedelta(minutes=minutes_before)
-                seconds_until_due = (due - now).total_seconds()
-                # A missed target is not reconstructed. A small grace window
-                # handles a poll landing just after the scheduled second.
-                if seconds_until_due < -5:
-                    continue
-                snapshot_type = "PRE_KICKOFF" if minutes_before == 1 else "PREMATCH"
-                self._enqueue(
-                    event.event_id,
-                    snapshot_type,
-                    f"T_MINUS_{minutes_before}",
-                    delay_seconds=max(0.0, seconds_until_due),
-                    raw_full=True,
-                    fallback_event=event,
-                    sequence=minutes_before,
-                )
+            if not self.settings.snapshot_pre_enabled:
+                continue
+            due = kickoff - timedelta(minutes=1)
+            seconds_until_due = (due - now).total_seconds()
+            # A missed target is not reconstructed. A small grace window
+            # handles a poll landing just after the scheduled second.
+            if seconds_until_due < -5:
+                continue
+            self._enqueue(
+                event.event_id,
+                "PRE_KICKOFF",
+                "T_MINUS_1",
+                delay_seconds=max(0.0, seconds_until_due),
+                raw_full=False,
+                fallback_event=event,
+            )
 
     def _fetch_detail(self, job: SnapshotJob) -> DetailFetchResult:
         delays = (0, *self.settings.collector_retry_delays_seconds)
         last_metrics: RequestMetrics | None = None
+        last_payload: dict | None = None
         last_error = "detail request failed"
         api_error = False
         attempt_metrics: list[RequestMetrics] = []
@@ -483,6 +499,7 @@ class Collector:
             try:
                 response: ApiResponse = client.get_event_details(job.event_id)
                 last_metrics = response.metrics
+                last_payload = response.payload
                 attempt_metrics.append(response.metrics)
                 details = parse_event_details(
                     response.payload,
@@ -526,6 +543,7 @@ class Collector:
         return DetailFetchResult(
             job=job,
             success=False,
+            payload=last_payload,
             metrics=last_metrics,
             error=last_error,
             api_error=api_error,
@@ -571,48 +589,42 @@ class Collector:
                 )
             self._persist_result(result)
 
-    def _persist_result(self, result: DetailFetchResult) -> None:
-        job = result.job
-        if result.attempt_metrics:
-            for metrics, kind in zip(result.attempt_metrics, result.attempt_kinds):
-                self.detail_stats.record(
-                    metrics,
-                    error=kind == "api",
-                    parsing_error=kind == "parse",
-                )
-        else:
-            self.detail_stats.record(
-                result.metrics,
-                error=not result.success and result.api_error,
-                parsing_error=not result.success and not result.api_error,
+    def _update_current_state(
+        self,
+        details: EventDetails,
+        observed_at: str,
+    ) -> MarketAnalysis | None:
+        """Write only the replaceable operational view for a detail response."""
+
+        self.market_repository.save_current_details(details, observed_at)
+        try:
+            return self.intelligence_service.analyze(
+                details,
+                observed_at=observed_at,
+                now=datetime.fromisoformat(observed_at.replace("Z", "+00:00")),
+                persist=True,
             )
-        if not result.success or result.details is None or result.payload is None:
-            self._persist_failure(result)
-            return
+        except Exception as exc:
+            self._record_error(f"Current intelligence failed: event={details.event.event_id}: {exc}")
+            return None
 
-        details = result.details
-        observed_at = result.metrics.response_received_at if result.metrics else _now_iso()
-        raw_path: str | None = None
-        if job.raw_full:
-            try:
-                raw_result = self.raw_storage.store(
-                    "events",
-                    job.event_id,
-                    result.payload,
-                    observed_at=observed_at,
-                    halftime=job.snapshot_type == "HALFTIME",
-                )
-                resolved_path = raw_result.path or self.raw_storage.path_for_hash(
-                    "events",
-                    job.event_id,
-                    raw_result.content_hash,
-                    observed_at=observed_at,
-                    halftime=job.snapshot_type == "HALFTIME",
-                )
-                raw_path = str(resolved_path) if resolved_path else None
-            except OSError as exc:
-                self._record_error(f"Could not store raw detail {job.event_id}: {exc}")
+    @staticmethod
+    def _has_relevant_tradeable_market(analysis: MarketAnalysis | None) -> bool:
+        if analysis is None:
+            return False
+        zero = analysis.zero_equivalence.best_odds
+        return bool(zero is not None and zero.selected is not None and zero.selected.is_open)
 
+    def _make_snapshot(
+        self,
+        job: SnapshotJob,
+        details: EventDetails,
+        analysis: MarketAnalysis | None,
+        observed_at: str,
+        *,
+        raw_path: str | None = None,
+        reopen_at: str | None = None,
+    ) -> tuple[Snapshot, dict[str, Any]]:
         second_half_goals, second_half_class = (
             _second_half_label(details.event) if job.snapshot_type == "FINAL" else (None, None)
         )
@@ -635,108 +647,258 @@ class Collector:
             raw_payload_path=raw_path,
             second_half_goals=second_half_goals,
             second_half_goal_class=second_half_class,
+            competition_id=details.event.competition_id,
+            competition_name=details.event.competition_name,
+            competition_country=details.event.competition_country,
+            home_team=details.event.home_team,
+            away_team=details.event.away_team,
+            kickoff_time=details.event.kickoff_time,
+            goal_at=job.goal_at,
+            reopen_at=reopen_at,
+            reopen_delay_seconds=job.reopen_delay_seconds,
         )
-        snapshot_id = self.database.create_snapshot(snapshot)
-        snapshot.snapshot_id = snapshot_id
-        self.market_repository.save_details(
-            details,
-            observed_at,
-            store_odds_history=self.settings.store_odds_history,
-            snapshot_id=snapshot_id,
-        )
-        try:
-            self.intelligence_service.analyze(
-                details,
-                observed_at=observed_at,
-                snapshot_id=snapshot_id,
-                now=datetime.fromisoformat(observed_at.replace("Z", "+00:00")),
-            )
-        except Exception as exc:
-            # Historical collection remains available even if a new V0.3
-            # mapping encounters an unexpected provider shape.
-            self._record_error(
-                f"V0.3 intelligence failed: event={job.event_id}: {exc}"
-            )
-        for market in details.markets:
-            self.database.add_market_presence(
-                event_id=job.event_id,
-                market_id=market.market_id,
-                snapshot_id=snapshot_id,
-                observed_at=observed_at,
-                market_type=market.type,
-                fixed_param=market.fixed_param,
-                market_status=market.status,
-            )
+        payload = build_snapshot_payload(details, analysis, snapshot)
+        snapshot.match_minute = payload.get("match_minute")
+        snapshot.q_zero_best = payload.get("q_zero_best")
+        snapshot.q_zero_source_type = payload.get("q_zero_source_type")
+        snapshot.q_zero_market_id = payload.get("q_zero_market_id")
+        snapshot.q_zero_outcome_id = payload.get("q_zero_outcome_id")
+        snapshot.q_two_plus_best = payload.get("q_two_plus_best")
+        snapshot.q_two_plus_source_type = payload.get("q_two_plus_source_type")
+        snapshot.q_two_plus_market_id = payload.get("q_two_plus_market_id")
+        snapshot.q_two_plus_outcome_id = payload.get("q_two_plus_outcome_id")
+        snapshot.remaining_under_05 = payload.get("remaining_under_05")
+        snapshot.remaining_over_05 = payload.get("remaining_over_05")
+        snapshot.remaining_under_15 = payload.get("remaining_under_15")
+        snapshot.remaining_over_15 = payload.get("remaining_over_15")
+        snapshot.p0_market = payload.get("p0_market")
+        snapshot.p1_market = payload.get("p1_market")
+        snapshot.p2plus_market = payload.get("p2plus_market")
+        snapshot.p1_break_even = payload.get("p1_break_even")
+        snapshot.p1_buffer = payload.get("p1_buffer")
+        snapshot.win_roi = payload.get("win_roi")
+        snapshot.normalizer_version = payload.get("normalizer_version")
+        snapshot.strategy_version = payload.get("strategy_version")
+        snapshot.relevant_markets_json = payload.get("relevant_markets_json")
+        return snapshot, payload
 
+    def _persist_snapshot(
+        self,
+        job: SnapshotJob,
+        details: EventDetails,
+        analysis: MarketAnalysis | None,
+        observed_at: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        raw_path: str | None = None,
+        reopen_at: str | None = None,
+    ) -> bool:
+        snapshot, built_payload = self._make_snapshot(
+            job,
+            details,
+            analysis,
+            observed_at,
+            raw_path=raw_path,
+            reopen_at=reopen_at,
+        )
+        if payload is None:
+            payload = built_payload
+        else:
+            payload.update(built_payload)
+        snapshot_id, created_outbox = self.database.enqueue_historical_snapshot(
+            snapshot,
+            payload,
+        )
+        snapshot.snapshot_id = snapshot_id
+        created = created_outbox
+        if created:
+            self.snapshot_counts[job.snapshot_type] += 1
+        if job.snapshot_type == "FINAL":
+            self._persist_match_result(details.event, observed_at, snapshot)
+        if job.snapshot_type == "HALFTIME" and self.settings.raw_at_halftime:
+            self._write_halftime_report(snapshot, details)
+        return created
+
+    def _persist_match_result(
+        self,
+        event: LiveEvent,
+        finished_at: str,
+        snapshot: Snapshot,
+    ) -> None:
+        if (
+            event.score_home is None
+            or event.score_away is None
+            or event.ht_score_home is None
+            or event.ht_score_away is None
+        ):
+            return
+        if not _is_finished(event):
+            return
+        second_half_goals = snapshot.second_half_goals
+        if second_half_goals is None or second_half_goals < 0:
+            return
+        self.database.upsert_match_result(
+            {
+                "event_id": event.event_id,
+                "competition_id": event.competition_id,
+                "competition_name": event.competition_name,
+                "competition_country": event.competition_country,
+                "home_team": event.home_team,
+                "away_team": event.away_team,
+                "kickoff_at": event.kickoff_time,
+                "ht_home": event.ht_score_home,
+                "ht_away": event.ht_score_away,
+                "ft_home": event.score_home,
+                "ft_away": event.score_away,
+                "first_half_goals": event.ht_score_home + event.ht_score_away,
+                "second_half_goals": second_half_goals,
+                "second_half_goal_class": snapshot.second_half_goal_class,
+                "final_status": event.status,
+                "finished_at": finished_at,
+                "extra_time": None if event.extra_time is None else int(event.extra_time),
+                "penalties": None if event.penalties is None else int(event.penalties),
+            }
+        )
+
+    def _persist_result(self, result: DetailFetchResult) -> None:
+        job = result.job
+        if result.attempt_metrics:
+            for metrics, kind in zip(result.attempt_metrics, result.attempt_kinds):
+                self.detail_stats.record(
+                    metrics,
+                    error=kind == "api",
+                    parsing_error=kind == "parse",
+                )
+        else:
+            self.detail_stats.record(
+                result.metrics,
+                error=not result.success and result.api_error,
+                parsing_error=not result.success and not result.api_error,
+            )
+        observed_at = result.metrics.response_received_at if result.metrics else _now_iso()
+        if not result.success or result.details is None or result.payload is None:
+            if result.payload is not None and not result.api_error:
+                try:
+                    debug_result = self.raw_storage.store(
+                        "debug",
+                        job.event_id,
+                        result.payload,
+                        observed_at=observed_at,
+                    )
+                    if debug_result.changed and debug_result.path:
+                        self.logger.info(
+                            "Stored parser-error raw payload: event=%s path=%s",
+                            job.event_id,
+                            debug_result.path,
+                        )
+                except OSError as exc:
+                    self._record_error(
+                        f"Could not store parser-error raw {job.event_id}: {exc}"
+                    )
+            self._record_error(
+                f"Detail probe failed: event={job.event_id} type={job.snapshot_type} "
+                f"reason={job.trigger_reason}: {result.error or 'unknown error'}"
+            )
+            # A feed-confirmed regular final still yields a useful result row
+            # if the detail endpoint is temporarily unavailable. A vanished
+            # event is intentionally never turned into a false FINAL.
+            if (
+                job.snapshot_type == "FINAL"
+                and job.fallback_event is not None
+                and job.trigger_reason != "EVENT_DISAPPEARED"
+                and _is_finished(job.fallback_event)
+                and job.fallback_event.score_home is not None
+                and job.fallback_event.score_away is not None
+                and job.fallback_event.ht_score_home is not None
+                and job.fallback_event.ht_score_away is not None
+            ):
+                details = EventDetails(
+                    event=job.fallback_event,
+                    markets=[],
+                    categories=[],
+                    raw_data={},
+                )
+                analysis = None
+                self._persist_snapshot(job, details, analysis, observed_at)
+            return
+
+        details = result.details
+        analysis = self._update_current_state(details, observed_at)
         state = self._event_states.setdefault(job.event_id, CollectorEventState())
-        current_availability = {
+        state.latest_details = details
+        state.last_status = details.event.status
+        state.last_outcome_availability = {
             outcome.outcome_id: outcome.is_available
             for market in details.markets
             for outcome in market.outcomes
         }
-        for outcome_id, available in current_availability.items():
-            if state.last_outcome_availability.get(outcome_id) is False and available:
-                state.reopen_count += 1
-                self.reopens_detected += 1
-                self.logger.info(
-                    "Relevant outcome reopened: event=%s outcome=%s observed_at=%s",
-                    job.event_id,
-                    outcome_id,
-                    observed_at,
-                )
-        state.last_outcome_availability = current_availability
-        state.latest_details = details
-        state.core_market_present = any(
-            market.type.casefold() in CORE_MARKET_TYPES
-            or market.type.casefold().startswith("points-more-less")
-            or market.type.casefold().startswith("team-points-more-less")
-            for market in details.markets
-        )
-        self.snapshot_counts[job.snapshot_type] += 1
-        if job.snapshot_type == "HALFTIME":
-            self._write_halftime_report(snapshot, details)
 
-    def _persist_failure(self, result: DetailFetchResult) -> None:
-        job = result.job
-        self._record_error(
-            f"Snapshot failed: event={job.event_id} type={job.snapshot_type} "
-            f"reason={job.trigger_reason}: {result.error or 'unknown error'}"
+        if job.snapshot_type == "REOPEN_PROBE":
+            if (
+                state.first_h2_goal_seen
+                and not state.reopen_enqueued
+                and self._has_relevant_tradeable_market(analysis)
+            ):
+                state.reopen_enqueued = True
+                self.reopens_detected += 1
+                reopen_at = observed_at
+                delay = None
+                if state.first_h2_goal_at:
+                    try:
+                        delay = max(
+                            0.0,
+                            (
+                                datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+                                - datetime.fromisoformat(state.first_h2_goal_at.replace("Z", "+00:00"))
+                            ).total_seconds(),
+                        )
+                    except ValueError:
+                        delay = None
+                self._persist_snapshot(
+                    SnapshotJob(
+                        event_id=job.event_id,
+                        snapshot_type="FIRST_H2_GOAL_REOPEN",
+                        trigger_reason="FIRST_RELEVANT_MARKET_REOPEN",
+                        due_at=job.due_at,
+                        raw_full=False,
+                        fallback_event=job.fallback_event,
+                        goal_at=state.first_h2_goal_at,
+                        reopen_delay_seconds=delay,
+                    ),
+                    details,
+                    analysis,
+                    observed_at,
+                    reopen_at=reopen_at,
+                )
+            return
+
+        raw_path: str | None = None
+        if job.raw_full and result.payload is not None:
+            try:
+                raw_result = self.raw_storage.store(
+                    "events",
+                    job.event_id,
+                    result.payload,
+                    observed_at=observed_at,
+                    halftime=job.snapshot_type in {"HALFTIME", "HT_STABLE"},
+                )
+                resolved_path = raw_result.path or self.raw_storage.path_for_hash(
+                    "events",
+                    job.event_id,
+                    raw_result.content_hash,
+                    observed_at=observed_at,
+                    halftime=job.snapshot_type in {"HALFTIME", "HT_STABLE"},
+                )
+                raw_path = str(resolved_path) if resolved_path else None
+            except OSError as exc:
+                self._record_error(f"Could not store snapshot raw {job.event_id}: {exc}")
+        self._persist_snapshot(
+            job,
+            details,
+            analysis,
+            observed_at,
+            raw_path=raw_path,
         )
-        fallback = job.fallback_event
-        observed_at = result.metrics.response_received_at if result.metrics else _now_iso()
-        if fallback is not None and job.snapshot_type == "FINAL":
-            second_half_goals, second_half_class = _second_half_label(fallback)
-            snapshot = Snapshot(
-                event_id=job.event_id,
-                observed_at=observed_at,
-                snapshot_type="FINAL",
-                trigger_reason=job.trigger_reason,
-                match_status=("NO_LONGER_LIVE" if job.trigger_reason == "EVENT_DISAPPEARED" else fallback.status),
-                display_time=fallback.display_minute,
-                score_home=fallback.score_home,
-                score_away=fallback.score_away,
-                ht_score_home=fallback.ht_score_home,
-                ht_score_away=fallback.ht_score_away,
-                snapshot_quality="FINAL_STATE_ONLY",
-                second_half_goals=second_half_goals,
-                second_half_goal_class=second_half_class,
-            )
-        else:
-            snapshot = Snapshot(
-                event_id=job.event_id,
-                observed_at=observed_at,
-                snapshot_type=job.snapshot_type,
-                trigger_reason=job.trigger_reason,
-                match_status=fallback.status if fallback else None,
-                display_time=fallback.display_minute if fallback else None,
-                score_home=fallback.score_home if fallback else None,
-                score_away=fallback.score_away if fallback else None,
-                ht_score_home=fallback.ht_score_home if fallback else None,
-                ht_score_away=fallback.ht_score_away if fallback else None,
-                snapshot_quality="FAILED",
-            )
-        self.database.create_snapshot(snapshot)
-        self.snapshot_counts[job.snapshot_type] += 1
 
     def _write_halftime_report(self, snapshot: Snapshot, details: EventDetails) -> None:
         date_dir = datetime.fromisoformat(
@@ -792,6 +954,23 @@ class Collector:
         path = directory / f"{details.event.event_id}_{snapshot.snapshot_id}.json"
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    def _export_snapshots_if_due(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if (
+            not force
+            and self._last_archive_export_at is not None
+            and now - self._last_archive_export_at
+            < max(1, self.settings.snapshot_outbox_export_interval_seconds)
+        ):
+            return
+        result = self.archive.export_pending(
+            self.database,
+            batch_size=self.settings.snapshot_outbox_batch_size,
+        )
+        self._last_archive_export_at = now
+        if int(result.get("errors") or 0):
+            self._record_error(f"Parquet export reported {result['errors']} error(s)")
+
     def status(self) -> dict:
         started = self._started_at
         return {
@@ -808,6 +987,13 @@ class Collector:
             "feed": self.feed_stats.summary(),
             "prematch": self.prematch_stats.summary(),
             "detail": self.detail_stats.summary(),
+            "archive": {
+                "path": str(self.archive.snapshot_root),
+                "size_bytes": self.archive.total_size_bytes,
+                "last_export_at": self.archive.last_export_at,
+                "last_error": self.archive.last_error,
+                "pending": self.database.count_rows("snapshot_outbox"),
+            },
             "coverage": self.database.collection_metrics_for_date(),
         }
 
@@ -850,6 +1036,7 @@ class Collector:
                 self._record_error(f"collector feed worker error: {exc}")
         self._collect_finished()
         self._drain_due_jobs()
+        self._export_snapshots_if_due()
         self._write_status()
 
     def run_once(self) -> dict:
@@ -870,6 +1057,7 @@ class Collector:
             while self._futures:
                 self._collect_finished(block=True)
                 self._drain_due_jobs()
+            self._export_snapshots_if_due(force=True)
         finally:
             self._running = False
             self._finished_at = _now_iso()
@@ -912,6 +1100,7 @@ class Collector:
             while self._futures:
                 self._collect_finished(block=True)
                 self._drain_due_jobs()
+            self._export_snapshots_if_due(force=True)
         finally:
             self._running = False
             self._finished_at = _now_iso()

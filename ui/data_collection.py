@@ -9,6 +9,7 @@ import streamlit as st
 
 from config import Settings
 from storage.database import Database
+from storage.parquet_archive import ParquetArchive
 from ui.time_format import format_local_datetime
 
 
@@ -26,6 +27,28 @@ def _score(row: object) -> str:
     return f"{home}:{away}"
 
 
+def _directory_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    for candidate in path.rglob("*"):
+        if candidate.is_file():
+            try:
+                total += candidate.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _size_label(size_bytes: int) -> str:
+    value = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return "0.0 B"
+
+
 def render_data_collection(database: Database, settings: Settings) -> None:
     """Render collector state without making any Tipico request."""
 
@@ -37,6 +60,7 @@ def render_data_collection(database: Database, settings: Settings) -> None:
     feed = status.get("feed", {})
     prematch = status.get("prematch", {})
     detail = status.get("detail", {})
+    archive = ParquetArchive(settings.archive_path)
 
     status_label = status.get("status", "NO_STATUS_FILE")
     if status_label == "RUNNING":
@@ -62,23 +86,27 @@ def render_data_collection(database: Database, settings: Settings) -> None:
     )
 
     columns = st.columns(5)
-    columns[0].metric("Periodic", coverage["periodic_snapshots"])
-    columns[1].metric("Goal Trigger", coverage["goal_triggers"])
-    columns[2].metric("Final", coverage["events_with_final_result"])
-    columns[3].metric("Core-Tracking", coverage["events_with_core_live_tracking"])
-    columns[4].metric(
+    columns[0].metric("HT stabil", coverage["ht_stable_snapshots"])
+    columns[1].metric("Minute 60 / 70", f"{coverage['minute_60_snapshots']} / {coverage['minute_70_snapshots']}")
+    columns[2].metric("Minute 80 / 85 / 90", f"{coverage['minute_80_snapshots']} / {coverage['minute_85_snapshots']} / {coverage['minute_90_snapshots']}")
+    columns[3].metric("HZ2-Reopen", coverage["goal_reopen_snapshots"])
+    columns[4].metric("Final / Results", f"{coverage['final_snapshots']} / {coverage['events_with_final_result']}")
+    columns = st.columns(2)
+    columns[0].metric(
         "API-Fehler",
         int(feed.get("errors", 0))
         + int(prematch.get("errors", 0))
         + int(detail.get("errors", 0)),
     )
+    columns[1].metric("Detail-Fehlerquote", f"{float(detail.get('error_rate', 0)) * 100:.1f}%")
 
     st.subheader("Canonical-Market-Coverage")
-    canonical_columns = st.columns(4)
-    canonical_columns[0].metric("Normalisierte Outcomes", canonical["total"])
+    canonical_columns = st.columns(5)
+    canonical_columns[0].metric("Historische Outcomes", canonical["total"])
     canonical_columns[1].metric("Bekannt", canonical["known"])
     canonical_columns[2].metric("UNKNOWN", canonical["unknown"])
-    canonical_columns[3].metric("Events analysiert", canonical["events"])
+    canonical_columns[3].metric("Historische Events", canonical["events"])
+    canonical_columns[4].metric("Current Outcomes", database.count_rows("current_canonical_outcomes"))
     if canonical["total"]:
         st.caption(
             f"Coverage: {canonical['known'] / canonical['total'] * 100:.1f}% · "
@@ -132,17 +160,46 @@ def render_data_collection(database: Database, settings: Settings) -> None:
         )
     st.dataframe(request_rows, hide_index=True, width="stretch")
 
+    st.subheader("Storage Overview")
+    db_size = database.database_size_bytes
+    parquet_size = archive.total_size_bytes
+    raw_size = _directory_size_bytes(settings.raw_storage_path)
+    today = str(coverage["date"])
+    archive_today = archive.size_for_date(today)
+    raw_today = _directory_size_bytes(settings.raw_storage_path / today)
+    growth_today = archive_today + raw_today
+    mb_today = growth_today / 1024 / 1024
+    estimated_gb_year = mb_today * 365 / 1024
+    storage_columns = st.columns(4)
+    storage_columns[0].metric("SQLite gesamt", _size_label(db_size))
+    storage_columns[1].metric("Parquet gesamt", _size_label(parquet_size))
+    storage_columns[2].metric("Raw-Archiv gesamt", _size_label(raw_size))
+    storage_columns[3].metric("Outbox pending", coverage["outbox_pending"])
+    storage_columns = st.columns(4)
+    storage_columns[0].metric("Snapshots heute", coverage["snapshots_today"])
+    storage_columns[1].metric("Matches heute", coverage["matches_today"])
+    storage_columns[2].metric("Paper Trades heute", coverage["paper_trades_today"])
+    storage_columns[3].metric(
+        "Ø Snapshots / Finished Match",
+        f"{coverage['average_snapshots_per_finished_match']:.2f}",
+        help="Zielwert laut V0.4.2: maximal 10 historische Slots je beendetem Spiel.",
+    )
+    st.caption(
+        f"Archivwachstum heute: {mb_today:.3f} MB · hochgerechnet: "
+        f"{estimated_gb_year:.2f} GB/Jahr · letzte Parquet-Ausgabe: "
+        f"{format_local_datetime(coverage['last_parquet_export'])} · "
+        f"{archive.snapshot_root}"
+    )
+    st.caption(
+        "Refreshes bleiben Current State. Historische Snapshots entstehen ausschließlich "
+        "über die zehn fachlichen Collector-Slots."
+    )
     st.subheader("Persistenz")
-    persistence_columns = st.columns(3)
-    persistence_columns[0].metric("Snapshots gesamt", database.count_rows("snapshots"))
-    persistence_columns[1].metric(
-        "Canonical Outcomes gesamt",
-        database.count_rows("canonical_outcomes"),
-    )
-    persistence_columns[2].metric(
-        "DB-Größe",
-        f"{database.database_size_bytes / 1024:.1f} KB",
-    )
+    persistence_columns = st.columns(4)
+    persistence_columns[0].metric("Historische Snapshots", database.count_rows("snapshots"))
+    persistence_columns[1].metric("Match Results", database.count_rows("match_results"))
+    persistence_columns[2].metric("Paper Trades", database.count_rows("paper_trades"))
+    persistence_columns[3].metric("Current Events", database.count_rows("current_event_state"))
     market_type_rows = database.market_type_counts()
     if market_type_rows:
         with st.expander("Beobachtete Market Types", expanded=False):
@@ -221,8 +278,8 @@ def render_data_collection(database: Database, settings: Settings) -> None:
             ),
         )
         presence = database.market_presence_for_snapshot(selected_snapshot_id)
-        st.caption(f"Markt-Präsenz: {len(presence)} Märkte")
         if presence:
+            st.caption(f"Legacy-Markt-Präsenz: {len(presence)} Märkte")
             st.dataframe(
                 [
                     {
@@ -236,5 +293,20 @@ def render_data_collection(database: Database, settings: Settings) -> None:
                 hide_index=True,
                 width="stretch",
             )
+        else:
+            selected_snapshot = next(
+                (row for row in snapshots if int(row["snapshot_id"]) == selected_snapshot_id),
+                None,
+            )
+            relevant = []
+            if selected_snapshot is not None:
+                try:
+                    parsed = json.loads(selected_snapshot["relevant_markets_json"] or "[]")
+                    relevant = parsed if isinstance(parsed, list) else []
+                except (TypeError, ValueError):
+                    relevant = []
+            st.caption(f"Relevante Märkte im Snapshot: {len(relevant)}")
+            if relevant:
+                st.dataframe(relevant, hide_index=True, width="stretch")
     else:
         st.info("Für dieses Event sind noch keine Snapshots gespeichert.")

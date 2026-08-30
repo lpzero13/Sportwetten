@@ -63,7 +63,7 @@ class MarketService:
         *,
         halftime: bool,
     ) -> str | None:
-        if not self.settings.store_raw_responses:
+        if not self.settings.raw_every_poll:
             return None
         try:
             result = self.raw_storage.store(
@@ -80,6 +80,23 @@ class MarketService:
             self.logger.warning("Could not store event raw payload %s: %s", event_id, exc)
         return None
 
+    def _store_debug_raw(self, event_id: str, payload: dict, observed_at: str) -> None:
+        """Keep parser-failure payloads for short-lived mapping diagnostics."""
+
+        try:
+            self.raw_storage.store(
+                "debug",
+                event_id,
+                payload,
+                observed_at=observed_at,
+            )
+        except OSError as raw_error:
+            self.logger.warning(
+                "Could not store event parser-error payload %s: %s",
+                event_id,
+                raw_error,
+            )
+
     def load_event_details(
         self,
         event_id: str,
@@ -88,6 +105,7 @@ class MarketService:
     ) -> MarketRefreshResult:
         resolved_event_id = str(event_id)
         self.request_count += 1
+        response = None
         try:
             response = self.client.get_event_details(resolved_event_id)
             self.last_metrics = response.metrics
@@ -107,11 +125,10 @@ class MarketService:
                 observed_at,
                 halftime=details.event.period == "HALF_TIME",
             )
-            odds_changes = self.repository.save_details(
-                details,
-                observed_at,
-                store_odds_history=self.settings.store_odds_history,
-            )
+            # The UI owns current state only. Historical rows are created by
+            # the collector's explicit snapshot policy, never by a refresh.
+            self.repository.save_current_details(details, observed_at)
+            odds_changes = 0
         except TipicoApiError as exc:
             self.error_count += 1
             self.last_error = str(exc)
@@ -125,6 +142,12 @@ class MarketService:
         except (TypeError, ValueError, KeyError) as exc:
             self.parse_error_count += 1
             self.last_error = f"Event detail parse error: {exc}"
+            if response is not None:
+                self._store_debug_raw(
+                    resolved_event_id,
+                    response.payload,
+                    response.metrics.response_received_at,
+                )
             self.logger.exception(
                 "Event detail parse error: event=%s",
                 resolved_event_id,

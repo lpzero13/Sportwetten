@@ -97,7 +97,7 @@ class EventService:
         return self.refresh()
 
     def _persist_raw(self, response: ApiResponse, observed_at: str) -> str | None:
-        if not self.settings.store_raw_responses:
+        if not self.settings.raw_every_poll:
             return None
         try:
             result = self.raw_storage.store(
@@ -113,8 +113,22 @@ class EventService:
             self.logger.warning("Could not store live raw payload: %s", exc)
         return None
 
+    def _persist_debug_raw(self, response: ApiResponse, observed_at: str) -> None:
+        """Keep parser-failure payloads for short-lived mapping diagnostics."""
+
+        try:
+            self.raw_storage.store(
+                "debug",
+                "live",
+                response.payload,
+                observed_at=observed_at,
+            )
+        except OSError as exc:
+            self.logger.warning("Could not store live parser-error payload: %s", exc)
+
     def refresh(self) -> EventRefreshResult:
         self.request_count += 1
+        response: ApiResponse | None = None
         try:
             response = self.client.get_live_football_events()
             self.last_metrics = response.metrics
@@ -136,6 +150,11 @@ class EventService:
         except (TypeError, ValueError, KeyError) as exc:
             self.parse_error_count += 1
             self.last_error = f"Live feed parse error: {exc}"
+            if response is not None:
+                self._persist_debug_raw(
+                    response,
+                    response.metrics.response_received_at,
+                )
             self.logger.exception("Live feed parse error")
             return EventRefreshResult(
                 success=False,

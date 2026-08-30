@@ -3,7 +3,7 @@ from .competition import CompetitionMetadata
 from .event import LiveEvent
 from .event_state import EventState
 from .market import EventDetails, Market, Outcome
-from .snapshot import SNAPSHOT_TYPES, Snapshot
+from .snapshot import STANDARD_SNAPSHOT_TYPES, SNAPSHOT_TYPES, Snapshot
 
 __all__ = [
     "CompetitionMetadata",
@@ -13,5 +13,6 @@ __all__ = [
     "Market",
     "Outcome",
     "SNAPSHOT_TYPES",
+    "STANDARD_SNAPSHOT_TYPES",
     "Snapshot",
 ]

@@ -152,6 +152,7 @@ class HalftimeScannerService:
                     observed_at=observed_at,
                     total_stake=total_stake,
                     now=_parse_iso(observed_at),
+                    persist=self.settings.persist_ui_refresh,
                 )
             except (TypeError, ValueError, KeyError) as exc:
                 items.append(

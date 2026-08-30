@@ -9,6 +9,7 @@ User=__SERVICE_USER__
 Group=__SERVICE_GROUP__
 WorkingDirectory=__INSTALL_DIR__
 EnvironmentFile=-/etc/default/tipico-observer
+Environment=WETTEN_ARCHIVE_PATH=/var/lib/wetten/archive
 Environment=PYTHONUNBUFFERED=1
 ExecStart=__INSTALL_DIR__/.venv/bin/python __INSTALL_DIR__/scripts/run_collector.py --root __INSTALL_DIR__ --workers 3
 Restart=always
@@ -18,7 +19,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=__INSTALL_DIR__/data __INSTALL_DIR__/logs
+ReadWritePaths=__INSTALL_DIR__/data __INSTALL_DIR__/logs /var/lib/wetten
 UMask=0027
 
 [Install]

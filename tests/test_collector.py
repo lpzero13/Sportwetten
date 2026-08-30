@@ -61,7 +61,7 @@ class FakeCollectorClient:
         return response("https://tipico.test/upcoming", self.upcoming_payload or {})
 
 
-def test_collector_run_once_persists_snapshot_and_metrics(tmp_path: Path) -> None:
+def test_collector_run_once_updates_current_state_without_history(tmp_path: Path) -> None:
     live = load_fixture("live_feed.json")
     detail = load_fixture("event_detail.json")
     settings = Settings(
@@ -84,17 +84,17 @@ def test_collector_run_once_persists_snapshot_and_metrics(tmp_path: Path) -> Non
 
     assert status["status"] == "COMPLETED"
     assert status["feed"]["requests"] == 1
-    assert status["detail"]["requests"] == 1
-    assert status["snapshot_counts"]["LIVE_PERIODIC"] == 1
-    assert database.count_rows("snapshots") == 1
-    assert database.count_rows("market_presence") == 3
-    history = database.connection.execute("SELECT snapshot_id FROM odds_history").fetchall()
-    assert len(history) == 8
-    assert {row["snapshot_id"] for row in history} == {1}
+    assert status["detail"]["requests"] == 0
+    assert status["snapshot_counts"] == {}
+    assert database.count_rows("snapshots") == 0
+    assert database.count_rows("snapshot_outbox") == 0
+    assert database.count_rows("market_presence") == 0
+    assert database.count_rows("odds_history") == 0
+    assert database.count_rows("current_event_state") == 1
     database.close()
 
 
-def test_collector_enqueues_goal_and_all_halftime_phases(tmp_path: Path) -> None:
+def test_collector_enqueues_goal_and_halftime_slots(tmp_path: Path) -> None:
     live = load_fixture("live_feed.json")
     detail = load_fixture("event_detail.json")
     halftime_live = copy.deepcopy(live)
@@ -108,7 +108,7 @@ def test_collector_enqueues_goal_and_all_halftime_phases(tmp_path: Path) -> None
         root_dir=tmp_path,
         store_raw_responses=False,
         collector_retry_delays_seconds=(),
-        collector_halftime_delays_seconds=(0, 0, 0),
+        snapshot_ht_stable_delay_seconds=0,
     )
     database = Database(settings.database_path)
     client = FakeCollectorClient(live, detail)
@@ -131,17 +131,23 @@ def test_collector_enqueues_goal_and_all_halftime_phases(tmp_path: Path) -> None
         client.live_payload = halftime_live
         client.detail_payload = halftime_detail
         collector._poll_feed()
+        # A second feed refresh while the first reopen probe is still queued
+        # must not fan out additional volatile probe requests.
+        collector._poll_feed()
         queued_types = [job.snapshot_type for _, _, job in collector._queue]
-        assert "EVENT_TRIGGERED" in queued_types
-        assert queued_types.count("HALFTIME") == 3
+        assert "REOPEN_PROBE" in queued_types
+        assert queued_types.count("REOPEN_PROBE") == 1
+        assert queued_types.count("HALFTIME") == 1
+        assert queued_types.count("HT_STABLE") == 1
 
         while collector._queue or collector._futures:
             collector._drain_due_jobs()
             if collector._futures:
                 collector._collect_finished(block=True)
-        assert collector.snapshot_counts["EVENT_TRIGGERED"] == 1
-        assert collector.snapshot_counts["HALFTIME"] == 3
-        assert database.count_rows("snapshots") == 5
+        assert collector.snapshot_counts["FIRST_H2_GOAL_REOPEN"] == 1
+        assert collector.snapshot_counts["HALFTIME"] == 1
+        assert collector.snapshot_counts["HT_STABLE"] == 1
+        assert database.count_rows("snapshots") == 3
     finally:
         collector._running = False
         collector._executor.shutdown(wait=True)
@@ -197,9 +203,7 @@ def test_prematch_scheduler_queues_only_future_targets(tmp_path: Path) -> None:
 
     collector._poll_prematch()
 
-    assert {
-        job.trigger_reason for _, _, job in collector._queue
-    } == {"T_MINUS_60", "T_MINUS_15", "T_MINUS_5", "T_MINUS_1"}
+    assert {job.trigger_reason for _, _, job in collector._queue} == {"T_MINUS_1"}
     assert database.count_rows("events") == 1
     competition = database.connection.execute(
         "SELECT country_or_region FROM competitions WHERE competition_id = '321'"
@@ -211,6 +215,7 @@ def test_prematch_scheduler_queues_only_future_targets(tmp_path: Path) -> None:
 def test_collector_retries_temporary_detail_error(tmp_path: Path) -> None:
     live = load_fixture("live_feed.json")
     detail = load_fixture("event_detail.json")
+    live["LIVE"]["events"]["721621110"]["date"] = "60'"
 
     class FlakyClient(FakeCollectorClient):
         def __init__(self) -> None:
@@ -247,4 +252,5 @@ def test_collector_retries_temporary_detail_error(tmp_path: Path) -> None:
     assert status["detail"]["requests"] == 2
     assert status["detail"]["errors"] == 1
     assert database.count_rows("snapshots") == 1
+    assert database.latest_snapshot_for_event("721621110")["snapshot_type"] == "MINUTE_60"
     database.close()

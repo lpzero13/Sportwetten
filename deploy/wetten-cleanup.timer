@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Sportwetten storage cleanup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+Unit=wetten-cleanup.service
+
+[Install]
+WantedBy=timers.target

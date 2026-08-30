@@ -56,7 +56,10 @@ def main() -> None:
     database = Database(settings.database_path)
     raw_storage = RawStorage(
         settings.raw_storage_path,
-        enabled=settings.store_raw_responses,
+        # Collector writes only explicit HALFTIME/debug slots. Enabling the
+        # sink here does not enable raw-on-every-poll.
+        enabled=True,
+        compression=settings.raw_compression,
     )
     client = TipicoClient(settings, logger=logger)
     collector = Collector(client, database, raw_storage, settings, logger=logger)

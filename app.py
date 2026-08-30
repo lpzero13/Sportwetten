@@ -46,7 +46,11 @@ def get_runtime(root_dir: str) -> tuple[
     database = Database(settings.database_path)
     raw_storage = RawStorage(
         settings.raw_storage_path,
-        enabled=settings.store_raw_responses,
+        # The store is enabled as a sink, but callers decide explicitly when
+        # to write. This keeps parser-error/debug payloads available without
+        # reintroducing per-refresh persistence.
+        enabled=True,
+        compression=settings.raw_compression,
     )
     event_service = EventService(
         client,
@@ -234,6 +238,7 @@ def _load_selected_detail(
             analysis = intelligence_service.analyze(
                 details,
                 observed_at=str(detail_state.get("loaded_at") or datetime.now(timezone.utc).isoformat()),
+                persist=settings.persist_ui_refresh,
             )
             detail_state["analysis"] = analysis
             st.session_state.detail_state = detail_state
