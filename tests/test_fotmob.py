@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from config import Settings
 from fotmob.client import FotMobClient
 from fotmob.matching import MatchIdentity, MatchMatcher
@@ -218,6 +220,22 @@ def test_matcher_protects_reserves_and_reports_ambiguity() -> None:
     assert result.provider_match_id is None
 
 
+def test_resolver_keeps_german_and_austrian_bundesliga_separate(tmp_path: Path) -> None:
+    database = Database(tmp_path / "data" / "tipico.db")
+    settings = Settings(root_dir=tmp_path, fotmob_enabled=True)
+    service = FotMobService(settings, database, client=FakeFotMobClient(None, fail=True))
+
+    german = tipico_event(competition_id="42301")
+    austrian = tipico_event(
+        event_id="tipico-at",
+        competition_id="29301",
+        competition_country="Österreich",
+    )
+    assert service.resolver.mapping_for_event(german) is not None
+    assert service.resolver.mapping_for_event(austrian) is None
+    database.close()
+
+
 class FakeFotMobClient:
     def __init__(self, match: FotMobMatch | None, *, fail: bool = False) -> None:
         self.match = match
@@ -339,6 +357,40 @@ def test_ht_snapshot_is_idempotent_and_archive_is_zstd_parquet(tmp_path: Path) -
     exported = service.export_pending()
     assert exported["snapshots_exported"] == 1
     assert list((tmp_path / "data" / "archive").rglob("*.parquet"))
+    database.close()
+
+
+def test_halftime_snapshot_parquet_keeps_live_provenance(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
+    database = Database(tmp_path / "data" / "tipico.db")
+    settings = Settings(
+        root_dir=tmp_path,
+        fotmob_enabled=True,
+        fotmob_network_mode="worker",
+        fotmob_provider_decision="PRODUCTION_READY",
+        fotmob_automated_usage="ACCEPTABLE_FOR_PROJECT",
+        fotmob_min_request_interval_seconds=0,
+    )
+    service = FotMobService(settings, database, client=FakeFotMobClient(parse_fotmob_payload(sample_payload())))
+    event = tipico_event()
+    assert service.match_tipico_event(event, [parse_fotmob_payload(sample_payload())]).status == "EXACT"
+
+    refreshed = service.refresh_for_tipico_event(event, snapshot_type="HALFTIME")
+    assert refreshed.success is True
+    assert service.export_pending()["snapshots_exported"] == 1
+
+    parquet_files = list((tmp_path / "data" / "archive" / "fotmob" / "snapshots").rglob("*.parquet"))
+    assert len(parquet_files) == 1
+    import pyarrow.parquet as parquet
+
+    rows = parquet.read_table(parquet_files[0]).to_pylist()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["provider"] == "FOTMOB"
+    assert row["stats_period"] == "FIRST_HALF"
+    assert row["source_context"] == "LIVE_HT"
+    assert row["captured_live"] == 1
+    assert row["tipico_event_id"] == event.event_id
     database.close()
 
 

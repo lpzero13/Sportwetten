@@ -143,6 +143,13 @@ class FotMobService:
             logger=self.logger,
         )
         self.archive = FotMobParquetArchive(settings.archive_path, settings.parquet_compression)
+        # Competition mappings are persisted once and then reused by the
+        # halftime resolver.  The import is local to keep the service/model
+        # dependency graph acyclic.
+        from .enrichment import FotMobTipicoResolver
+
+        self.resolver = FotMobTipicoResolver(self)
+        self.resolver.seed_default_competition_links()
         self.last_error: str | None = None
         self.last_result: FotMobRefreshResult | None = None
 
@@ -197,6 +204,10 @@ class FotMobService:
         observed_at: str,
         snapshot_type: str | None = None,
         raw_payload_path: str | None = None,
+        source_context: str | None = None,
+        captured_live: bool = False,
+        stats_period: str | None = None,
+        tipico_event_id: str | None = None,
     ) -> FotMobRefreshResult:
         self.store.upsert_fotmob_match(internal_match_id, match, observed_at=observed_at)
         tipico_result = self._tipico_result(internal_match_id)
@@ -212,6 +223,13 @@ class FotMobService:
             ht_consistency=ht_consistency,
             quality=quality,
             raw_payload_path=raw_payload_path,
+            provider="FOTMOB",
+            stats_period=stats_period or (
+                "FIRST_HALF" if snapshot_type in {"HALFTIME", "HT_STABLE"} else "FULL_MATCH"
+            ),
+            source_context=source_context,
+            captured_live=captured_live,
+            tipico_event_id=tipico_event_id,
         )
         self.store.upsert_quality(
             internal_match_id=internal_match_id,
@@ -248,6 +266,13 @@ class FotMobService:
                 result_consistency=result_consistency,
                 ht_consistency=ht_consistency,
                 raw_payload_path=raw_payload_path,
+                provider="FOTMOB",
+                stats_period=stats_period or (
+                    "FIRST_HALF" if current_type in {"HALFTIME", "HT_STABLE"} else "FULL_MATCH"
+                ),
+                source_context=source_context,
+                captured_live=captured_live,
+                tipico_event_id=tipico_event_id,
             )
             current_id, current_created = self.store.save_snapshot(snapshot)
             snapshot_id = current_id
@@ -470,6 +495,10 @@ class FotMobService:
         internal_match_id: str,
         *,
         snapshot_type: str | None = None,
+        source_context: str | None = "MANUAL_REFRESH",
+        captured_live: bool = False,
+        stats_period: str | None = None,
+        tipico_event_id: str | None = None,
     ) -> FotMobRefreshResult:
         if not self.enabled:
             return FotMobRefreshResult(False, internal_match_id=internal_match_id, error="FotMob ist deaktiviert.")
@@ -499,6 +528,10 @@ class FotMobService:
             fetched.match,
             observed_at=_iso_now(),
             snapshot_type=snapshot_type,
+            source_context=source_context,
+            captured_live=captured_live,
+            stats_period=stats_period,
+            tipico_event_id=tipico_event_id,
         )
 
     def refresh_for_tipico_event(
@@ -523,14 +556,23 @@ class FotMobService:
             observed = _parse_time(str(current["observed_at"])) if current is not None else None
             if observed is not None:
                 age = (datetime.now(timezone.utc) - observed).total_seconds()
-                if 0 <= age < self.settings.fotmob_poll_seconds:
+                has_first_half = bool(current["ht_stats_json"])
+                is_live_ht = bool(current["captured_live"]) and current["source_context"] == "LIVE_HT"
+                if 0 <= age < self.settings.fotmob_poll_seconds and is_live_ht and has_first_half:
                     return FotMobRefreshResult(
                         True,
                         internal_match_id=internal_match_id,
                         result_consistency=current["result_consistency"],
                         ht_consistency=current["ht_consistency"],
                     )
-        return self.refresh_link(internal_match_id, snapshot_type=snapshot_type)
+        return self.refresh_link(
+            internal_match_id,
+            snapshot_type=snapshot_type,
+            source_context="LIVE_HT" if snapshot_type == "HALFTIME" else "LIVE_REFRESH",
+            captured_live=snapshot_type == "HALFTIME",
+            stats_period="FIRST_HALF" if snapshot_type == "HALFTIME" else None,
+            tipico_event_id=str(event.event_id),
+        )
 
     def current_for_tipico_event(self, event: Any) -> Any:
         row = self.store.match_row_for_tipico_event(str(event.event_id))

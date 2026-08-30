@@ -616,7 +616,12 @@ CREATE TABLE IF NOT EXISTS fotmob_match_index (
     raw_payload_path TEXT,
     payload_hash TEXT,
     second_half_goals INTEGER,
-    second_half_goal_class TEXT
+    second_half_goal_class TEXT,
+    source_type TEXT NOT NULL DEFAULT 'FRESH_INDEX',
+    source_context TEXT,
+    stats_period TEXT,
+    captured_live INTEGER NOT NULL DEFAULT 0,
+    field_provenance_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_fotmob_match_index_season
@@ -644,8 +649,48 @@ CREATE TABLE IF NOT EXISTS fotmob_historical_archive_index (
     archive_path TEXT NOT NULL,
     payload_hash TEXT,
     written_at TEXT NOT NULL,
+    source_type TEXT NOT NULL DEFAULT 'FRESH_FETCH',
+    source_priority INTEGER NOT NULL DEFAULT 30,
+    source_context TEXT,
+    stats_period TEXT,
+    captured_live INTEGER NOT NULL DEFAULT 0,
+    field_provenance_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (provider, fotmob_match_id, schema_version)
 );
+
+CREATE TABLE IF NOT EXISTS competition_provider_links (
+    internal_competition_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_competition_id TEXT NOT NULL,
+    tipico_competition_name TEXT NOT NULL,
+    tipico_country TEXT,
+    provider_competition_name TEXT,
+    provider_country TEXT,
+    confidence REAL NOT NULL DEFAULT 1,
+    match_status TEXT NOT NULL DEFAULT 'MANUALLY_CONFIRMED',
+    source TEXT,
+    created_at TEXT NOT NULL,
+    verified_at TEXT,
+    PRIMARY KEY (internal_competition_id, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_competition_provider_links_lookup
+    ON competition_provider_links(provider, provider_competition_id, tipico_country);
+
+CREATE TABLE IF NOT EXISTS fotmob_fixture_index_runs (
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    run_date TEXT NOT NULL,
+    league_id TEXT NOT NULL,
+    season_id TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    fixture_count INTEGER NOT NULL DEFAULT 0,
+    payload_hash TEXT,
+    source_context TEXT NOT NULL DEFAULT 'DAILY_INDEX',
+    PRIMARY KEY (provider, run_date, league_id, season_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_fixture_index_runs_lookup
+    ON fotmob_fixture_index_runs(provider, league_id, fetched_at DESC);
 """
 
 
@@ -2881,6 +2926,7 @@ class Database:
             "teams",
             "team_provider_aliases",
             "competition_provider_aliases",
+            "competition_provider_links",
             "fotmob_current_state",
             "fotmob_snapshots",
             "fotmob_snapshot_outbox",
@@ -2889,6 +2935,7 @@ class Database:
             "fotmob_match_index",
             "fotmob_history_samples",
             "fotmob_historical_archive_index",
+            "fotmob_fixture_index_runs",
         }
         if table not in allowed:
             raise ValueError(f"Unsupported table: {table}")

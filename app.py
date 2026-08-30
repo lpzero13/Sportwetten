@@ -231,11 +231,11 @@ def _load_selected_detail(
 
     if opening_intent == "quotes":
         quotes_tab, analysis_tab, fotmob_tab, history_tab, raw_tab = st.tabs(
-            ["Alle Tipico Märkte", "Analyse", "FotMob", "Odds History", "Raw / Debug"]
+            ["Alle Tipico Märkte", "Analyse", "FotMob HT", "Odds History", "Debug"]
         )
     else:
         analysis_tab, fotmob_tab, quotes_tab, history_tab, raw_tab = st.tabs(
-            ["Analyse", "FotMob", "Alle Tipico Märkte", "Odds History", "Raw / Debug"]
+            ["Analyse", "FotMob HT", "Alle Tipico Märkte", "Odds History", "Debug"]
         )
 
     with analysis_tab:

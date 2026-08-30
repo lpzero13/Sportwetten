@@ -152,21 +152,22 @@ Die Seite **Data Collection** liest ausschließlich Current State, SQLite,
 Parquet-Metadaten und `data/collector_status.json`; sie startet keinen Collector
 und entscheidet nicht über die Datensammlung.
 
-### Optionales FotMob-Enrichment (V0.5.1 abgeschlossen)
+### Optionales FotMob-Enrichment (V0.5.3)
 
-FotMob ist vollständig vom Tipico-Collector getrennt und standardmäßig
-deaktiviert. Der FotMob-Tab zeigt nach einer bestätigten Verknüpfung nur
-Matchstatus und Fußballstatistiken. FotMob-Werte werden weder für das
-Tipico-Market-Ranking noch für Paper-Trades oder Settlement verwendet.
+FotMob ist ein optionales Enrichment und standardmäßig deaktiviert. Der
+Tipico-Collector kann bei einer bestätigten Liga-/Team-/Kickoff-Verknüpfung
+Pre-Match nur den kleinen Match-Index nutzen und beim ersten Tipico-HZ-Signal
+genau einen öffentlichen `/match/{id}`-Abruf auslösen. Der FotMob-Tab zeigt
+die FirstHalf-Werte daneben. FotMob-Werte werden weder für das Tipico-
+Market-Ranking noch für Paper-Trades oder Settlement verwendet.
 
-Die V0.5.1-Entscheidung lautet `FOTMOB_PROVIDER_DECISION=LIMITED_USE` bei
-`AUTOMATED_USAGE=UNCLEAR`. Die öffentliche Browser-Discovery, historische
-Coverage und Begründung stehen in `outputs/FOTMOB_FINAL_VALIDATION.md`,
-`outputs/FOTMOB_HISTORICAL_COVERAGE.md` und
-`outputs/FOTMOB_PROVIDER_DECISION.md`. Standardmäßig bleibt FotMob aus. Für
-ein einzelnes ausdrücklich gewünschtes Match gibt es
-`scripts/discover_fotmob.py`; der periodische Worker verweigert sich bei der
-aktuellen Provider-Entscheidung automatisch:
+Die Providerentscheidung bleibt `LIMITED_USE` bei `AUTOMATED_USAGE=UNCLEAR`.
+Standardmäßig bleibt FotMob aus. Eine automatisierte HZ-Anreicherung benötigt
+zusätzlich `FOTMOB_NETWORK_MODE=worker`,
+`FOTMOB_PROVIDER_DECISION=PRODUCTION_READY` und
+`FOTMOB_AUTOMATED_USAGE=ACCEPTABLE_FOR_PROJECT`. Ohne diese Freigabe läuft
+der Tipico-Collector unverändert weiter. Für ein einzelnes ausdrücklich
+gewünschtes Match gibt es `scripts/discover_fotmob.py`:
 
 ~~~powershell
 $env:FOTMOB_ENABLED="true"
@@ -175,10 +176,20 @@ python scripts/discover_fotmob.py --root . --match-id 5881143
 python scripts/run_fotmob.py --root . --once
 ~~~
 
+Für einen bewusst freigegebenen Collector-HZ-Lauf:
+
+~~~powershell
+$env:FOTMOB_ENABLED="true"
+$env:FOTMOB_NETWORK_MODE="worker"
+$env:FOTMOB_PROVIDER_DECISION="PRODUCTION_READY"
+$env:FOTMOB_AUTOMATED_USAGE="ACCEPTABLE_FOR_PROJECT"
+python scripts/run_collector.py --root .
+~~~
+
 Für Proxmox ist `wetten-fotmob.service` vorhanden, wird vom Installationsskript
-nicht aktiviert und bleibt bei `LIMITED_USE`/`UNCLEAR` ohne periodische
-Requests. Eine Freigabe für produktive Automation wäre eine neue, ausdrücklich
-zulässige Provider-Entscheidung; sie ist in V0.5.1 nicht gesetzt.
+nicht aktiviert. Bei `LIMITED_USE`/`UNCLEAR` bleiben automatische FotMob-
+Requests blockiert; die HZ-Anreicherung wird nur mit der oben beschriebenen
+expliziten Worker-Freigabe aktiv.
 
 ### FotMob Historical Foundation (V0.5.2)
 
@@ -223,6 +234,32 @@ nicht aus Fixtures simuliert; der aktuelle manuelle Real-Lauf ist in
 verlangt weiterhin `FOTMOB_NETWORK_MODE=worker` sowie
 `FOTMOB_PROVIDER_DECISION=PRODUCTION_READY` und
 `FOTMOB_AUTOMATED_USAGE=ACCEPTABLE_FOR_PROJECT`.
+
+### Historische Konsolidierung und HZ-Enrichment (V0.5.3)
+
+V0.5.3 importiert die alte `sniper_football.db` ausschließlich read-only,
+legt vor der Prüfung eine Kopie an und führt die Legacy-Zeilen über denselben
+normalisierten `/match/{id}`-Parser. `LEGACY_IMPORT` und `FRESH_FETCH` werden
+über FotMob-Match-ID und Source-Priorität dedupliziert; frische Detaildaten
+ersetzen Legacy-Zeilen. Alte 60-Minuten-Werte bleiben als `m60_*` separat und
+werden niemals als FirstHalf verwendet. Die Halbzeit-Features kommen nur aus
+`content.stats.Periods.FirstHalf` und tragen `stats_period=FIRST_HALF`,
+`source_context=LIVE_HT` sowie `captured_live=true`.
+
+Die vollständige Prüfung kann isoliert und reproduzierbar erneut ausgeführt
+werden:
+
+~~~powershell
+python scripts/run_v053_validation.py --root work/v053-validation --tipico-db data/tipico.db --output-dir outputs
+~~~
+
+Die Reports sind `outputs/LEGACY_FOTMOB_DATA_REPORT.md`,
+`outputs/LEGACY_FOTMOB_SAMPLE.md`, `outputs/LEGACY_IMPORT_REPORT.md`,
+`outputs/FOTMOB_TIPICO_MATCHING_REPORT.md`,
+`outputs/FOTMOB_HT_ENRICHMENT_REPORT.md` und `outputs/V053_STATUS.md`.
+Der Status bleibt `PARTIAL`, solange die bereitgestellte Tipico-Historie
+weniger als die geforderten 20 echten deutschen Bundesliga-Events enthält;
+fehlende Events werden nicht künstlich erzeugt.
 
 ### Paper Trading
 

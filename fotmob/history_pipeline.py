@@ -131,6 +131,15 @@ def _row_to_index(row: Any) -> FotMobMatchIndexRecord:
         country=row["country"],
         first_seen_at=row["first_seen_at"],
         provider=str(row["provider"]),
+        source_type=str(row["source_type"] or "FRESH_INDEX"),
+        source_context=row["source_context"],
+        stats_period=row["stats_period"],
+        captured_live=bool(row["captured_live"]),
+        field_provenance=(
+            json.loads(str(row["field_provenance_json"]))
+            if row["field_provenance_json"]
+            else {}
+        ),
     )
 
 
@@ -277,6 +286,13 @@ class FotMobHistoryPipeline:
             )
         )
         counts = self.store.upsert_match_index(records)
+        self.store.record_fixture_index_run(
+            str(league_id),
+            season.season_id,
+            fixture_count=len(records),
+            payload_hash=_payload_hash(payload),
+            source_context="DAILY_INDEX",
+        )
         return MatchIndexResult(
             True,
             str(league_id),
@@ -341,6 +357,10 @@ class FotMobHistoryPipeline:
             fetched.match,
             fetched_at=_now(),
             raw_payload_path=raw_path,
+            source_type="FRESH_FETCH",
+            source_context="HISTORY_DETAIL",
+            stats_period="FULL_MATCH",
+            captured_live=False,
         )
         normalized["payload_hash"] = payload_hash
         return normalized
@@ -400,6 +420,11 @@ class FotMobHistoryPipeline:
                     second_half_goals=normalized.get("second_half_goals"),
                     second_half_goal_class=normalized.get("second_half_goal_class"),
                     worker_id=worker_id,
+                    source_type=str(normalized.get("source_type", "FRESH_FETCH")),
+                    source_context=normalized.get("source_context"),
+                    stats_period=normalized.get("stats_period"),
+                    captured_live=bool(normalized.get("captured_live")),
+                    field_provenance=normalized.get("field_provenance_json"),
                 )
                 if status == "FETCHED":
                     fetched_count += 1

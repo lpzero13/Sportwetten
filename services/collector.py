@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean, median
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from config import Settings
 from intelligence.models import MarketAnalysis
@@ -34,6 +34,9 @@ from storage.repositories import MarketRepository
 from tipico.client import ApiResponse, RequestMetrics, TipicoApiError, TipicoClient
 from tipico.parser import parse_event_details, parse_upcoming_feed
 from services.event_service import EventService, EventRefreshResult
+
+if TYPE_CHECKING:  # pragma: no cover - import only for type checkers
+    from fotmob.service import FotMobService
 
 
 CORE_MARKET_TYPES = {
@@ -189,6 +192,7 @@ class RequestStats:
 @dataclass(slots=True)
 class CollectorEventState:
     halftime_detected: bool = False
+    fotmob_halftime_detected: bool = False
     first_h2_goal_seen: bool = False
     first_h2_goal_at: str | None = None
     reopen_enqueued: bool = False
@@ -214,6 +218,7 @@ class Collector:
         event_service: EventService | None = None,
         market_repository: MarketRepository | None = None,
         client_factory: Callable[[], TipicoClient] | None = None,
+        fotmob_service: "FotMobService | None" = None,
     ) -> None:
         self.client = client
         self.database = database
@@ -241,6 +246,9 @@ class Collector:
         self.client_factory = client_factory or (
             lambda: TipicoClient(settings, logger=self.logger)
         )
+        # Optional enrichment is injected so Tipico collection remains fully
+        # usable when FotMob is disabled, unavailable or policy-blocked.
+        self.fotmob_service = fotmob_service
 
         self.feed_stats = RequestStats()
         self.prematch_stats = RequestStats()
@@ -360,6 +368,10 @@ class Collector:
                         fallback_event=event,
                     )
 
+            if _is_halftime(event) and not state.fotmob_halftime_detected:
+                state.fotmob_halftime_detected = True
+                self._enrich_fotmob_halftime(event)
+
             minute = _parse_minute(event.display_minute)
             if _is_second_half(event) and minute is not None:
                 minute_settings = {
@@ -410,6 +422,54 @@ class Collector:
         self._observed_events = current_events
         return result
 
+    def _enrich_fotmob_halftime(self, event: LiveEvent) -> None:
+        """Fetch one confirmed FotMob FirstHalf detail at the Tipico HZ edge."""
+
+        service = self.fotmob_service
+        if service is None or not getattr(service, "automated_worker_allowed", False):
+            return
+        try:
+            resolved = self._resolve_fotmob_link(event)
+            if resolved is None:
+                return
+            status = getattr(getattr(resolved, "match_result", None), "status", "UNMATCHED")
+            if status not in {"EXACT", "HIGH_CONFIDENCE", "MANUALLY_CONFIRMED"}:
+                self.logger.info(
+                    "FotMob HZ enrichment unavailable: event=%s status=%s",
+                    event.event_id,
+                    status,
+                )
+                return
+            result = service.refresh_for_tipico_event(event, snapshot_type="HALFTIME")
+            if not getattr(result, "success", False):
+                self.logger.warning(
+                    "FotMob HZ enrichment failed: event=%s reason=%s",
+                    event.event_id,
+                    getattr(result, "error", None) or "unknown error",
+                )
+        except Exception as exc:  # enrichment must never stop Tipico polling
+            self.logger.warning(
+                "FotMob HZ enrichment error: event=%s reason=%s",
+                event.event_id,
+                exc,
+            )
+
+    def _resolve_fotmob_link(self, event: LiveEvent) -> Any | None:
+        """Resolve an index-only provider link without making a detail request."""
+
+        service = self.fotmob_service
+        if service is None or not getattr(service, "automated_worker_allowed", False):
+            return None
+        try:
+            return service.resolver.resolve(event)
+        except Exception as exc:  # optional enrichment must never stop polling
+            self.logger.warning(
+                "FotMob provider-link resolution failed: event=%s reason=%s",
+                event.event_id,
+                exc,
+            )
+            return None
+
     @staticmethod
     def _second_half_goals(event: LiveEvent | None) -> int | None:
         if event is None:
@@ -455,6 +515,7 @@ class Collector:
             # Keep the pre-match event/competition metadata available even
             # before the first detail snapshot is due.
             self.event_service.repository.save_observation(event, observed_at)
+            self._resolve_fotmob_link(event)
             if not event.kickoff_time or event.status.strip().lower() not in {
                 "pre_match",
                 "prematch",
@@ -970,6 +1031,16 @@ class Collector:
         self._last_archive_export_at = now
         if int(result.get("errors") or 0):
             self._record_error(f"Parquet export reported {result['errors']} error(s)")
+        service = self.fotmob_service
+        if service is not None and getattr(service, "automated_worker_allowed", False):
+            try:
+                fotmob_result = service.export_pending()
+                if int(fotmob_result.get("errors") or 0):
+                    self._record_error(
+                        f"FotMob Parquet export reported {fotmob_result['errors']} error(s)"
+                    )
+            except Exception as exc:  # optional sink must not stop collection
+                self._record_error(f"FotMob Parquet export failed: {exc}")
 
     def status(self) -> dict:
         started = self._started_at

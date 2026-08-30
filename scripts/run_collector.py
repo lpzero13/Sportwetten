@@ -12,6 +12,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import Settings, configure_logging
+from fotmob.service import FotMobService
 from services.collector import Collector
 from storage.database import Database
 from storage.raw_storage import RawStorage
@@ -62,7 +63,15 @@ def main() -> None:
         compression=settings.raw_compression,
     )
     client = TipicoClient(settings, logger=logger)
-    collector = Collector(client, database, raw_storage, settings, logger=logger)
+    fotmob_service = FotMobService(settings, database, logger=logger)
+    collector = Collector(
+        client,
+        database,
+        raw_storage,
+        settings,
+        logger=logger,
+        fotmob_service=fotmob_service,
+    )
     try:
         status = (
             collector.run_once()

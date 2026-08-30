@@ -16,6 +16,7 @@ from .history_models import (
     FOTMOB_DETAIL_STATUSES,
     FOTMOB_HISTORICAL_PARSER_VERSION,
     FOTMOB_HISTORICAL_SCHEMA_VERSION,
+    FOTMOB_SOURCE_PRIORITY,
     FotMobMatchIndexRecord,
     FotMobSeasonRef,
 )
@@ -67,7 +68,12 @@ CREATE TABLE IF NOT EXISTS fotmob_match_index (
     raw_payload_path TEXT,
     payload_hash TEXT,
     second_half_goals INTEGER,
-    second_half_goal_class TEXT
+    second_half_goal_class TEXT,
+    source_type TEXT NOT NULL DEFAULT 'FRESH_INDEX',
+    source_context TEXT,
+    stats_period TEXT,
+    captured_live INTEGER NOT NULL DEFAULT 0,
+    field_provenance_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_fotmob_match_index_season
@@ -95,8 +101,29 @@ CREATE TABLE IF NOT EXISTS fotmob_historical_archive_index (
     archive_path TEXT NOT NULL,
     payload_hash TEXT,
     written_at TEXT NOT NULL,
+    source_type TEXT NOT NULL DEFAULT 'FRESH_FETCH',
+    source_priority INTEGER NOT NULL DEFAULT 30,
+    source_context TEXT,
+    stats_period TEXT,
+    captured_live INTEGER NOT NULL DEFAULT 0,
+    field_provenance_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (provider, fotmob_match_id, schema_version)
 );
+
+CREATE TABLE IF NOT EXISTS fotmob_fixture_index_runs (
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    run_date TEXT NOT NULL,
+    league_id TEXT NOT NULL,
+    season_id TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    fixture_count INTEGER NOT NULL DEFAULT 0,
+    payload_hash TEXT,
+    source_context TEXT NOT NULL DEFAULT 'DAILY_INDEX',
+    PRIMARY KEY (provider, run_date, league_id, season_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_fixture_index_runs_lookup
+    ON fotmob_fixture_index_runs(provider, league_id, fetched_at DESC);
 """
 
 
@@ -132,6 +159,34 @@ class FotMobHistoryStore:
         self._lock = getattr(database, "_lock", threading.RLock())
         with self._lock, database.connection:
             database.connection.executescript(HISTORY_SCHEMA)
+            # V0.5.2 databases already exist in the field.  Keep the migration
+            # additive and do not rebuild or delete the historical catalog.
+            for table, columns in {
+                "fotmob_match_index": {
+                    "source_type": "TEXT NOT NULL DEFAULT 'FRESH_INDEX'",
+                    "source_context": "TEXT",
+                    "stats_period": "TEXT",
+                    "captured_live": "INTEGER NOT NULL DEFAULT 0",
+                    "field_provenance_json": "TEXT NOT NULL DEFAULT '{}'",
+                },
+                "fotmob_historical_archive_index": {
+                    "source_type": "TEXT NOT NULL DEFAULT 'FRESH_FETCH'",
+                    "source_priority": "INTEGER NOT NULL DEFAULT 30",
+                    "source_context": "TEXT",
+                    "stats_period": "TEXT",
+                    "captured_live": "INTEGER NOT NULL DEFAULT 0",
+                    "field_provenance_json": "TEXT NOT NULL DEFAULT '{}'",
+                },
+            }.items():
+                existing_columns = {
+                    str(row["name"])
+                    for row in database.connection.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for column, definition in columns.items():
+                    if column not in existing_columns:
+                        database.connection.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                        )
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -210,14 +265,19 @@ class FotMobHistoryStore:
                     (record.provider_match_id,),
                 ).fetchone()
                 seen_at = record.first_seen_at or _now()
+                source_type = str(record.source_type or "FRESH_INDEX").upper()
+                if source_type not in FOTMOB_SOURCE_PRIORITY:
+                    source_type = "FRESH_INDEX"
+                provenance_json = _json(record.field_provenance or {})
                 self.connection.execute(
                     """
                     INSERT INTO fotmob_match_index (
                         fotmob_match_id, provider, league_id, season_id, season_label,
                         league_name, country, kickoff_at, home_team_id, home_team_name,
                         away_team_id, away_team_name, round, match_status,
-                        first_seen_at, last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        first_seen_at, last_seen_at, source_type, source_context,
+                        stats_period, captured_live, field_provenance_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(fotmob_match_id) DO UPDATE SET
                         provider = excluded.provider,
                         league_id = excluded.league_id,
@@ -232,7 +292,18 @@ class FotMobHistoryStore:
                         away_team_name = excluded.away_team_name,
                         round = COALESCE(excluded.round, fotmob_match_index.round),
                         match_status = COALESCE(excluded.match_status, fotmob_match_index.match_status),
-                        last_seen_at = excluded.last_seen_at
+                        last_seen_at = excluded.last_seen_at,
+                        source_type = CASE
+                            WHEN excluded.source_type != 'FRESH_INDEX' THEN excluded.source_type
+                            ELSE fotmob_match_index.source_type
+                        END,
+                        source_context = COALESCE(excluded.source_context, fotmob_match_index.source_context),
+                        stats_period = COALESCE(excluded.stats_period, fotmob_match_index.stats_period),
+                        captured_live = MAX(fotmob_match_index.captured_live, excluded.captured_live),
+                        field_provenance_json = CASE
+                            WHEN excluded.field_provenance_json != '{}' THEN excluded.field_provenance_json
+                            ELSE fotmob_match_index.field_provenance_json
+                        END
                     """,
                     (
                         record.provider_match_id,
@@ -251,6 +322,11 @@ class FotMobHistoryStore:
                         record.match_status,
                         seen_at,
                         seen_at,
+                        source_type,
+                        record.source_context,
+                        record.stats_period,
+                        int(bool(record.captured_live)),
+                        provenance_json,
                     ),
                 )
                 if existing is None:
@@ -263,6 +339,39 @@ class FotMobHistoryStore:
             "inserted": inserted,
             "updated": updated,
         }
+
+    def record_fixture_index_run(
+        self,
+        league_id: str,
+        season_id: str,
+        *,
+        fixture_count: int,
+        payload_hash: str | None = None,
+        run_date: str | None = None,
+        fetched_at: str | None = None,
+        source_context: str = "DAILY_INDEX",
+        provider: str = "FOTMOB",
+    ) -> None:
+        fetched = fetched_at or _now()
+        day = str(run_date or fetched[:10])
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO fotmob_fixture_index_runs (
+                    provider, run_date, league_id, season_id, fetched_at,
+                    fixture_count, payload_hash, source_context
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, run_date, league_id, season_id) DO UPDATE SET
+                    fetched_at = excluded.fetched_at,
+                    fixture_count = excluded.fixture_count,
+                    payload_hash = excluded.payload_hash,
+                    source_context = excluded.source_context
+                """,
+                (
+                    provider.upper(), day, str(league_id), str(season_id), fetched,
+                    max(0, int(fixture_count)), payload_hash, source_context,
+                ),
+            )
 
     def match_index(
         self,
@@ -292,6 +401,52 @@ class FotMobHistoryStore:
         """
         with self._lock:
             return list(self.connection.execute(query, params).fetchall())
+
+    def match_index_for_league(
+        self,
+        league_id: str,
+        *,
+        provider: str = "FOTMOB",
+    ) -> list[sqlite3.Row]:
+        """Return all indexed seasons for resolver-side fixture lookup."""
+
+        with self._lock:
+            return list(self.connection.execute(
+                """
+                SELECT * FROM fotmob_match_index
+                WHERE provider = ? AND league_id = ?
+                ORDER BY CASE WHEN kickoff_at IS NULL THEN 1 ELSE 0 END,
+                         kickoff_at, fotmob_match_id
+                """,
+                (provider.upper(), str(league_id)),
+            ).fetchall())
+
+    def missing_archive_ids(
+        self,
+        league_id: str,
+        *,
+        schema_version: str = FOTMOB_HISTORICAL_SCHEMA_VERSION,
+        provider: str = "FOTMOB",
+    ) -> list[str]:
+        """Return indexed fixtures whose detail row is not archived yet."""
+
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT i.fotmob_match_id
+                FROM fotmob_match_index i
+                LEFT JOIN fotmob_historical_archive_index a
+                    ON a.provider = i.provider
+                   AND a.fotmob_match_id = i.fotmob_match_id
+                   AND a.schema_version = ?
+                WHERE i.provider = ? AND i.league_id = ?
+                  AND a.fotmob_match_id IS NULL
+                ORDER BY CASE WHEN i.kickoff_at IS NULL THEN 1 ELSE 0 END,
+                         i.kickoff_at, i.fotmob_match_id
+                """,
+                (schema_version, provider.upper(), str(league_id)),
+            ).fetchall()
+        return [str(row["fotmob_match_id"]) for row in rows]
 
     def set_sample(self, league_id: str, season_id: str, match_ids: Iterable[str], provider: str = "FOTMOB") -> None:
         ids = [str(value) for value in match_ids]
@@ -424,8 +579,16 @@ class FotMobHistoryStore:
         second_half_goals: int | None = None,
         second_half_goal_class: str | None = None,
         worker_id: str | None = None,
+        source_type: str = "FRESH_FETCH",
+        source_context: str | None = "HISTORY_DETAIL",
+        stats_period: str | None = "FULL_MATCH",
+        captured_live: bool = False,
+        field_provenance: Mapping[str, Any] | None = None,
     ) -> str:
         detail_status = "FETCHED" if data_quality == "COMPLETE" else "PARTIAL"
+        normalized_source = str(source_type or "FRESH_FETCH").upper()
+        if normalized_source not in FOTMOB_SOURCE_PRIORITY:
+            normalized_source = "FRESH_FETCH"
         with self._lock, self.connection:
             self.connection.execute(
                 """
@@ -433,14 +596,18 @@ class FotMobHistoryStore:
                 SET detail_status = ?, last_checked_at = ?, last_error = NULL,
                     worker_id = NULL, data_quality = ?, ml_eligible = ?,
                     parser_version = ?, schema_version = ?, raw_payload_path = ?,
-                    payload_hash = ?, second_half_goals = ?, second_half_goal_class = ?
+                    payload_hash = ?, second_half_goals = ?, second_half_goal_class = ?,
+                    source_type = ?, source_context = ?, stats_period = ?,
+                    captured_live = ?, field_provenance_json = ?
                 WHERE fotmob_match_id = ?
                   AND (? IS NULL OR worker_id = ?)
                 """,
                 (
                     detail_status, _now(), data_quality, int(ml_eligible), parser_version,
                     schema_version, raw_payload_path, payload_hash, second_half_goals,
-                    second_half_goal_class, str(provider_match_id), worker_id, worker_id,
+                    second_half_goal_class, normalized_source, source_context, stats_period,
+                    int(bool(captured_live)), _json(field_provenance or {}),
+                    str(provider_match_id), worker_id, worker_id,
                 ),
             )
         return detail_status
@@ -540,14 +707,23 @@ class FotMobHistoryStore:
         schema_version: str = FOTMOB_HISTORICAL_SCHEMA_VERSION,
         provider: str = "FOTMOB",
     ) -> bool:
+        return self.archive_entry(provider_match_id, schema_version, provider=provider) is not None
+
+    def archive_entry(
+        self,
+        provider_match_id: str,
+        schema_version: str = FOTMOB_HISTORICAL_SCHEMA_VERSION,
+        *,
+        provider: str = "FOTMOB",
+    ) -> sqlite3.Row | None:
         with self._lock:
             return self.connection.execute(
                 """
-                SELECT 1 FROM fotmob_historical_archive_index
+                SELECT * FROM fotmob_historical_archive_index
                 WHERE provider = ? AND fotmob_match_id = ? AND schema_version = ?
                 """,
                 (provider.upper(), str(provider_match_id), schema_version),
-            ).fetchone() is not None
+            ).fetchone()
 
     def mark_archive_written(
         self,
@@ -558,25 +734,102 @@ class FotMobHistoryStore:
         schema_version: str = FOTMOB_HISTORICAL_SCHEMA_VERSION,
         parser_version: str = FOTMOB_HISTORICAL_PARSER_VERSION,
         provider: str = "FOTMOB",
+        source_type: str = "FRESH_FETCH",
+        source_priority: int | None = None,
+        source_context: str | None = None,
+        stats_period: str | None = None,
+        captured_live: bool = False,
+        field_provenance: Mapping[str, Any] | None = None,
     ) -> None:
+        normalized_source = str(source_type or "FRESH_FETCH").upper()
+        if normalized_source not in FOTMOB_SOURCE_PRIORITY:
+            normalized_source = "FRESH_FETCH"
+        priority = (
+            int(source_priority)
+            if source_priority is not None
+            else FOTMOB_SOURCE_PRIORITY[normalized_source]
+        )
         with self._lock, self.connection:
             self.connection.execute(
                 """
                 INSERT INTO fotmob_historical_archive_index (
                     provider, fotmob_match_id, schema_version, parser_version,
-                    archive_path, payload_hash, written_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    archive_path, payload_hash, written_at, source_type, source_priority,
+                    source_context, stats_period, captured_live, field_provenance_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider, fotmob_match_id, schema_version) DO UPDATE SET
                     parser_version = excluded.parser_version,
                     archive_path = excluded.archive_path,
                     payload_hash = excluded.payload_hash,
-                    written_at = excluded.written_at
+                    written_at = excluded.written_at,
+                    source_type = excluded.source_type,
+                    source_priority = excluded.source_priority,
+                    source_context = excluded.source_context,
+                    stats_period = excluded.stats_period,
+                    captured_live = excluded.captured_live,
+                    field_provenance_json = excluded.field_provenance_json
                 """,
                 (
                     provider.upper(), str(provider_match_id), schema_version, parser_version,
-                    str(archive_path), payload_hash, _now(),
+                    str(archive_path), payload_hash, _now(), normalized_source, priority,
+                    source_context, stats_period, int(bool(captured_live)),
+                    _json(field_provenance or {}),
                 ),
             )
+
+    def mark_imported(
+        self,
+        provider_match_id: str,
+        *,
+        data_quality: str,
+        ml_eligible: bool,
+        parser_version: str = FOTMOB_HISTORICAL_PARSER_VERSION,
+        schema_version: str = FOTMOB_HISTORICAL_SCHEMA_VERSION,
+        raw_payload_path: str | None = None,
+        payload_hash: str | None = None,
+        second_half_goals: int | None = None,
+        second_half_goal_class: str | None = None,
+        source_type: str = "LEGACY_IMPORT",
+        source_context: str = "LEGACY_SQLITE",
+        stats_period: str = "FIRST_HALF_AND_FULL_MATCH",
+        captured_live: bool = False,
+        field_provenance: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Mark a legacy row without downgrading an already fresh detail row."""
+
+        normalized_source = str(source_type or "LEGACY_IMPORT").upper()
+        if normalized_source not in FOTMOB_SOURCE_PRIORITY:
+            normalized_source = "LEGACY_IMPORT"
+        detail_status = "FETCHED" if data_quality in {"COMPLETE", "SCORE_ONLY"} else "PARTIAL"
+        with self._lock, self.connection:
+            existing = self.connection.execute(
+                "SELECT source_type FROM fotmob_match_index WHERE fotmob_match_id = ?",
+                (str(provider_match_id),),
+            ).fetchone()
+            existing_source = str(
+                existing["source_type"] if existing and existing["source_type"] else "FRESH_INDEX"
+            ).upper()
+            if FOTMOB_SOURCE_PRIORITY.get(existing_source, 0) > FOTMOB_SOURCE_PRIORITY[normalized_source]:
+                return False
+            self.connection.execute(
+                """
+                UPDATE fotmob_match_index
+                SET detail_status = ?, last_checked_at = ?, last_error = NULL,
+                    data_quality = ?, ml_eligible = ?, parser_version = ?,
+                    schema_version = ?, raw_payload_path = ?, payload_hash = ?,
+                    second_half_goals = ?, second_half_goal_class = ?,
+                    source_type = ?, source_context = ?, stats_period = ?,
+                    captured_live = ?, field_provenance_json = ?
+                WHERE fotmob_match_id = ?
+                """,
+                (
+                    detail_status, _now(), data_quality, int(bool(ml_eligible)), parser_version,
+                    schema_version, raw_payload_path, payload_hash, second_half_goals,
+                    second_half_goal_class, normalized_source, source_context, stats_period,
+                    int(bool(captured_live)), _json(field_provenance or {}), str(provider_match_id),
+                ),
+            )
+        return True
 
     def save_raw_payload(
         self,
@@ -621,9 +874,21 @@ class FotMobHistoricalArchive:
     @staticmethod
     def _parquet_row(row: Mapping[str, Any]) -> dict[str, Any]:
         result = dict(row)
+        # These are Hive partition columns.  Keeping a second, differently
+        # typed copy inside the file makes ``pyarrow.read_table(path)`` reject
+        # the dataset (for example ``league_id=54`` is inferred as int while
+        # the payload column is a string).  Readers recover them from the
+        # partition path automatically.
+        result.pop("league_id", None)
+        result.pop("season_label", None)
         for key in ("ht_extra_stats_json", "ft_extra_stats_json", "timeline_json"):
             result[key] = _json(result.get(key, {} if "stats" in key else []))
+        provenance = result.get("field_provenance_json", {})
+        result["field_provenance_json"] = (
+            provenance if isinstance(provenance, str) else _json(provenance or {})
+        )
         result["ml_eligible"] = int(bool(result.get("ml_eligible")))
+        result["captured_live"] = int(bool(result.get("captured_live")))
         return result
 
     @staticmethod
@@ -633,21 +898,51 @@ class FotMobHistoricalArchive:
     def write_batch(self, store: FotMobHistoryStore, rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         candidates = list(rows)
         if not candidates:
-            return {"written": 0, "skipped": 0, "paths": []}
-        new_rows: list[Mapping[str, Any]] = []
-        seen_keys: set[tuple[str, str, str]] = set()
+            return {"written": 0, "skipped": 0, "replaced": 0, "paths": []}
+
+        def source_info(row: Mapping[str, Any]) -> tuple[str, int]:
+            source = str(row.get("source_type", "FRESH_FETCH") or "FRESH_FETCH").upper()
+            if source not in FOTMOB_SOURCE_PRIORITY:
+                source = "FRESH_FETCH"
+            value = row.get("source_priority")
+            priority = int(value) if value is not None else FOTMOB_SOURCE_PRIORITY[source]
+            return source, priority
+
+        # A batch can contain an imported row and a fresh row for the same
+        # provider key.  Keep only the highest-quality source before touching
+        # Parquet, so a retry can never create a second training record.
+        selected_by_key: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+        skipped = 0
         for row in candidates:
             provider = str(row.get("provider", "FOTMOB")).upper()
             match_id = str(row["fotmob_match_id"])
             schema_version = str(row.get("schema_version", FOTMOB_HISTORICAL_SCHEMA_VERSION))
             key = (provider, match_id, schema_version)
-            if key in seen_keys or store.archive_key_exists(match_id, schema_version, provider=provider):
+            if key not in selected_by_key:
+                selected_by_key[key] = row
                 continue
-            seen_keys.add(key)
+            _, previous_priority = source_info(selected_by_key[key])
+            _, current_priority = source_info(row)
+            if current_priority > previous_priority:
+                selected_by_key[key] = row
+            else:
+                skipped += 1
+
+        new_rows: list[Mapping[str, Any]] = []
+        replacements: list[tuple[sqlite3.Row, Mapping[str, Any]]] = []
+        for key, row in selected_by_key.items():
+            provider, match_id, schema_version = key
+            _, candidate_priority = source_info(row)
+            existing = store.archive_entry(match_id, schema_version, provider=provider)
+            if existing is not None:
+                existing_priority = int(existing["source_priority"] or 0)
+                if existing_priority >= candidate_priority:
+                    skipped += 1
+                    continue
+                replacements.append((existing, row))
             new_rows.append(row)
-        skipped = len(candidates) - len(new_rows)
         if not new_rows:
-            return {"written": 0, "skipped": skipped, "paths": []}
+            return {"written": 0, "skipped": skipped, "replaced": 0, "paths": []}
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
@@ -670,6 +965,13 @@ class FotMobHistoricalArchive:
                 temporary.replace(destination)
                 paths.append(str(destination))
                 for row in group:
+                    source_type, source_priority = source_info(row)
+                    provenance = row.get("field_provenance_json")
+                    if isinstance(provenance, str):
+                        try:
+                            provenance = json.loads(provenance)
+                        except ValueError:
+                            provenance = {"raw": provenance}
                     store.mark_archive_written(
                         str(row["fotmob_match_id"]),
                         str(destination),
@@ -677,5 +979,61 @@ class FotMobHistoricalArchive:
                         schema_version=str(row.get("schema_version", FOTMOB_HISTORICAL_SCHEMA_VERSION)),
                         parser_version=str(row.get("parser_version", FOTMOB_HISTORICAL_PARSER_VERSION)),
                         provider=str(row.get("provider", "FOTMOB")),
+                        source_type=source_type,
+                        source_priority=source_priority,
+                        source_context=row.get("source_context"),
+                        stats_period=row.get("stats_period"),
+                        captured_live=bool(row.get("captured_live")),
+                        field_provenance=provenance if isinstance(provenance, Mapping) else None,
                     )
-        return {"written": len(new_rows), "skipped": skipped, "paths": paths}
+
+            # When a fresh detail supersedes a legacy row, remove the old row
+            # from its physical file as well as replacing the active catalog
+            # pointer.  The operation is limited to archive files previously
+            # recorded in the catalog and never touches the source database.
+            replaced = 0
+            for existing, row in replacements:
+                old_path = Path(str(existing["archive_path"]))
+                new_path = next(
+                    (
+                        path for path in paths
+                        if path != str(old_path)
+                        and Path(path).parent == old_path.parent
+                    ),
+                    None,
+                )
+                if new_path is None or not old_path.exists():
+                    continue
+                try:
+                    # ``old_path`` lives below Hive-style directories.  Read
+                    # the physical file without re-attaching inferred
+                    # partition columns; otherwise a rewrite can reintroduce
+                    # a string/int ``league_id`` conflict.
+                    table = pq.read_table(old_path, partitioning=None)
+                    remaining = [
+                        {
+                            key: value
+                            for key, value in item.items()
+                            if key not in {"league_id", "season_label"}
+                        }
+                        for item in table.to_pylist()
+                        if not (
+                            str(item.get("provider", "FOTMOB")).upper()
+                            == str(row.get("provider", "FOTMOB")).upper()
+                            and str(item.get("fotmob_match_id")) == str(row["fotmob_match_id"])
+                            and str(item.get("schema_version"))
+                            == str(row.get("schema_version", FOTMOB_HISTORICAL_SCHEMA_VERSION))
+                        )
+                    ]
+                    if remaining:
+                        rewrite = old_path.with_suffix(old_path.suffix + ".rewrite.tmp")
+                        pq.write_table(pa.Table.from_pylist(remaining), rewrite, compression=self.compression)
+                        rewrite.replace(old_path)
+                    else:
+                        old_path.unlink(missing_ok=True)
+                    replaced += 1
+                except (OSError, ValueError, KeyError):
+                    # The catalog remains authoritative if an old physical
+                    # file was moved or is not readable anymore.
+                    continue
+        return {"written": len(new_rows), "skipped": skipped, "replaced": replaced, "paths": paths}

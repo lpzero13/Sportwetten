@@ -103,6 +103,25 @@ CREATE TABLE IF NOT EXISTS competition_provider_aliases (
 CREATE INDEX IF NOT EXISTS idx_competition_alias_lookup
     ON competition_provider_aliases(provider, normalized_name);
 
+CREATE TABLE IF NOT EXISTS competition_provider_links (
+    internal_competition_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_competition_id TEXT NOT NULL,
+    tipico_competition_name TEXT NOT NULL,
+    tipico_country TEXT,
+    provider_competition_name TEXT,
+    provider_country TEXT,
+    confidence REAL NOT NULL DEFAULT 1,
+    match_status TEXT NOT NULL DEFAULT 'MANUALLY_CONFIRMED',
+    source TEXT,
+    created_at TEXT NOT NULL,
+    verified_at TEXT,
+    PRIMARY KEY (internal_competition_id, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_competition_provider_links_lookup
+    ON competition_provider_links(provider, provider_competition_id, tipico_country);
+
 CREATE TABLE IF NOT EXISTS fotmob_current_state (
     internal_match_id TEXT PRIMARY KEY,
     provider_match_id TEXT NOT NULL UNIQUE,
@@ -141,6 +160,11 @@ CREATE TABLE IF NOT EXISTS fotmob_current_state (
     result_consistency TEXT,
     ht_consistency TEXT,
     quality TEXT,
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    stats_period TEXT,
+    source_context TEXT,
+    captured_live INTEGER NOT NULL DEFAULT 0,
+    tipico_event_id TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -186,6 +210,11 @@ CREATE TABLE IF NOT EXISTS fotmob_snapshots (
     archive_path TEXT,
     exported_at TEXT,
     payload_hash TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    stats_period TEXT,
+    source_context TEXT,
+    captured_live INTEGER NOT NULL DEFAULT 0,
+    tipico_event_id TEXT,
     UNIQUE (internal_match_id, snapshot_type)
 );
 
@@ -264,6 +293,31 @@ class FotMobStore:
         self._lock = getattr(database, "_lock", threading.RLock())
         with self._lock, database.connection:
             database.connection.executescript(FOTMOB_SCHEMA)
+            for table, columns in {
+                "fotmob_current_state": {
+                    "provider": "TEXT NOT NULL DEFAULT 'FOTMOB'",
+                    "stats_period": "TEXT",
+                    "source_context": "TEXT",
+                    "captured_live": "INTEGER NOT NULL DEFAULT 0",
+                    "tipico_event_id": "TEXT",
+                },
+                "fotmob_snapshots": {
+                    "provider": "TEXT NOT NULL DEFAULT 'FOTMOB'",
+                    "stats_period": "TEXT",
+                    "source_context": "TEXT",
+                    "captured_live": "INTEGER NOT NULL DEFAULT 0",
+                    "tipico_event_id": "TEXT",
+                },
+            }.items():
+                existing_columns = {
+                    str(row["name"])
+                    for row in database.connection.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for column, definition in columns.items():
+                    if column not in existing_columns:
+                        database.connection.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                        )
 
     def _connection(self) -> sqlite3.Connection:
         return self.database.connection
@@ -537,6 +591,78 @@ class FotMobStore:
             ).fetchall()
         return {str(row["normalized_name"]): str(row["competition_id"]) for row in rows}
 
+    def upsert_competition_provider_link(
+        self,
+        *,
+        internal_competition_id: str,
+        provider: str,
+        provider_competition_id: str,
+        tipico_competition_name: str,
+        tipico_country: str | None = None,
+        provider_competition_name: str | None = None,
+        provider_country: str | None = None,
+        confidence: float = 1.0,
+        match_status: str = "MANUALLY_CONFIRMED",
+        source: str | None = None,
+        verified_at: str | None = None,
+    ) -> None:
+        now = _now()
+        with self._lock, self._connection():
+            self._connection().execute(
+                """
+                INSERT INTO competition_provider_links (
+                    internal_competition_id, provider, provider_competition_id,
+                    tipico_competition_name, tipico_country, provider_competition_name,
+                    provider_country, confidence, match_status, source, created_at, verified_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(internal_competition_id, provider) DO UPDATE SET
+                    provider_competition_id = excluded.provider_competition_id,
+                    tipico_competition_name = excluded.tipico_competition_name,
+                    tipico_country = COALESCE(excluded.tipico_country, competition_provider_links.tipico_country),
+                    provider_competition_name = COALESCE(excluded.provider_competition_name, competition_provider_links.provider_competition_name),
+                    provider_country = COALESCE(excluded.provider_country, competition_provider_links.provider_country),
+                    confidence = excluded.confidence,
+                    match_status = excluded.match_status,
+                    source = COALESCE(excluded.source, competition_provider_links.source),
+                    verified_at = COALESCE(excluded.verified_at, competition_provider_links.verified_at)
+                """,
+                (
+                    str(internal_competition_id), provider.upper(), str(provider_competition_id),
+                    str(tipico_competition_name), tipico_country, provider_competition_name,
+                    provider_country, max(0.0, min(1.0, float(confidence))), match_status,
+                    source, now, verified_at,
+                ),
+            )
+
+    def competition_link_for_internal(
+        self,
+        internal_competition_id: str,
+        provider: str = "FOTMOB",
+    ) -> sqlite3.Row | None:
+        with self._lock:
+            return self._connection().execute(
+                """
+                SELECT * FROM competition_provider_links
+                WHERE internal_competition_id = ? AND provider = ?
+                """,
+                (str(internal_competition_id), provider.upper()),
+            ).fetchone()
+
+    def competition_links(self, provider: str | None = "FOTMOB") -> list[sqlite3.Row]:
+        with self._lock:
+            if provider is None:
+                return list(self._connection().execute(
+                    "SELECT * FROM competition_provider_links ORDER BY internal_competition_id"
+                ).fetchall())
+            return list(self._connection().execute(
+                """
+                SELECT * FROM competition_provider_links
+                WHERE provider = ?
+                ORDER BY internal_competition_id
+                """,
+                (provider.upper(),),
+            ).fetchall())
+
     def _state_values(self, match: FotMobMatch) -> list[Any]:
         return [
             match.provider_match_id, match.status, match.period, match.minute,
@@ -558,10 +684,19 @@ class FotMobStore:
         ht_consistency: str | None = None,
         quality: str | None = None,
         raw_payload_path: str | None = None,
+        provider: str = "FOTMOB",
+        stats_period: str | None = "FULL_MATCH",
+        source_context: str | None = None,
+        captured_live: bool = False,
+        tipico_event_id: str | None = None,
     ) -> None:
         state_values = self._state_values(match)
         values = [internal_match_id, state_values[0], observed_at, *state_values[1:]]
-        values.extend([raw_payload_path, result_consistency, ht_consistency, quality, observed_at])
+        values.extend([
+            raw_payload_path, result_consistency, ht_consistency, quality,
+            provider.upper(), stats_period, source_context, int(bool(captured_live)),
+            tipico_event_id, observed_at,
+        ])
         columns = (
             "internal_match_id", "provider_match_id", "observed_at", "status", "period",
             "minute", "added_time", "score_home", "score_away", "ht_score_home", "ht_score_away",
@@ -571,7 +706,8 @@ class FotMobStore:
             "yellow_cards_away", "red_cards_home", "red_cards_away", "stats_json",
             "ht_stats_json", "extra_stats_json", "events_json", "raw_data_json",
             "payload_hash", "raw_payload_path", "result_consistency", "ht_consistency",
-            "quality", "updated_at",
+            "quality", "provider", "stats_period", "source_context", "captured_live",
+            "tipico_event_id", "updated_at",
         )
         updates = ", ".join(
             f"{column} = excluded.{column}" for column in columns[1:]
@@ -604,6 +740,11 @@ class FotMobStore:
             "ht_consistency": snapshot.ht_consistency,
             "raw_payload_path": snapshot.raw_payload_path,
             "extra_stats": snapshot.extra_stats,
+            "provider": snapshot.provider,
+            "stats_period": snapshot.stats_period,
+            "source_context": snapshot.source_context,
+            "captured_live": snapshot.captured_live,
+            "tipico_event_id": snapshot.tipico_event_id,
             "match": snapshot.match.to_dict(),
         }
 
@@ -623,7 +764,9 @@ class FotMobStore:
             _json({**match.stats.extra_stats, **snapshot.extra_stats}),
             _json([item.to_dict() for item in match.events]), snapshot.raw_payload_path,
             snapshot.result_consistency, snapshot.ht_consistency, snapshot.quality,
-            snapshot.schema_version, payload_hash,
+            snapshot.schema_version, payload_hash, snapshot.provider.upper(),
+            snapshot.stats_period, snapshot.source_context, int(bool(snapshot.captured_live)),
+            snapshot.tipico_event_id,
         ]
         columns = (
             "internal_match_id", "provider_match_id", "captured_at", "snapshot_type", "status",
@@ -634,7 +777,8 @@ class FotMobStore:
             "yellow_cards_home", "yellow_cards_away", "red_cards_home", "red_cards_away",
             "stats_json", "ht_stats_json", "extra_stats_json", "events_json",
             "raw_payload_path", "result_consistency", "ht_consistency", "snapshot_quality",
-            "schema_version", "payload_hash",
+            "schema_version", "payload_hash", "provider", "stats_period", "source_context",
+            "captured_live", "tipico_event_id",
         )
         with self._lock, self._connection():
             existing = self._connection().execute(
@@ -855,9 +999,14 @@ class FotMobParquetArchive:
         return {
             "schema_version": payload.get("schema_version", FOTMOB_SCHEMA_VERSION),
             "internal_match_id": payload.get("internal_match_id"),
+            "provider": payload.get("provider", "FOTMOB"),
             "provider_match_id": match.get("provider_match_id"),
             "snapshot_type": payload.get("snapshot_type"),
             "captured_at": payload.get("captured_at"),
+            "stats_period": payload.get("stats_period"),
+            "source_context": payload.get("source_context"),
+            "captured_live": int(bool(payload.get("captured_live"))),
+            "tipico_event_id": payload.get("tipico_event_id"),
             "quality": payload.get("quality"),
             "result_consistency": payload.get("result_consistency"),
             "ht_consistency": payload.get("ht_consistency"),

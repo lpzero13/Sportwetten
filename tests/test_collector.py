@@ -5,6 +5,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from config import Settings
 from services.collector import Collector
@@ -153,6 +154,61 @@ def test_collector_enqueues_goal_and_halftime_slots(tmp_path: Path) -> None:
         collector._executor.shutdown(wait=True)
         collector._executor = None
         database.close()
+
+
+def test_collector_triggers_confirmed_fotmob_enrichment_once_at_halftime(tmp_path: Path) -> None:
+    live = load_fixture("live_feed.json")
+    halftime_live = copy.deepcopy(live)
+    halftime_live["LIVE"]["events"]["721621110"]["date"] = "HZ"
+    halftime_live["LIVE"]["scores"]["721621110"]["currentScore"] = ["2", "1"]
+    settings = Settings(
+        root_dir=tmp_path,
+        store_raw_responses=False,
+        snapshot_ht_stable_enabled=False,
+    )
+    database = Database(settings.database_path)
+    client = FakeCollectorClient(live, {})
+
+    class FakeFotMob:
+        automated_worker_allowed = True
+
+        def __init__(self) -> None:
+            self.resolve_calls = 0
+            self.refresh_calls = 0
+            self.export_calls = 0
+            self.resolver = self
+
+        def resolve(self, event: object) -> object:
+            self.resolve_calls += 1
+            return SimpleNamespace(match_result=SimpleNamespace(status="EXACT"))
+
+        def refresh_for_tipico_event(self, event: object, *, snapshot_type: str) -> object:
+            assert snapshot_type == "HALFTIME"
+            self.refresh_calls += 1
+            return SimpleNamespace(success=True, error=None)
+
+        def export_pending(self) -> dict[str, int]:
+            self.export_calls += 1
+            return {"errors": 0}
+
+    fotmob = FakeFotMob()
+    collector = Collector(
+        client,  # type: ignore[arg-type]
+        database,
+        RawStorage(settings.raw_storage_path, enabled=False),
+        settings,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+        fotmob_service=fotmob,  # type: ignore[arg-type]
+    )
+
+    collector._poll_feed()
+    client.live_payload = halftime_live
+    collector._poll_feed()
+    collector._poll_feed()
+
+    assert fotmob.resolve_calls == 1
+    assert fotmob.refresh_calls == 1
+    database.close()
 
 
 def test_prematch_scheduler_queues_only_future_targets(tmp_path: Path) -> None:

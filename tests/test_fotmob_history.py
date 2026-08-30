@@ -24,6 +24,7 @@ from fotmob.history_pipeline import (
     worker_history_allowed,
 )
 from fotmob.history_storage import FotMobHistoryStore
+from fotmob.history_storage import FotMobHistoricalArchive
 from fotmob.client import FotMobClient
 from fotmob.history_cli import main as history_cli_main
 from fotmob.models import FotMobFetchResult
@@ -200,6 +201,53 @@ def test_historical_row_keeps_explicit_ht_ft_stats_and_target() -> None:
     assert row["ml_eligible"] is True
     assert row["ht_extra_stats_json"] == {}
     assert row["ft_extra_stats_json"]["unknown future metric"] == [4.0, 5.0]
+
+
+def test_historical_archive_prefers_fresh_rows_without_duplicates(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
+    database = Database(tmp_path / "data" / "tipico.db")
+    store = FotMobHistoryStore(database, tmp_path / "archive")
+    archive = FotMobHistoricalArchive(tmp_path / "archive")
+    match = parse_fotmob_payload(sample_payload())
+    legacy = historical_row_from_match(
+        history_index_record(), match, fetched_at="2026-08-30T10:00:00+00:00",
+        source_type="LEGACY_IMPORT", source_context="LEGACY_SQLITE",
+    )
+    fresh = historical_row_from_match(
+        history_index_record(), match, fetched_at="2026-08-30T11:00:00+00:00",
+        source_type="FRESH_FETCH", source_context="HISTORY_DETAIL",
+    )
+
+    first = archive.write_batch(store, [legacy])
+    second = archive.write_batch(store, [fresh])
+    assert first["written"] == 1
+    assert second["replaced"] == 1
+    active = store.archive_entry("5881143")
+    assert active is not None
+    assert active["source_type"] == "FRESH_FETCH"
+
+    import pyarrow.parquet as parquet
+
+    files = list((tmp_path / "archive" / "fotmob" / "historical").rglob("*.parquet"))
+    rows = [row for path in files for row in parquet.read_table(path).to_pylist()]
+    assert len(rows) == 1
+    assert rows[0]["source_type"] == "FRESH_FETCH"
+    database.close()
+
+
+def test_missing_archive_queue_is_index_minus_archive(tmp_path: Path) -> None:
+    database = Database(tmp_path / "data" / "tipico.db")
+    store = FotMobHistoryStore(database, tmp_path / "archive")
+    records = [history_index_record("queue-archived"), history_index_record("queue-missing")]
+    assert store.upsert_match_index(records)["inserted"] == 2
+    row = historical_row_from_match(
+        history_index_record("queue-archived"),
+        parse_fotmob_payload(sample_payload(match_id=5881143), provider_match_id="queue-archived"),
+        fetched_at="2026-08-30T10:00:00+00:00",
+    )
+    FotMobHistoricalArchive(tmp_path / "archive").write_batch(store, [row])
+    assert store.missing_archive_ids("54") == ["queue-missing"]
+    database.close()
 
 
 def test_score_target_and_quality_never_correct_invalid_scores() -> None:

@@ -44,7 +44,23 @@ def normalize_name(value: Any) -> str:
 
 
 def normalize_team_name(value: Any) -> str:
-    return normalize_name(value)
+    normalized = normalize_name(value)
+    # Cross-provider display names used in the current Bundesliga feed.  The
+    # mapping is deliberately narrow; reserve/youth/gender markers are still
+    # retained and rejected by the marker guard below.
+    aliases = {
+        "borussia m gladbach": "borussia monchengladbach",
+        "m gladbach": "borussia monchengladbach",
+        "fc augsburg": "augsburg",
+        "sc freiburg": "freiburg",
+        "1 fc koln": "koln",
+        "fc koln": "koln",
+        "fsv mainz 05": "mainz 05",
+        "sc paderborn 07": "paderborn",
+        "paderborn 07": "paderborn",
+        "hsv": "hamburger sv",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def normalize_competition_name(value: Any) -> str:

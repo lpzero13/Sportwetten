@@ -94,9 +94,8 @@ def render_halftime_scanner(
         # refreshes confirmed links and writes the idempotent HALFTIME slot;
         # the Tipico ranking below is not recalculated from these stats.
         for event in events:
-            internal_id = fotmob_service.ensure_tipico_event(event)
-            link = fotmob_service.store.link_for_internal(internal_id)
-            if link is None or link["match_status"] not in {"EXACT", "HIGH_CONFIDENCE", "MANUALLY_CONFIRMED"}:
+            resolved = fotmob_service.resolver.resolve(event)
+            if resolved.match_result.status not in {"EXACT", "HIGH_CONFIDENCE", "MANUALLY_CONFIRMED"}:
                 continue
             result = fotmob_service.refresh_for_tipico_event(event, snapshot_type="HALFTIME")
             if not result.success and result.error:
@@ -130,7 +129,7 @@ def render_halftime_scanner(
             try:
                 import json
 
-                fotmob_stats = json.loads(str(fotmob_state["stats_json"]))
+                fotmob_stats = json.loads(str(fotmob_state["ht_stats_json"]))
             except (KeyError, TypeError, ValueError):
                 fotmob_stats = {}
         rows.append(

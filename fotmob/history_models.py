@@ -10,6 +10,13 @@ FOTMOB_HISTORICAL_SCHEMA_VERSION = "fotmob_historical_v1"
 FOTMOB_HISTORICAL_PARSER_VERSION = "fotmob_historical_parser_v1"
 FOTMOB_DETAIL_STATUSES = ("NOT_FETCHED", "IN_PROGRESS", "FETCHED", "PARTIAL", "FAILED")
 FOTMOB_DATA_QUALITY = ("COMPLETE", "PARTIAL", "SCORE_ONLY", "INVALID")
+FOTMOB_SOURCE_TYPES = ("FRESH_INDEX", "FRESH_FETCH", "LEGACY_IMPORT", "LEGACY_VALIDATED")
+FOTMOB_SOURCE_PRIORITY = {
+    "FRESH_INDEX": 0,
+    "LEGACY_IMPORT": 10,
+    "LEGACY_VALIDATED": 20,
+    "FRESH_FETCH": 30,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +47,11 @@ class FotMobMatchIndexRecord:
     country: str | None = None
     first_seen_at: str | None = None
     provider: str = "FOTMOB"
+    source_type: str = "FRESH_INDEX"
+    source_context: str | None = None
+    stats_period: str | None = None
+    captured_live: bool = False
+    field_provenance: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +64,7 @@ class HistoricalDetailResult:
     second_half_goal_class: str | None = None
     error: str | None = None
     archive_path: str | None = None
+    source_type: str = "FRESH_FETCH"
 
 
 def score_target(
@@ -82,6 +95,11 @@ def historical_row_from_match(
     *,
     fetched_at: str,
     raw_payload_path: str | None = None,
+    source_type: str = "FRESH_FETCH",
+    source_context: str | None = "HISTORY_DETAIL",
+    stats_period: str | None = "FULL_MATCH",
+    captured_live: bool = False,
+    field_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Flatten a normalized :class:`FotMobMatch` into a historical row."""
 
@@ -151,6 +169,30 @@ def historical_row_from_match(
         "ml_eligible": ml_eligible,
         "raw_payload_path": raw_payload_path,
         "fetched_at": fetched_at,
+        "source_type": source_type,
+        "source_context": source_context,
+        "stats_period": stats_period,
+        "captured_live": bool(captured_live),
+        "field_provenance_json": field_provenance or {},
+        # These columns intentionally remain separate from the first-half and
+        # full-match statistics.  A legacy 60-minute observation must never be
+        # mistaken for a FirstHalf value.
+        "m60_score_home": None,
+        "m60_score_away": None,
+        "m60_xg_home": None,
+        "m60_xg_away": None,
+        "m60_shots_home": None,
+        "m60_shots_away": None,
+        "m60_shots_on_target_home": None,
+        "m60_shots_on_target_away": None,
+        "m60_big_chances_home": None,
+        "m60_big_chances_away": None,
+        "m60_corners_home": None,
+        "m60_corners_away": None,
+        "m60_yellow_cards_home": None,
+        "m60_yellow_cards_away": None,
+        "m60_red_cards_home": None,
+        "m60_red_cards_away": None,
     }
     for prefix, stats in (("ht", ht_stats), ("ft", ft_stats)):
         for field_name in (

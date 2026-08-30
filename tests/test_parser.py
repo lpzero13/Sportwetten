@@ -34,6 +34,21 @@ def test_live_feed_resolves_competition_and_score() -> None:
     assert event.bet_markets_count == 16
 
 
+def test_explicit_tipico_halftime_uses_current_score_when_ht_score_is_omitted() -> None:
+    payload = load_fixture("live_feed.json")
+    live = payload["LIVE"]
+    event = live["events"]["721621110"]
+    event["date"] = "HZ"
+    live["scores"]["721621110"] = {"currentScore": ["2", "1"]}
+
+    parsed = parse_live_feed(payload)
+
+    assert len(parsed) == 1
+    assert parsed[0].period == "HALF_TIME"
+    assert (parsed[0].score_home, parsed[0].score_away) == (2, 1)
+    assert (parsed[0].ht_score_home, parsed[0].ht_score_away) == (2, 1)
+
+
 def test_event_detail_uses_id_graph_and_deduplicates_market() -> None:
     details = parse_event_details(load_fixture("event_detail.json"))
 

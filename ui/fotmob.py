@@ -24,11 +24,11 @@ def _score_label(home: Any, away: Any) -> str:
     return f"{_display(home)}:{_display(away)}"
 
 
-def _stats_rows(state: Any) -> list[dict[str, str]]:
+def _stats_rows(state: Any, column: str = "stats_json") -> list[dict[str, str]]:
     if state is None:
         return []
     try:
-        stats = json.loads(str(state["stats_json"]))
+        stats = json.loads(str(state[column]))
     except (KeyError, TypeError, ValueError):
         stats = {}
     labels = (
@@ -158,11 +158,30 @@ def render_fotmob_tab(service: FotMobService, event: Any) -> None:
     state_columns[2].metric("Stand", _score_label(current["score_home"], current["score_away"]))
     state_columns[3].metric("HZ", _score_label(current["ht_score_home"], current["ht_score_away"]))
     state_columns[4].metric("Letztes Update", current["updated_at"] or "—")
-    rows = _stats_rows(current)
+    rows = _stats_rows(current, "stats_json")
     if rows:
+        st.caption("FotMob Match / All")
         st.dataframe(rows, hide_index=True, width="stretch")
     else:
         st.info("Für diesen Current-State sind noch keine normierten FotMob-Statistiken vorhanden.")
+
+    first_half_rows = _stats_rows(current, "ht_stats_json")
+    st.subheader("FotMob FirstHalf")
+    st.caption(
+        "Ausschließlich `content.stats.Periods.FirstHalf`; FotMob All/SecondHalf wird nicht in diese HZ-Werte übernommen."
+    )
+    if first_half_rows:
+        st.dataframe(first_half_rows, hide_index=True, width="stretch")
+    else:
+        st.info("Noch keine FirstHalf-Statistiken gespeichert.")
+    st.caption(
+        f"Provider: {current['provider'] or 'FOTMOB'} · FotMob-ID: {current['provider_match_id']} · "
+        f"Tipico-ID: {current['tipico_event_id'] or event.event_id} · "
+        f"stats_period: {current['stats_period'] or '—'} · "
+        f"source_context: {current['source_context'] or '—'} · "
+        f"captured_live: {'ja' if current['captured_live'] else 'nein'} · "
+        f"captured_at: {current['observed_at'] or '—'}"
+    )
     if quality is not None:
         st.caption(
             f"Result consistency: {quality['result_consistency'] or '—'} · "

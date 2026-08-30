@@ -150,6 +150,11 @@ class FotMobSnapshot:
     raw_payload_path: str | None = None
     extra_stats: dict[str, Any] = field(default_factory=dict)
     schema_version: str = FOTMOB_SCHEMA_VERSION
+    provider: str = "FOTMOB"
+    stats_period: str | None = "MATCH"
+    source_context: str | None = None
+    captured_live: bool = False
+    tipico_event_id: str | None = None
 
 
 @dataclass(slots=True)

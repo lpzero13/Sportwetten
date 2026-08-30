@@ -220,6 +220,18 @@ def _build_event(
         ht_home, ht_away = _score_pair(event.get("halftimeScore"))
 
     display_time = _display_time(event.get("date") or event.get("displayTime"))
+    # During the explicit Tipico HZ state, currentScore is the halftime score.
+    # Some feed variants omit htScore at that exact point and only add it to a
+    # later second-half state.  Using the score here is safe because the HZ
+    # marker is explicit; never apply this fallback to ordinary LIVE states.
+    if (
+        ht_home is None
+        and ht_away is None
+        and display_time == "HZ"
+        and score_home is not None
+        and score_away is not None
+    ):
+        ht_home, ht_away = score_home, score_away
     red_home, red_away = _red_cards(event)
     clock_data = _mapping(event.get("clockData"))
     return LiveEvent(
