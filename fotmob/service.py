@@ -10,7 +10,10 @@ from typing import Any, Iterable
 
 from config import Settings
 
+from .canonical import FotMobCanonicalArchive, ht_snapshot_row
 from .client import FotMobClient
+from .history_models import FotMobMatchIndexRecord
+from .history_pipeline import FotMobHistoryPipeline
 from .matching import MatchIdentity, MatchMatchResult, MatchMatcher, normalize_name
 from .models import FOTMOB_SNAPSHOT_TYPES, FotMobFetchResult, FotMobMatch, FotMobSnapshot
 from .storage import FotMobParquetArchive, FotMobStore
@@ -143,6 +146,18 @@ class FotMobService:
             logger=self.logger,
         )
         self.archive = FotMobParquetArchive(settings.archive_path, settings.parquet_compression)
+        self.canonical_archive = FotMobCanonicalArchive(
+            getattr(settings, "fotmob_archive_path", settings.archive_path / "fotmob"),
+            settings.parquet_compression,
+        )
+        # The UI uses this same rate-limited client for explicit date-range
+        # loads.  No network call is made during construction.
+        self.history_pipeline = FotMobHistoryPipeline(
+            settings,
+            database,
+            client=self.client,
+            logger=self.logger,
+        )
         # Competition mappings are persisted once and then reused by the
         # halftime resolver.  The import is local to keep the service/model
         # dependency graph acyclic.
@@ -277,6 +292,35 @@ class FotMobService:
             current_id, current_created = self.store.save_snapshot(snapshot)
             snapshot_id = current_id
             created = created or current_created
+            if current_type == "HALFTIME" and captured_live:
+                # Live HT enrichment has its own canonical dataset.  It is
+                # intentionally not written into the historical core as a
+                # replacement for a completed fresh match.
+                index = FotMobMatchIndexRecord(
+                    provider_match_id=match.provider_match_id,
+                    league_id=str(match.competition_id or "unknown"),
+                    season_id=str(match.season or "unknown"),
+                    season_label=str(match.season or "unknown"),
+                    kickoff_at=match.kickoff_at,
+                    home_team_id=match.home_team_id,
+                    home_team_name=match.home_team,
+                    away_team_id=match.away_team_id,
+                    away_team_name=match.away_team,
+                    match_status=match.status,
+                    league_name=match.competition_name,
+                    country=match.competition_country,
+                )
+                self.canonical_archive.write_ht_snapshot(
+                    ht_snapshot_row(
+                        index,
+                        match,
+                        captured_at=observed_at,
+                        internal_match_id=internal_match_id,
+                        tipico_event_id=tipico_event_id,
+                        matching_status="CONFIRMED",
+                        matching_confidence=1.0,
+                    )
+                )
         result = FotMobRefreshResult(
             success=True,
             internal_match_id=internal_match_id,
@@ -541,6 +585,14 @@ class FotMobService:
         snapshot_type: str | None = None,
     ) -> FotMobRefreshResult:
         internal_match_id = self.ensure_tipico_event(event)
+        if snapshot_type == "HALFTIME" and not getattr(
+            self.settings, "fotmob_ht_enrichment_enabled", True
+        ):
+            return FotMobRefreshResult(
+                False,
+                internal_match_id=internal_match_id,
+                error="FotMob-HT-Enrichment ist deaktiviert (FOTMOB_HT_ENRICHMENT_ENABLED=false).",
+            )
         if not self.automated_worker_allowed:
             return FotMobRefreshResult(
                 False,
@@ -594,4 +646,9 @@ class FotMobService:
         metrics["manual_use_allowed"] = self.manual_use_allowed
         metrics["automated_worker_allowed"] = self.automated_worker_allowed
         metrics["access"] = client_metrics
+        metrics["daily"] = self.history_pipeline.store.daily_status(
+            getattr(self.settings, "fotmob_history_league_id", "54")
+        )
+        metrics["canonical_archive"] = str(self.canonical_archive.root)
+        metrics["canonical_archive_bytes"] = self.canonical_archive.total_size_bytes
         return metrics

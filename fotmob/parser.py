@@ -349,11 +349,49 @@ def _period_nodes(payload: Mapping[str, Any]) -> tuple[Any, Any, Any]:
             "1", "1st", "1st half", "first half", "firsthalf", "first", "1h", "ht",
         }:
             ht_node = value
-    if all_node is _MISSING and periods:
-        # A response with only one explicit period is still safe as the all
-        # period, but it must never be promoted to HT implicitly.
-        all_node = next(iter(periods.values()))
+    # Do not promote a lone FirstHalf/SecondHalf node to All.  The canonical
+    # archive treats provider periods as separate observations and a fallback
+    # here would turn a partial response into a false full-match statistic.
     return all_node, ht_node, stats_root
+
+
+def _period_node(stats_root: Any, wanted: set[str]) -> Any:
+    """Return one explicitly named period without falling back to another one."""
+
+    if not isinstance(stats_root, Mapping):
+        return _MISSING
+    periods = _first(stats_root, "periods")
+    if not isinstance(periods, Mapping):
+        return _MISSING
+    wanted_normalized = {_normal_label(item) for item in wanted}
+    for key, value in periods.items():
+        normalized = _normal_label(key)
+        if normalized in wanted_normalized:
+            return value
+    return _MISSING
+
+
+def extract_period_stats(payload: Mapping[str, Any]) -> dict[str, FotMobStats]:
+    """Return the explicitly available FotMob periods in normalized form.
+
+    ``All`` is never fabricated from ``FirstHalf`` and ``SecondHalf`` is
+    never inferred by subtraction.  This keeps the historical archive honest
+    when a provider payload contains only a subset of its periods.
+    """
+
+    all_node, first_half_node, stats_root = _period_nodes(payload)
+    second_half_node = _period_node(
+        stats_root,
+        {"2", "2nd", "2nd half", "second half", "secondhalf", "second", "2h"},
+    )
+    result: dict[str, FotMobStats] = {}
+    if all_node is not _MISSING:
+        result["ALL"] = _period_stats(all_node)
+    if first_half_node is not _MISSING:
+        result["FIRST_HALF"] = _period_stats(first_half_node)
+    if second_half_node is not _MISSING:
+        result["SECOND_HALF"] = _period_stats(second_half_node)
+    return result
 
 
 def _period_stats(node: Any) -> FotMobStats:
@@ -411,11 +449,23 @@ def _parse_events(payload: Mapping[str, Any]) -> list[FotMobEvent]:
             added = _integer(added_value) or added
         home_flag = _first(raw, "isHome", "home", "teamIsHome")
         team = None
+        is_home: bool | None = None
         if isinstance(home_flag, bool):
+            is_home = home_flag
             team = "home" if home_flag else "away"
         if team is None:
             team_value = _first(raw, "team", "side", "teamSide")
             team = _text(None if team_value is _MISSING else team_value)
+            normalized_team = (team or "").casefold()
+            if normalized_team in {"home", "heim"}:
+                is_home = True
+            elif normalized_team in {"away", "auswärts", "auswaerts"}:
+                is_home = False
+        team_id_value = _first(raw, "teamId", "team_id", "participantId")
+        player_node = _first(raw, "player", "playerName", "name")
+        player_id_value = _first(raw, "playerId", "player_id")
+        if isinstance(player_node, Mapping) and player_id_value is _MISSING:
+            player_id_value = _first(player_node, "id", "playerId", "player_id")
         player_value = _first(raw, "player", "playerName", "name")
         detail_value = _first(raw, "incidentClass", "detail", "reason", "description")
         score_home, score_away = _score_pair(raw)
@@ -425,6 +475,17 @@ def _parse_events(payload: Mapping[str, Any]) -> list[FotMobEvent]:
                 minute=minute,
                 added_time=added,
                 team=team,
+                team_id=(
+                    None
+                    if team_id_value is _MISSING or team_id_value is None
+                    else str(team_id_value)
+                ),
+                is_home=is_home,
+                player_id=(
+                    None
+                    if player_id_value is _MISSING or player_id_value is None
+                    else str(player_id_value)
+                ),
                 player=_text(None if player_value is _MISSING else player_value),
                 detail=_text(None if detail_value is _MISSING else detail_value),
                 score_home=score_home,
@@ -616,11 +677,37 @@ def parse_fotmob_payload(
     if kickoff is _MISSING:
         kickoff = _first(header, "startTime", "kickoff", "kickoffTime")
     all_node, first_half_node, stats_source = _period_nodes(payload)
+    second_half_node = _period_node(
+        stats_source,
+        {"2", "2nd", "2nd half", "second half", "secondhalf", "second", "2h"},
+    )
     stats = _period_stats(all_node)
     ht_stats = None if first_half_node is _MISSING else _period_stats(first_half_node)
+    second_half_stats = (
+        None if second_half_node is _MISSING else _period_stats(second_half_node)
+    )
     events = _parse_events(payload)
+    ht_score_source = (
+        "EXPLICIT_PROVIDER"
+        if ht_home is not None and ht_away is not None
+        else None
+    )
+    ft_score_source = (
+        "EXPLICIT_PROVIDER"
+        if score_home is not None and score_away is not None
+        else None
+    )
     if ht_home is None or ht_away is None:
-        ht_home, ht_away = _derive_halftime_score(payload, events, score_home, score_away)
+        derived_home, derived_away = _derive_halftime_score(
+            payload, events, score_home, score_away
+        )
+        ht_home, ht_away = derived_home, derived_away
+        if ht_home is not None and ht_away is not None:
+            ht_score_source = (
+                "INFERRED_ZERO_ZERO"
+                if score_home == 0 and score_away == 0 and not events
+                else "TIMELINE_RECONSTRUCTED"
+            )
 
     country_text = _text(country if country is not _MISSING else None)
     if isinstance(country, Mapping):
@@ -645,8 +732,11 @@ def parse_fotmob_payload(
         score_away=score_away,
         ht_score_home=ht_home,
         ht_score_away=ht_away,
+        ht_score_source=ht_score_source,
+        ft_score_source=ft_score_source,
         stats=stats,
         ht_stats=ht_stats,
+        second_half_stats=second_half_stats,
         ht_stats_available=first_half_node is not _MISSING,
         events=events,
         extra_data={

@@ -144,6 +144,9 @@ FOTMOB_HISTORY_BATCH_SIZE = 100
 STORE_FOTMOB_HISTORICAL_RAW = False
 FOTMOB_NETWORK_MODE = "off"
 FOTMOB_NETWORK_MODE_VALUES = ("off", "manual", "worker")
+FOTMOB_ARCHIVE_ROOT = ""
+FOTMOB_HISTORY_LEAGUE_ID = "54"
+FOTMOB_HT_ENRICHMENT_ENABLED = True
 
 
 @dataclass(slots=True)
@@ -218,6 +221,9 @@ class Settings:
     fotmob_history_batch_size: int = FOTMOB_HISTORY_BATCH_SIZE
     store_fotmob_historical_raw: bool = STORE_FOTMOB_HISTORICAL_RAW
     fotmob_network_mode: str = FOTMOB_NETWORK_MODE
+    fotmob_archive_root: str = FOTMOB_ARCHIVE_ROOT
+    fotmob_history_league_id: str = FOTMOB_HISTORY_LEAGUE_ID
+    fotmob_ht_enrichment_enabled: bool = FOTMOB_HT_ENRICHMENT_ENABLED
 
     @property
     def database_path(self) -> Path:
@@ -239,6 +245,13 @@ class Settings:
     def archive_path(self) -> Path:
         configured = os.getenv("WETTEN_ARCHIVE_PATH")
         return Path(configured).expanduser() if configured else self.root_dir / "data" / "archive"
+
+    @property
+    def fotmob_archive_path(self) -> Path:
+        """Canonical FotMob root, separate from the Tipico archive root."""
+
+        configured = str(self.fotmob_archive_root or os.getenv("FOTMOB_ARCHIVE_ROOT", "")).strip()
+        return Path(configured).expanduser() if configured else self.archive_path / "fotmob"
 
     @property
     def halftime_reports_path(self) -> Path:
@@ -407,6 +420,14 @@ class Settings:
                 "FOTMOB_NETWORK_MODE",
                 FOTMOB_NETWORK_MODE,
                 FOTMOB_NETWORK_MODE_VALUES,
+            ),
+            fotmob_archive_root=os.getenv("FOTMOB_ARCHIVE_ROOT", FOTMOB_ARCHIVE_ROOT),
+            fotmob_history_league_id=os.getenv(
+                "FOTMOB_HISTORY_LEAGUE_ID", FOTMOB_HISTORY_LEAGUE_ID
+            ).strip()
+            or FOTMOB_HISTORY_LEAGUE_ID,
+            fotmob_ht_enrichment_enabled=_env_bool(
+                "FOTMOB_HT_ENRICHMENT_ENABLED", FOTMOB_HT_ENRICHMENT_ENABLED
             ),
         )
 

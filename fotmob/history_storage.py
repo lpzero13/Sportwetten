@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from .history_models import (
-    FOTMOB_DETAIL_STATUSES,
     FOTMOB_HISTORICAL_PARSER_VERSION,
     FOTMOB_HISTORICAL_SCHEMA_VERSION,
     FOTMOB_SOURCE_PRIORITY,
@@ -124,6 +123,58 @@ CREATE TABLE IF NOT EXISTS fotmob_fixture_index_runs (
 
 CREATE INDEX IF NOT EXISTS idx_fotmob_fixture_index_runs_lookup
     ON fotmob_fixture_index_runs(provider, league_id, fetched_at DESC);
+
+-- One durable row per requested UTC day and provider fixture.  This is the
+-- small, query-friendly daily catalog; match statistics remain in Parquet.
+CREATE TABLE IF NOT EXISTS fotmob_daily_index (
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    observation_date TEXT NOT NULL,
+    fotmob_match_id TEXT NOT NULL,
+    league_id TEXT NOT NULL,
+    league_name TEXT,
+    country_code TEXT,
+    country_name TEXT,
+    season_id TEXT,
+    season_label TEXT,
+    kickoff_at_utc TEXT,
+    home_team_id TEXT,
+    home_team_name TEXT NOT NULL,
+    away_team_id TEXT,
+    away_team_name TEXT NOT NULL,
+    round TEXT,
+    match_status TEXT,
+    source_endpoint TEXT,
+    payload_hash TEXT,
+    fetched_at TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (provider, observation_date, fotmob_match_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_date
+    ON fotmob_daily_index(provider, observation_date, league_id, kickoff_at_utc);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_match
+    ON fotmob_daily_index(provider, fotmob_match_id, observation_date);
+
+CREATE TABLE IF NOT EXISTS fotmob_daily_load_runs (
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    observation_date TEXT NOT NULL,
+    league_id TEXT NOT NULL,
+    season_id TEXT,
+    status TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    fixture_count INTEGER NOT NULL DEFAULT 0,
+    selected_count INTEGER NOT NULL DEFAULT 0,
+    detail_count INTEGER NOT NULL DEFAULT 0,
+    payload_hash TEXT,
+    source_endpoint TEXT,
+    error TEXT,
+    PRIMARY KEY (provider, observation_date, league_id, season_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_daily_load_runs_date
+    ON fotmob_daily_load_runs(provider, observation_date, league_id, status);
 """
 
 
@@ -373,6 +424,284 @@ class FotMobHistoryStore:
                 ),
             )
 
+    @staticmethod
+    def _country_code(value: Any) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        normalized = text.casefold()
+        known = {
+            "de": "GER",
+            "deu": "GER",
+            "ger": "GER",
+            "deutschland": "GER",
+            "germany": "GER",
+            "at": "AUT",
+            "aut": "AUT",
+            "österreich": "AUT",
+            "osterreich": "AUT",
+            "austria": "AUT",
+            "gb": "ENG",
+            "gbr": "ENG",
+            "eng": "ENG",
+            "england": "ENG",
+            "es": "ESP",
+            "esp": "ESP",
+            "spanien": "ESP",
+            "spain": "ESP",
+            "fr": "FRA",
+            "fra": "FRA",
+            "frankreich": "FRA",
+            "france": "FRA",
+            "it": "ITA",
+            "ita": "ITA",
+            "italien": "ITA",
+            "italy": "ITA",
+            "nl": "NED",
+            "nld": "NED",
+            "ned": "NED",
+            "niederlande": "NED",
+            "netherlands": "NED",
+        }
+        return known.get(normalized, text.upper() if len(text) in {2, 3} else text.upper())
+
+    @staticmethod
+    def _country_name(value: Any) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        names = {
+            "GER": "Deutschland",
+            "DEU": "Deutschland",
+            "AUT": "Österreich",
+            "ENG": "England",
+            "ESP": "Spanien",
+            "FRA": "Frankreich",
+            "ITA": "Italien",
+            "NED": "Niederlande",
+        }
+        return names.get(text.upper(), text)
+
+    def upsert_daily_index(
+        self,
+        records: Iterable[FotMobMatchIndexRecord],
+        *,
+        observation_date: str,
+        source_endpoint: str | None = None,
+        payload_hash: str | None = None,
+        fetched_at: str | None = None,
+        provider: str = "FOTMOB",
+    ) -> dict[str, int]:
+        """Persist the date-bounded fixture catalog without storing stats."""
+
+        record_list = list(records)
+        fetched = fetched_at or _now()
+        day = str(observation_date)
+        inserted = updated = 0
+        with self._lock, self.connection:
+            for record in record_list:
+                country_code = self._country_code(record.country)
+                country_name = self._country_name(record.country)
+                existing = self.connection.execute(
+                    """
+                    SELECT 1 FROM fotmob_daily_index
+                    WHERE provider = ? AND observation_date = ? AND fotmob_match_id = ?
+                    """,
+                    (provider.upper(), day, record.provider_match_id),
+                ).fetchone()
+                first_seen = record.first_seen_at or fetched
+                self.connection.execute(
+                    """
+                    INSERT INTO fotmob_daily_index (
+                        provider, observation_date, fotmob_match_id, league_id,
+                        league_name, country_code, country_name, season_id,
+                        season_label, kickoff_at_utc, home_team_id, home_team_name,
+                        away_team_id, away_team_name, round, match_status,
+                        source_endpoint, payload_hash, fetched_at, first_seen_at,
+                        last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(provider, observation_date, fotmob_match_id) DO UPDATE SET
+                        league_id = excluded.league_id,
+                        league_name = COALESCE(excluded.league_name, fotmob_daily_index.league_name),
+                        country_code = COALESCE(excluded.country_code, fotmob_daily_index.country_code),
+                        country_name = COALESCE(excluded.country_name, fotmob_daily_index.country_name),
+                        season_id = COALESCE(excluded.season_id, fotmob_daily_index.season_id),
+                        season_label = COALESCE(excluded.season_label, fotmob_daily_index.season_label),
+                        kickoff_at_utc = COALESCE(excluded.kickoff_at_utc, fotmob_daily_index.kickoff_at_utc),
+                        home_team_id = COALESCE(excluded.home_team_id, fotmob_daily_index.home_team_id),
+                        home_team_name = excluded.home_team_name,
+                        away_team_id = COALESCE(excluded.away_team_id, fotmob_daily_index.away_team_id),
+                        away_team_name = excluded.away_team_name,
+                        round = COALESCE(excluded.round, fotmob_daily_index.round),
+                        match_status = COALESCE(excluded.match_status, fotmob_daily_index.match_status),
+                        source_endpoint = COALESCE(excluded.source_endpoint, fotmob_daily_index.source_endpoint),
+                        payload_hash = COALESCE(excluded.payload_hash, fotmob_daily_index.payload_hash),
+                        fetched_at = excluded.fetched_at,
+                        last_seen_at = excluded.last_seen_at
+                    """,
+                    (
+                        provider.upper(), day, record.provider_match_id,
+                        record.league_id, record.league_name, country_code,
+                        country_name, record.season_id, record.season_label,
+                        record.kickoff_at, record.home_team_id, record.home_team_name,
+                        record.away_team_id, record.away_team_name, record.round_name,
+                        record.match_status, source_endpoint, payload_hash, fetched,
+                        first_seen, fetched,
+                    ),
+                )
+                if existing is None:
+                    inserted += 1
+                else:
+                    updated += 1
+        return {"discovered": len(record_list), "inserted": inserted, "updated": updated}
+
+    def record_daily_load_run(
+        self,
+        observation_date: str,
+        league_id: str,
+        *,
+        season_id: str | None,
+        status: str,
+        fixture_count: int = 0,
+        selected_count: int = 0,
+        detail_count: int = 0,
+        payload_hash: str | None = None,
+        source_endpoint: str | None = None,
+        error: str | None = None,
+        fetched_at: str | None = None,
+        provider: str = "FOTMOB",
+    ) -> None:
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO fotmob_daily_load_runs (
+                    provider, observation_date, league_id, season_id, status,
+                    fetched_at, fixture_count, selected_count, detail_count,
+                    payload_hash, source_endpoint, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, observation_date, league_id, season_id) DO UPDATE SET
+                    status = excluded.status,
+                    fetched_at = excluded.fetched_at,
+                    fixture_count = excluded.fixture_count,
+                    selected_count = excluded.selected_count,
+                    detail_count = excluded.detail_count,
+                    payload_hash = COALESCE(excluded.payload_hash, fotmob_daily_load_runs.payload_hash),
+                    source_endpoint = COALESCE(excluded.source_endpoint, fotmob_daily_load_runs.source_endpoint),
+                    error = COALESCE(excluded.error, fotmob_daily_load_runs.error)
+                """,
+                (
+                    provider.upper(), str(observation_date), str(league_id),
+                    season_id, str(status), fetched_at or _now(),
+                    max(0, int(fixture_count)), max(0, int(selected_count)),
+                    max(0, int(detail_count)), payload_hash, source_endpoint, error,
+                ),
+            )
+
+    def daily_index(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        *,
+        league_id: str | None = None,
+        provider: str = "FOTMOB",
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        clauses = ["i.provider = ?"]
+        params: list[Any] = [provider.upper()]
+        if start_date:
+            clauses.append("i.observation_date >= ?")
+            params.append(str(start_date))
+        if end_date:
+            clauses.append("i.observation_date <= ?")
+            params.append(str(end_date))
+        if league_id:
+            clauses.append("i.league_id = ?")
+            params.append(str(league_id))
+        params.append(max(1, int(limit)))
+        with self._lock:
+            return list(self.connection.execute(
+                f"""
+                SELECT i.*, m.detail_status, m.data_quality, m.ml_eligible,
+                       a.archive_path AS canonical_archive_path,
+                       COALESCE(a.archive_path, legacy.archive_path) AS historical_archive_path,
+                       COALESCE(a.source_type, legacy.source_type) AS historical_source_type
+                FROM fotmob_daily_index i
+                LEFT JOIN fotmob_match_index m
+                  ON m.provider = i.provider AND m.fotmob_match_id = i.fotmob_match_id
+                LEFT JOIN fotmob_historical_archive_index a
+                  ON a.provider = i.provider AND a.fotmob_match_id = i.fotmob_match_id
+                 AND a.schema_version = 'fotmob_match_core_v2'
+                LEFT JOIN fotmob_historical_archive_index legacy
+                  ON legacy.provider = i.provider AND legacy.fotmob_match_id = i.fotmob_match_id
+                 AND legacy.schema_version = 'fotmob_historical_v1'
+                WHERE {' AND '.join(clauses)}
+                ORDER BY i.observation_date DESC, i.kickoff_at_utc, i.fotmob_match_id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall())
+
+    def daily_load_runs(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        *,
+        league_id: str | None = None,
+        provider: str = "FOTMOB",
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        clauses = ["provider = ?"]
+        params: list[Any] = [provider.upper()]
+        if start_date:
+            clauses.append("observation_date >= ?")
+            params.append(str(start_date))
+        if end_date:
+            clauses.append("observation_date <= ?")
+            params.append(str(end_date))
+        if league_id:
+            clauses.append("league_id = ?")
+            params.append(str(league_id))
+        params.append(max(1, int(limit)))
+        with self._lock:
+            return list(self.connection.execute(
+                f"""
+                SELECT * FROM fotmob_daily_load_runs
+                WHERE {' AND '.join(clauses)}
+                ORDER BY observation_date DESC, league_id, season_id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall())
+
+    def daily_status(self, league_id: str | None = None) -> dict[str, Any]:
+        clauses = ["provider = 'FOTMOB'"]
+        params: list[Any] = []
+        if league_id:
+            clauses.append("league_id = ?")
+            params.append(str(league_id))
+        where = " AND ".join(clauses)
+        with self._lock:
+            index = self.connection.execute(
+                f"SELECT COUNT(*) AS n, MIN(observation_date) AS first_date, MAX(observation_date) AS last_date FROM fotmob_daily_index WHERE {where}",
+                params,
+            ).fetchone()
+            runs = self.connection.execute(
+                f"SELECT COUNT(*) AS n, COUNT(DISTINCT observation_date) AS days FROM fotmob_daily_load_runs WHERE {where}",
+                params,
+            ).fetchone()
+            statuses = self.connection.execute(
+                f"SELECT status, COUNT(*) AS n FROM fotmob_daily_load_runs WHERE {where} GROUP BY status",
+                params,
+            ).fetchall()
+        return {
+            "index_rows": int(index["n"] or 0) if index else 0,
+            "loaded_days": int(runs["days"] or 0) if runs else 0,
+            "run_rows": int(runs["n"] or 0) if runs else 0,
+            "first_date": index["first_date"] if index else None,
+            "last_date": index["last_date"] if index else None,
+            "run_status": {str(row["status"]): int(row["n"] or 0) for row in statuses},
+        }
+
     def match_index(
         self,
         league_id: str,
@@ -559,6 +888,68 @@ class FotMobHistoryStore:
                 claimed = self.connection.execute(
                     "SELECT * FROM fotmob_match_index WHERE fotmob_match_id = ?",
                     (row["fotmob_match_id"],),
+                ).fetchone()
+                self.connection.commit()
+                return claimed
+            except Exception:
+                self.connection.rollback()
+                raise
+
+    def claim_match(
+        self,
+        provider_match_id: str,
+        *,
+        worker_id: str,
+        retry_failed: bool = False,
+        max_attempts: int = 3,
+        stale_minutes: int = 30,
+        refresh_existing: bool = False,
+    ) -> sqlite3.Row | None:
+        """Atomically claim one known fixture for a date-bounded job.
+
+        A daily load may deliberately refresh a legacy row once so that the
+        fresh canonical archive can supersede it.  Already fresh rows remain
+        idempotent and are skipped unless a caller explicitly changes policy.
+        """
+
+        self.recover_stale(stale_minutes)
+        now = _now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.connection.execute(
+                    "SELECT * FROM fotmob_match_index WHERE fotmob_match_id = ?",
+                    (str(provider_match_id),),
+                ).fetchone()
+                if row is None:
+                    self.connection.commit()
+                    return None
+                status = str(row["detail_status"] or "NOT_FETCHED")
+                source = str(row["source_type"] or "FRESH_INDEX").upper()
+                allowed = status == "NOT_FETCHED" or (
+                    retry_failed and status == "FAILED"
+                )
+                if refresh_existing and source != "FRESH_FETCH" and status in {"FETCHED", "PARTIAL"}:
+                    allowed = True
+                if not allowed or int(row["attempt_count"] or 0) >= max(1, int(max_attempts)):
+                    self.connection.commit()
+                    return None
+                cursor = self.connection.execute(
+                    """
+                    UPDATE fotmob_match_index
+                    SET detail_status = 'IN_PROGRESS', worker_id = ?,
+                        attempt_count = attempt_count + 1, last_attempt_at = ?,
+                        last_checked_at = NULL, last_error = NULL
+                    WHERE fotmob_match_id = ? AND detail_status = ?
+                    """,
+                    (worker_id, now, str(provider_match_id), status),
+                )
+                if cursor.rowcount != 1:
+                    self.connection.rollback()
+                    return None
+                claimed = self.connection.execute(
+                    "SELECT * FROM fotmob_match_index WHERE fotmob_match_id = ?",
+                    (str(provider_match_id),),
                 ).fetchone()
                 self.connection.commit()
                 return claimed

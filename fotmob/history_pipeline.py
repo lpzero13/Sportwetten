@@ -11,19 +11,25 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from config import Settings
 
 from .client import FotMobClient
+from .canonical import (
+    CANONICAL_MATCH_CORE_SCHEMA_VERSION,
+    CANONICAL_PARSER_VERSION,
+    FotMobCanonicalArchive,
+)
 from .history_discovery import (
     extract_league_metadata,
     extract_match_index,
@@ -171,6 +177,10 @@ class FotMobHistoryPipeline:
             logger=self.logger,
         )
         self.archive = FotMobHistoricalArchive(settings.archive_path, settings.parquet_compression)
+        self.canonical_archive = FotMobCanonicalArchive(
+            getattr(settings, "fotmob_archive_path", settings.archive_path / "fotmob"),
+            settings.parquet_compression,
+        )
         self._archive_lock = threading.RLock()
 
     def _network_error(self, execution_mode: str) -> str:
@@ -365,6 +375,239 @@ class FotMobHistoryPipeline:
         normalized["payload_hash"] = payload_hash
         return normalized
 
+    def _write_canonical(
+        self,
+        row: Any,
+        fetched: FotMobFetchResult,
+        *,
+        fetched_at: str | None = None,
+        source_context: str = "DAILY_DETAIL",
+    ) -> dict[str, Any]:
+        if fetched.match is None:
+            raise ValueError("FotMob detail has no normalized match")
+        result = self.canonical_archive.write_match(
+            _row_to_index(row),
+            fetched.match,
+            fetched.payload,
+            fetched_at=fetched_at or _now(),
+            source_type="FRESH_FETCH",
+            source_context=source_context,
+            stats_period="FULL_MATCH",
+            captured_live=False,
+        )
+        # The canonical writer returns one deterministic path per dataset.  Do
+        # not use a glob here: the SQLite archive index must point to the file
+        # written by this fetch, even when a deployment contains old runs.
+        core_path = next(
+            (
+                path for path in result.get("paths", [])
+                if "match_core" in Path(str(path)).parts
+            ),
+            None,
+        )
+        if core_path:
+            self.store.mark_archive_written(
+                str(row["fotmob_match_id"]),
+                str(core_path),
+                payload_hash=result.get("payload_hash"),
+                schema_version=CANONICAL_MATCH_CORE_SCHEMA_VERSION,
+                parser_version=CANONICAL_PARSER_VERSION,
+                provider=str(row["provider"]),
+                source_type="FRESH_FETCH",
+                source_context=source_context,
+                stats_period="FULL_MATCH",
+                captured_live=False,
+            )
+        return result
+
+    def _fetch_specific(
+        self,
+        provider_match_id: str,
+        *,
+        worker_id: str,
+        retry_failed: bool,
+        refresh_existing: bool,
+    ) -> tuple[Any, FotMobFetchResult | None, str | None] | None:
+        row = self.store.claim_match(
+            str(provider_match_id),
+            worker_id=worker_id,
+            retry_failed=retry_failed,
+            max_attempts=self.settings.fotmob_history_max_retry_attempts,
+            stale_minutes=self.settings.fotmob_history_stale_minutes,
+            refresh_existing=refresh_existing,
+        )
+        if row is None:
+            return None
+        try:
+            fetched = self.client.fetch_match_details(str(provider_match_id))
+            if not isinstance(fetched, FotMobFetchResult):
+                fetched = FotMobFetchResult(success=True, match=fetched)
+            if not fetched.success or fetched.match is None:
+                return row, fetched, fetched.error or "FotMob detail request failed"
+            return row, fetched, None
+        except Exception as exc:  # pragma: no cover - defensive worker boundary
+            return row, None, str(exc)
+
+    def fetch_details_for_ids(
+        self,
+        provider_match_ids: list[str] | tuple[str, ...],
+        *,
+        workers: int = 1,
+        retry_failed: bool = False,
+        refresh_existing: bool = False,
+        execution_mode: str = "manual",
+    ) -> dict[str, Any]:
+        """Fetch only the fixtures selected by a date-range job.
+
+        This keeps a date job resumable and prevents a small UI-selected range
+        from accidentally draining an entire season queue.
+        """
+
+        if not _history_network_allowed(self.settings, execution_mode):
+            return {
+                "status": "BLOCKED_BY_POLICY",
+                "requested": len(set(str(item) for item in provider_match_ids)),
+                "fetched": 0,
+                "partial": 0,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 0,
+                "canonical_files": [],
+                "historical_files": [],
+                "period_stats_rows": 0,
+                "shot_rows": 0,
+                "event_rows": 0,
+                "archive_bytes": 0,
+                "canonical_bytes": 0,
+                "error": self._network_error(execution_mode),
+            }
+        ids = list(dict.fromkeys(str(item) for item in provider_match_ids if str(item).strip()))
+        workers = max(1, min(8, int(workers)))
+        worker_id = f"daily-{uuid.uuid4().hex[:12]}"
+        fetched_count = partial_count = failed_count = errors = skipped = 0
+        canonical_files: list[str] = []
+        historical_files: list[str] = []
+        period_rows = shot_rows = event_rows = archive_bytes = canonical_bytes = 0
+        successful_ids: set[str] = set()
+        buffer: list[dict[str, Any]] = []
+
+        def flush() -> None:
+            nonlocal buffer, archive_bytes
+            if not buffer:
+                return
+            with self._archive_lock:
+                result = self.archive.write_batch(self.store, buffer)
+            historical_files.extend(str(path) for path in result.get("paths", []))
+            archive_bytes += sum(
+                Path(path).stat().st_size
+                for path in result.get("paths", [])
+                if Path(path).exists()
+            )
+            for normalized in buffer:
+                self.store.mark_success(
+                    str(normalized["fotmob_match_id"]),
+                    data_quality=str(normalized["data_quality"]),
+                    ml_eligible=bool(normalized["ml_eligible"]),
+                    parser_version=str(normalized["parser_version"]),
+                    schema_version=str(normalized["schema_version"]),
+                    raw_payload_path=normalized.get("raw_payload_path"),
+                    payload_hash=normalized.get("payload_hash"),
+                    second_half_goals=normalized.get("second_half_goals"),
+                    second_half_goal_class=normalized.get("second_half_goal_class"),
+                    worker_id=worker_id,
+                    source_type=str(normalized.get("source_type", "FRESH_FETCH")),
+                    source_context=normalized.get("source_context"),
+                    stats_period=normalized.get("stats_period"),
+                    captured_live=bool(normalized.get("captured_live")),
+                    field_provenance=normalized.get("field_provenance_json"),
+                )
+            buffer = []
+
+        def handle(result: tuple[Any, FotMobFetchResult | None, str | None] | None) -> None:
+            nonlocal fetched_count, partial_count, failed_count, errors, skipped
+            nonlocal period_rows, shot_rows, event_rows, canonical_bytes
+            if result is None:
+                skipped += 1
+                return
+            row, fetched, error = result
+            if error or fetched is None or fetched.match is None:
+                errors += 1
+                failure_status = self.store.mark_failure(
+                    str(row["fotmob_match_id"]),
+                    error or "FotMob detail request failed",
+                    max_attempts=self.settings.fotmob_history_max_retry_attempts,
+                    worker_id=worker_id,
+                )
+                if failure_status == "FAILED":
+                    failed_count += 1
+                return
+            try:
+                canonical = self._write_canonical(
+                    row,
+                    fetched,
+                    source_context="DAILY_DETAIL",
+                )
+                canonical_files.extend(str(path) for path in canonical.get("paths", []))
+                period_rows += int(canonical.get("period_stats_rows", 0))
+                shot_rows += int(canonical.get("shot_rows", 0))
+                event_rows += int(canonical.get("event_rows", 0))
+                canonical_bytes += int(canonical.get("bytes", 0))
+                normalized = self._normalized_row(row, fetched)
+                buffer.append(normalized)
+                if str(normalized.get("data_quality")) == "COMPLETE":
+                    fetched_count += 1
+                else:
+                    partial_count += 1
+                successful_ids.add(str(row["fotmob_match_id"]))
+            except Exception as exc:
+                errors += 1
+                failure_status = self.store.mark_failure(
+                    str(row["fotmob_match_id"]),
+                    f"normalization/archive preparation failed: {exc}",
+                    max_attempts=self.settings.fotmob_history_max_retry_attempts,
+                    worker_id=worker_id,
+                )
+                if failure_status == "FAILED":
+                    failed_count += 1
+            if len(buffer) >= max(1, int(self.settings.fotmob_history_batch_size)):
+                flush()
+
+        try:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="fotmob-daily") as executor:
+                futures = [
+                    executor.submit(
+                        self._fetch_specific,
+                        provider_match_id,
+                        worker_id=worker_id,
+                        retry_failed=retry_failed,
+                        refresh_existing=refresh_existing,
+                    )
+                    for provider_match_id in ids
+                ]
+                for future in futures:
+                    handle(future.result())
+            flush()
+        finally:
+            self.store.release_worker(worker_id)
+        return {
+            "status": "PASS" if failed_count == 0 and errors == 0 else "PARTIAL",
+            "requested": len(ids),
+            "fetched": fetched_count,
+            "partial": partial_count,
+            "failed": failed_count,
+            "errors": errors,
+            "skipped": skipped,
+            "canonical_files": sorted(set(canonical_files)),
+            "historical_files": sorted(set(historical_files)),
+            "period_stats_rows": period_rows,
+            "shot_rows": shot_rows,
+            "event_rows": event_rows,
+            "archive_bytes": archive_bytes,
+            "canonical_bytes": canonical_bytes,
+            "successful_ids": sorted(successful_ids),
+            "access": getattr(self.client, "metrics_snapshot", lambda: {})(),
+        }
+
     def fetch_details(
         self,
         league_id: str,
@@ -494,6 +737,7 @@ class FotMobHistoryPipeline:
                                 failed_count += 1
                         else:
                             try:
+                                self._write_canonical(row, fetched)
                                 buffer.append(self._normalized_row(row, fetched))
                             except Exception as exc:
                                 error_count += 1
@@ -545,6 +789,260 @@ class FotMobHistoryPipeline:
             "eta_seconds": progress["eta_seconds"],
             "progress": progress,
             "archive_files": sorted(set(archive_files)),
+            "access": getattr(self.client, "metrics_snapshot", lambda: {})(),
+        }
+
+    @staticmethod
+    def _coerce_date(value: date | str) -> date:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        try:
+            return date.fromisoformat(str(value).strip())
+        except ValueError as exc:
+            raise ValueError(f"Ungültiges Datum: {value!r}; erwartet YYYY-MM-DD") from exc
+
+    @staticmethod
+    def _season_window(season_label: str) -> tuple[date, date] | None:
+        match = re.search(r"(\d{4})\s*[/\-]\s*(\d{2,4})", str(season_label or ""))
+        if not match:
+            return None
+        first = int(match.group(1))
+        second_text = match.group(2)
+        second = int(second_text) if len(second_text) == 4 else (first // 100) * 100 + int(second_text)
+        if second < first:
+            second = first + 1
+        # Football seasons are treated as July--June for selecting which
+        # provider season page to request.  The fixture itself is still
+        # filtered by its exact UTC kickoff, so unusual cup/season dates are
+        # never silently included.
+        return date(first, 7, 1), date(second, 6, 30)
+
+    def load_date_range(
+        self,
+        start_date: date | str,
+        end_date: date | str,
+        *,
+        league_id: str | None = None,
+        fetch_details: bool = True,
+        workers: int | None = None,
+        execution_mode: str = "manual",
+    ) -> dict[str, Any]:
+        """Load the configured league for an inclusive UTC date range.
+
+        The provider league/season pages are fetched once per relevant season;
+        fixtures are then assigned to the selected days by their provider UTC
+        kickoff.  Every selected day, including a day without fixtures, gets a
+        durable run row in SQLite.  Match details and statistics are written to
+        the canonical Parquet datasets.
+        """
+
+        start = self._coerce_date(start_date)
+        end = self._coerce_date(end_date)
+        if end < start:
+            raise ValueError("Das Enddatum darf nicht vor dem Startdatum liegen.")
+        day_count = (end - start).days + 1
+        if day_count > 3660:
+            raise ValueError("Der Datumsbereich ist auf 10 Jahre begrenzt.")
+        target_league = str(league_id or getattr(self.settings, "fotmob_history_league_id", "54"))
+        if not _history_network_allowed(self.settings, execution_mode):
+            return {
+                "status": "BLOCKED_BY_POLICY",
+                "from_date": start.isoformat(),
+                "to_date": end.isoformat(),
+                "league_id": target_league,
+                "days": day_count,
+                "fixtures": 0,
+                "details": {},
+                "error": self._network_error(execution_mode),
+            }
+
+        discovery = self.discover_league(target_league, execution_mode=execution_mode)
+        if not discovery.success:
+            return {
+                "status": "ERROR",
+                "from_date": start.isoformat(),
+                "to_date": end.isoformat(),
+                "league_id": target_league,
+                "days": day_count,
+                "fixtures": 0,
+                "details": {},
+                "error": discovery.error,
+            }
+
+        relevant_seasons = [
+            season
+            for season in discovery.seasons
+            if self._season_window(season.season_label) is None
+            or (
+                self._season_window(season.season_label)[1] >= start
+                and self._season_window(season.season_label)[0] <= end
+            )
+        ]
+        day_records: dict[str, dict[str, FotMobMatchIndexRecord]] = {}
+        season_day_records: dict[tuple[str, str], dict[str, dict[str, FotMobMatchIndexRecord]]] = {}
+        season_errors: list[str] = []
+        indexed_seasons: list[str] = []
+        for season in relevant_seasons:
+            endpoint = self._endpoint(
+                self.settings.fotmob_season_path,
+                league_id=target_league,
+                season_id=season.season_id,
+                season_label=season.season_label,
+            )
+            payload, error = self._fetch_json(endpoint)
+            if payload is None:
+                message = f"{season.season_label}: {error or 'FotMob Season konnte nicht geladen werden'}"
+                season_errors.append(message)
+                for offset in range(day_count):
+                    day = (start + timedelta(days=offset)).isoformat()
+                    self.store.record_daily_load_run(
+                        day,
+                        target_league,
+                        season_id=season.season_id,
+                        status="ERROR",
+                        source_endpoint=endpoint,
+                        error=error,
+                    )
+                continue
+            fetched_at = _now()
+            records = tuple(
+                extract_match_index(
+                    payload,
+                    league_id=target_league,
+                    season=season,
+                    first_seen_at=fetched_at,
+                )
+            )
+            self.store.upsert_match_index(records)
+            self.store.record_fixture_index_run(
+                target_league,
+                season.season_id,
+                fixture_count=len(records),
+                payload_hash=_payload_hash(payload),
+                run_date=end.isoformat(),
+                fetched_at=fetched_at,
+                source_context="DAILY_INDEX",
+            )
+            indexed_seasons.append(season.season_id)
+            selected_by_day: dict[str, dict[str, FotMobMatchIndexRecord]] = {}
+            for record in records:
+                kickoff_day = str(record.kickoff_at or "")[:10]
+                if not kickoff_day:
+                    continue
+                try:
+                    kickoff_date = date.fromisoformat(kickoff_day)
+                except ValueError:
+                    continue
+                if not (start <= kickoff_date <= end):
+                    continue
+                selected_by_day.setdefault(kickoff_day, {})[record.provider_match_id] = record
+                day_records.setdefault(kickoff_day, {})[record.provider_match_id] = record
+            season_day_records[(season.season_id, endpoint)] = selected_by_day
+            for offset in range(day_count):
+                day = (start + timedelta(days=offset)).isoformat()
+                selected = list(selected_by_day.get(day, {}).values())
+                self.store.upsert_daily_index(
+                    selected,
+                    observation_date=day,
+                    source_endpoint=endpoint,
+                    payload_hash=_payload_hash(payload),
+                    fetched_at=fetched_at,
+                )
+                self.store.record_daily_load_run(
+                    day,
+                    target_league,
+                    season_id=season.season_id,
+                    status="COMPLETE",
+                    fixture_count=len(selected),
+                    selected_count=len(selected),
+                    payload_hash=_payload_hash(payload),
+                    source_endpoint=endpoint,
+                    fetched_at=fetched_at,
+                )
+
+        if not relevant_seasons:
+            for offset in range(day_count):
+                day = (start + timedelta(days=offset)).isoformat()
+                self.store.record_daily_load_run(
+                    day,
+                    target_league,
+                    season_id="",
+                    status="NO_SEASON",
+                    error="Kein bekannter FotMob-Season-Zeitraum deckt dieses Datum ab.",
+                )
+
+        selected_records = [record for records in day_records.values() for record in records.values()]
+        detail_result: dict[str, Any] = {
+            "status": "SKIPPED",
+            "requested": 0,
+            "fetched": 0,
+            "partial": 0,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+        if fetch_details and selected_records:
+            detail_result = self.fetch_details_for_ids(
+                [record.provider_match_id for record in selected_records],
+                workers=workers or getattr(self.settings, "fotmob_history_workers", 1),
+                refresh_existing=True,
+                execution_mode=execution_mode,
+            )
+            successful_ids = set(detail_result.get("successful_ids", []))
+            for (season_id, _endpoint), records_by_day in season_day_records.items():
+                for day, records in records_by_day.items():
+                    detail_count = len(successful_ids.intersection(records))
+                    run_status = (
+                        "BLOCKED_BY_POLICY"
+                        if detail_result.get("status") == "BLOCKED_BY_POLICY"
+                        else "COMPLETE"
+                        if detail_result.get("status") in {"PASS", "SKIPPED"}
+                        else "PARTIAL"
+                    )
+                    self.store.record_daily_load_run(
+                        day,
+                        target_league,
+                        season_id=season_id,
+                        status=run_status,
+                        fixture_count=len(records),
+                        selected_count=len(records),
+                        detail_count=detail_count,
+                        payload_hash=None,
+                    )
+        detail_status = str(detail_result.get("status") or "SKIPPED")
+        if season_errors or detail_status in {"PARTIAL", "ERROR", "BLOCKED_BY_POLICY"}:
+            status = "PARTIAL" if detail_status != "BLOCKED_BY_POLICY" else "BLOCKED_BY_POLICY"
+        else:
+            status = "PASS"
+        country_code = str(discovery.country or "").strip().upper() or None
+        country_names = {
+            "GER": "Deutschland",
+            "DEU": "Deutschland",
+            "AUT": "Österreich",
+            "ENG": "England",
+            "ESP": "Spanien",
+            "FRA": "Frankreich",
+            "ITA": "Italien",
+            "NED": "Niederlande",
+        }
+        return {
+            "status": status,
+            "from_date": start.isoformat(),
+            "to_date": end.isoformat(),
+            "league_id": target_league,
+            "league_name": discovery.league_name,
+            "country": discovery.country,
+            "country_code": country_code,
+            "country_name": country_names.get(country_code or "", discovery.country),
+            "days": day_count,
+            "seasons": indexed_seasons,
+            "fixtures": len(selected_records),
+            "daily_index_rows": len(selected_records),
+            "details": detail_result,
+            "errors": season_errors,
+            "error": detail_result.get("error") if detail_status == "BLOCKED_BY_POLICY" else None,
             "access": getattr(self.client, "metrics_snapshot", lambda: {})(),
         }
 

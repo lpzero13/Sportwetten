@@ -26,6 +26,7 @@ from storage.database import Database
 
 
 ARCHIVE_SCHEMA_VERSION = "tipico_snapshot_v1"
+STRATEGY_ARCHIVE_SCHEMA_VERSION = "tipico_strategy_snapshots_v2"
 
 
 def _field(name: str, type_: Any, *, nullable: bool = True) -> Any:
@@ -85,6 +86,56 @@ SNAPSHOT_SCHEMA = (
             _field("reopen_delay_seconds", pa.float64()),
             _field("raw_payload_path", pa.string()),
             _field("payload_hash", pa.string()),
+        ]
+    )
+    if pa is not None
+    else None
+)
+
+
+STRATEGY_SCHEMA = (
+    pa.schema(
+        [
+            _field("schema_version", pa.string(), nullable=False),
+            _field("parser_version", pa.string(), nullable=False),
+            _field("internal_match_id", pa.string()),
+            _field("tipico_event_id", pa.string(), nullable=False),
+            _field("snapshot_id", pa.int64(), nullable=False),
+            _field("snapshot_type", pa.string(), nullable=False),
+            _field("captured_at", pa.string(), nullable=False),
+            _field("strategy_type", pa.string()),
+            _field("strategy_status", pa.string()),
+            _field("strategy_label", pa.string()),
+            _field("strategy_version", pa.string()),
+            _field("normalizer_version", pa.string()),
+            _field("probability_status", pa.string()),
+            _field("score_home", pa.int64()),
+            _field("score_away", pa.int64()),
+            _field("minute", pa.int64()),
+            _field("period", pa.string()),
+            _field("q0_best", pa.float64()),
+            _field("q0_market_id", pa.string()),
+            _field("q0_outcome_id", pa.string()),
+            _field("q0_market_type", pa.string()),
+            _field("q0_source_label", pa.string()),
+            _field("q2_plus_best", pa.float64()),
+            _field("q2_plus_market_id", pa.string()),
+            _field("q2_plus_outcome_id", pa.string()),
+            _field("q2_plus_market_type", pa.string()),
+            _field("q2_plus_source_label", pa.string()),
+            _field("market_p0", pa.float64()),
+            _field("market_p1", pa.float64()),
+            _field("market_p2_plus", pa.float64()),
+            _field("p1_break_even", pa.float64()),
+            _field("p1_buffer", pa.float64()),
+            _field("win_roi", pa.float64()),
+            _field("covered_payout", pa.float64()),
+            _field("covered_profit", pa.float64()),
+            _field("stake_total", pa.float64()),
+            _field("stake_zero", pa.float64()),
+            _field("stake_two_plus", pa.float64()),
+            _field("payout_zero", pa.float64()),
+            _field("payout_two_plus", pa.float64()),
         ]
     )
     if pa is not None
@@ -168,6 +219,85 @@ def _relevant_markets(analysis: MarketAnalysis | None) -> str:
     return json.dumps(selected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _internal_match_id(event_id: str) -> str:
+    """Keep the strategy archive join key identical to ``fotmob.storage``."""
+
+    digest = hashlib.sha256(f"TIPICO:{event_id}".encode("utf-8")).hexdigest()[:24]
+    return f"match_{digest}"
+
+
+def _snapshot_period(snapshot_type: Any, minute: Any) -> str:
+    kind = str(snapshot_type or "").upper()
+    if kind == "PRE_KICKOFF":
+        return "PRE_MATCH"
+    if kind in {"HALFTIME", "HT_STABLE"}:
+        return "FIRST_HALF"
+    try:
+        value = int(minute)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    return "FIRST_HALF" if value <= 45 else "SECOND_HALF"
+
+
+def build_strategy_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Project an outbox snapshot onto ``tipico_strategy_snapshots_v2``."""
+
+    source = dict(payload)
+    event_id = str(source.get("tipico_event_id") or source.get("event_id") or "")
+    q0 = source.get("q0_best", source.get("q_zero_best"))
+    q2 = source.get("q2_plus_best", source.get("q_two_plus_best"))
+    payout_zero = source.get("payout_zero")
+    payout_two = source.get("payout_two_plus")
+    covered_payout = None
+    if payout_zero is not None and payout_two is not None:
+        try:
+            covered_payout = min(float(payout_zero), float(payout_two))
+        except (TypeError, ValueError):
+            covered_payout = None
+    return {
+        "schema_version": STRATEGY_ARCHIVE_SCHEMA_VERSION,
+        "parser_version": "tipico_strategy_archive_v2",
+        "internal_match_id": source.get("internal_match_id") or _internal_match_id(event_id),
+        "tipico_event_id": event_id,
+        "snapshot_id": int(source.get("snapshot_id") or 0),
+        "snapshot_type": source.get("snapshot_type"),
+        "captured_at": source.get("captured_at"),
+        "strategy_type": source.get("strategy_type") or "ZERO_OR_2PLUS",
+        "strategy_status": source.get("strategy_status"),
+        "strategy_label": source.get("strategy_label"),
+        "strategy_version": source.get("strategy_version"),
+        "normalizer_version": source.get("normalizer_version"),
+        "probability_status": source.get("probability_status"),
+        "score_home": source.get("score_home"),
+        "score_away": source.get("score_away"),
+        "minute": source.get("match_minute"),
+        "period": source.get("period") or _snapshot_period(source.get("snapshot_type"), source.get("match_minute")),
+        "q0_best": q0,
+        "q0_market_id": source.get("q0_market_id") or source.get("q_zero_market_id"),
+        "q0_outcome_id": source.get("q0_outcome_id") or source.get("q_zero_outcome_id"),
+        "q0_market_type": source.get("q0_market_type") or source.get("q_zero_source_type"),
+        "q0_source_label": source.get("q0_source_label"),
+        "q2_plus_best": q2,
+        "q2_plus_market_id": source.get("q2_plus_market_id") or source.get("q_two_plus_market_id"),
+        "q2_plus_outcome_id": source.get("q2_plus_outcome_id") or source.get("q_two_plus_outcome_id"),
+        "q2_plus_market_type": source.get("q2_plus_market_type") or source.get("q_two_plus_source_type"),
+        "q2_plus_source_label": source.get("q2_plus_source_label"),
+        "market_p0": source.get("market_p0", source.get("p0_market")),
+        "market_p1": source.get("market_p1", source.get("p1_market")),
+        "market_p2_plus": source.get("market_p2_plus", source.get("p2plus_market")),
+        "p1_break_even": source.get("p1_break_even"),
+        "p1_buffer": source.get("p1_buffer"),
+        "win_roi": source.get("win_roi"),
+        "covered_payout": source.get("covered_payout", covered_payout),
+        "covered_profit": source.get("covered_profit"),
+        "stake_total": source.get("stake_total"),
+        "stake_zero": source.get("stake_zero"),
+        "stake_two_plus": source.get("stake_two_plus"),
+        "payout_zero": payout_zero,
+        "payout_two_plus": payout_two,
+    }
+
+
 def build_snapshot_payload(
     details: EventDetails,
     analysis: MarketAnalysis | None,
@@ -198,6 +328,8 @@ def build_snapshot_payload(
     probability = analysis.probability if analysis is not None else None
     payload: dict[str, Any] = {
         "schema_version": ARCHIVE_SCHEMA_VERSION,
+        "internal_match_id": _internal_match_id(str(event.event_id)),
+        "tipico_event_id": str(event.event_id),
         "snapshot_id": int(snapshot.snapshot_id or 0),
         "event_id": str(event.event_id),
         "competition_id": str(event.competition_id) if event.competition_id is not None else None,
@@ -225,10 +357,20 @@ def build_snapshot_payload(
         "q_zero_source_type": zero.raw_market_type if zero is not None else None,
         "q_zero_market_id": zero.market_id if zero is not None else None,
         "q_zero_outcome_id": zero.outcome_id if zero is not None else None,
+        "q0_best": zero.odds if zero is not None else None,
+        "q0_market_id": zero.market_id if zero is not None else None,
+        "q0_outcome_id": zero.outcome_id if zero is not None else None,
+        "q0_market_type": zero.raw_market_type if zero is not None else None,
+        "q0_source_label": strategy.source_zero if strategy is not None else (zero.source_label if zero is not None else None),
         "q_two_plus_best": two.odds if two is not None else None,
         "q_two_plus_source_type": two.raw_market_type if two is not None else None,
         "q_two_plus_market_id": two.market_id if two is not None else None,
         "q_two_plus_outcome_id": two.outcome_id if two is not None else None,
+        "q2_plus_best": two.odds if two is not None else None,
+        "q2_plus_market_id": two.market_id if two is not None else None,
+        "q2_plus_outcome_id": two.outcome_id if two is not None else None,
+        "q2_plus_market_type": two.raw_market_type if two is not None else None,
+        "q2_plus_source_label": strategy.source_two_plus if strategy is not None else (two.source_label if two is not None else None),
         "remaining_under_05": _quote_at(
             analysis, "REMAINING_TOTAL_UNDER", 0.5, fallback_types=("MATCH_TOTAL_UNDER",)
         ),
@@ -247,6 +389,24 @@ def build_snapshot_payload(
         "p1_break_even": strategy.p1_max if strategy is not None else None,
         "p1_buffer": strategy.p1_buffer if strategy is not None else None,
         "win_roi": strategy.win_roi if strategy is not None else None,
+        "strategy_type": strategy.strategy_type if strategy is not None else None,
+        "strategy_status": strategy.status if strategy is not None else None,
+        "strategy_label": strategy.label if strategy is not None else None,
+        "probability_status": probability.status if probability is not None else None,
+        "covered_payout": (
+            min(strategy.payout_zero, strategy.payout_two_plus)
+            if strategy is not None
+            and strategy.payout_zero is not None
+            and strategy.payout_two_plus is not None
+            else None
+        ),
+        "covered_profit": strategy.covered_profit if strategy is not None else None,
+        "stake_total": strategy.total_stake if strategy is not None else None,
+        "stake_zero": strategy.stake_zero if strategy is not None else None,
+        "stake_two_plus": strategy.stake_two_plus if strategy is not None else None,
+        "payout_zero": strategy.payout_zero if strategy is not None else None,
+        "payout_two_plus": strategy.payout_two_plus if strategy is not None else None,
+        "period": _snapshot_period(snapshot.snapshot_type, snapshot.match_minute),
         "normalizer_version": analysis.normalized_outcomes[0].normalizer_version
         if analysis is not None and analysis.normalized_outcomes else None,
         "strategy_version": strategy.strategy_version if strategy is not None else None,
@@ -266,6 +426,7 @@ class ParquetArchive:
     def __init__(self, root: Path | str, *, compression: str = "zstd", logger: logging.Logger | None = None) -> None:
         self.root = Path(root)
         self.snapshot_root = self.root / "tipico" / "snapshots"
+        self.strategy_root = self.root / "tipico" / "strategy"
         self.compression = str(compression or "zstd").lower()
         self.logger = logger or logging.getLogger("tipico")
         self._lock = threading.RLock()
@@ -356,6 +517,32 @@ class ParquetArchive:
         except OSError:
             pass
 
+    def _write_strategy_table(self, path: Path, rows: list[Mapping[str, Any]]) -> None:
+        if pa is None or pq is None or STRATEGY_SCHEMA is None:
+            raise RuntimeError("pyarrow is required for Parquet strategy export")
+        records = [build_strategy_payload(row) for row in rows]
+        temporary = path.with_name(path.name + ".tmp")
+        if temporary.exists():
+            temporary.unlink()
+        table = pa.Table.from_pylist(records, schema=STRATEGY_SCHEMA)
+        pq.write_table(
+            table,
+            temporary,
+            compression="zstd" if self.compression in {"zstd", "zst"} else self.compression,
+            use_dictionary=True,
+        )
+        with temporary.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+        try:
+            directory_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+
     def _file_matches(self, path: Path, snapshot_ids: set[int]) -> bool:
         if pa is None or pq is None or not path.exists():
             return False
@@ -385,10 +572,22 @@ class ParquetArchive:
                 partition.mkdir(parents=True, exist_ok=True)
                 filename = f"tipico_snapshots_{date_text}_{self._batch_hash(date_rows)}.parquet"
                 path = partition / filename
+                strategy_partition = (
+                    self.strategy_root
+                    / f"year={date_text[:4]}"
+                    / f"month={date_text[5:7]}"
+                    / f"date={date_text}"
+                )
+                strategy_partition.mkdir(parents=True, exist_ok=True)
+                strategy_path = strategy_partition / (
+                    f"tipico_strategy_{date_text}_{self._batch_hash(date_rows)}.parquet"
+                )
                 try:
+                    records = [json.loads(str(row["payload_json"])) for row in date_rows]
                     if not self._file_matches(path, ids):
-                        records = [json.loads(str(row["payload_json"])) for row in date_rows]
                         self._write_table(path, records)
+                    if not self._file_matches(strategy_path, ids):
+                        self._write_strategy_table(strategy_path, records)
                     stamp = datetime.now(timezone.utc).isoformat()
                     exported += database.mark_snapshots_exported(ids, str(path), stamp)
                     database.delete_exported_snapshot_outbox()
@@ -427,5 +626,16 @@ class ParquetArchive:
             path = partition / name
             if not self._file_matches(path, {int(row["snapshot_id"]) for row in date_rows}):
                 self._write_table(path, date_rows)
+            strategy_partition = (
+                self.strategy_root
+                / f"year={date_text[:4]}"
+                / f"month={date_text[5:7]}"
+                / f"date={date_text}"
+            )
+            strategy_partition.mkdir(parents=True, exist_ok=True)
+            strategy_name = f"tipico_strategy_migration_{date_text}_{hashlib.sha256(value.encode()).hexdigest()[:16]}.parquet"
+            strategy_path = strategy_partition / strategy_name
+            if not self._file_matches(strategy_path, {int(row["snapshot_id"]) for row in date_rows}):
+                self._write_strategy_table(strategy_path, date_rows)
             files.append(str(path))
         return {"files": files, "rows": len(rows)}

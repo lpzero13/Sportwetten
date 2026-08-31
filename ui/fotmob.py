@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -207,6 +209,7 @@ def render_fotmob_debug(service: FotMobService) -> None:
         f"Einzelspiel: {'AN' if metrics['manual_use_allowed'] else 'AUS'} · "
         f"Worker: {'AN' if metrics['automated_worker_allowed'] else 'AUS'}"
     )
+    _render_historical_date_loader(service)
     st.subheader("FotMob Access")
     st.write(
         {
@@ -255,3 +258,99 @@ def render_fotmob_debug(service: FotMobService) -> None:
         )
     else:
         st.info("Noch keine FotMob-Matches verknüpft.")
+
+
+def _render_historical_date_loader(service: FotMobService) -> None:
+    """Render the intentionally small V0.5.4 date-range import control."""
+
+    st.subheader("FotMob-Historie laden")
+    st.caption(
+        "Bundesliga · Deutschland · Tagesauswahl nach FotMob-UTC-Datum. "
+        "Die Auswahl schreibt den Fixture-Index in SQLite und die Detaildaten "
+        "in das kanonische Parquet-Archiv."
+    )
+    munich_today = datetime.now(ZoneInfo("Europe/Berlin")).date()
+    default_from = munich_today - timedelta(days=7)
+    with st.form("fotmob-date-range-form", clear_on_submit=False):
+        columns = st.columns(2)
+        start_date = columns[0].date_input(
+            "Von",
+            value=default_from,
+            key="fotmob-history-from-date",
+        )
+        end_date = columns[1].date_input(
+            "Bis",
+            value=munich_today,
+            key="fotmob-history-to-date",
+        )
+        submitted = st.form_submit_button(
+            "FotMob-Daten laden",
+            type="primary",
+            width="stretch",
+        )
+    if submitted:
+        try:
+            with st.spinner("FotMob-Tagesdaten werden geladen …"):
+                result = service.history_pipeline.load_date_range(
+                    start_date,
+                    end_date,
+                    league_id=service.settings.fotmob_history_league_id,
+                    fetch_details=True,
+                    workers=service.settings.fotmob_history_workers,
+                    execution_mode="manual",
+                )
+            st.session_state["fotmob_last_date_load"] = result
+        except (TypeError, ValueError, OSError, RuntimeError) as exc:
+            st.session_state["fotmob_last_date_load"] = {
+                "status": "ERROR",
+                "error": str(exc),
+            }
+
+    last_result = st.session_state.get("fotmob_last_date_load")
+    if isinstance(last_result, dict):
+        status = str(last_result.get("status", ""))
+        if status == "PASS":
+            st.success(
+                f"FotMob abgeschlossen: {last_result.get('fixtures', 0)} Spiele "
+                f"für {last_result.get('from_date', '—')} bis {last_result.get('to_date', '—')}."
+            )
+        elif status == "BLOCKED_BY_POLICY":
+            st.warning(str(last_result.get("error") or "FotMob-Historie ist durch die Konfiguration blockiert."))
+        else:
+            st.warning(
+                f"FotMob-Lauf {status or 'FEHLER'}: "
+                f"{last_result.get('error') or '; '.join(last_result.get('errors', [])) or 'siehe Details'}"
+            )
+        details = last_result.get("details") or {}
+        detail_columns = st.columns(4)
+        detail_columns[0].metric("Index-Zeilen", last_result.get("daily_index_rows", 0))
+        detail_columns[1].metric("Details komplett", details.get("fetched", 0))
+        detail_columns[2].metric("Period-Stats", details.get("period_stats_rows", 0))
+        detail_columns[3].metric("Schüsse / Events", f"{details.get('shot_rows', 0)} / {details.get('event_rows', 0)}")
+
+    rows = service.history_pipeline.store.daily_index(
+        league_id=service.settings.fotmob_history_league_id,
+        limit=5000,
+    )
+    if rows:
+        st.caption("Zuletzt gespeicherter FotMob-Tagesindex")
+        st.dataframe(
+            [
+                {
+                    "Datum": row["observation_date"],
+                    "Anstoß UTC": row["kickoff_at_utc"] or "—",
+                    "Land": row["country_name"] or row["country_code"] or "—",
+                    "Liga": row["league_name"] or row["league_id"],
+                    "Season": row["season_label"] or row["season_id"] or "—",
+                    "Spiel": f"{row['home_team_name']} – {row['away_team_name']}",
+                    "FotMob-ID": row["fotmob_match_id"],
+                    "Detail": row["detail_status"] or "NOT_FETCHED",
+                    "Qualität": row["data_quality"] or "—",
+                }
+                for row in rows
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+    else:
+        st.info("Noch kein FotMob-Tagesindex geladen.")

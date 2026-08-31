@@ -691,6 +691,56 @@ CREATE TABLE IF NOT EXISTS fotmob_fixture_index_runs (
 
 CREATE INDEX IF NOT EXISTS idx_fotmob_fixture_index_runs_lookup
     ON fotmob_fixture_index_runs(provider, league_id, fetched_at DESC);
+
+CREATE TABLE IF NOT EXISTS fotmob_daily_index (
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    observation_date TEXT NOT NULL,
+    fotmob_match_id TEXT NOT NULL,
+    league_id TEXT NOT NULL,
+    league_name TEXT,
+    country_code TEXT,
+    country_name TEXT,
+    season_id TEXT,
+    season_label TEXT,
+    kickoff_at_utc TEXT,
+    home_team_id TEXT,
+    home_team_name TEXT NOT NULL,
+    away_team_id TEXT,
+    away_team_name TEXT NOT NULL,
+    round TEXT,
+    match_status TEXT,
+    source_endpoint TEXT,
+    payload_hash TEXT,
+    fetched_at TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (provider, observation_date, fotmob_match_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_date
+    ON fotmob_daily_index(provider, observation_date, league_id, kickoff_at_utc);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_match
+    ON fotmob_daily_index(provider, fotmob_match_id, observation_date);
+
+CREATE TABLE IF NOT EXISTS fotmob_daily_load_runs (
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    observation_date TEXT NOT NULL,
+    league_id TEXT NOT NULL,
+    season_id TEXT,
+    status TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    fixture_count INTEGER NOT NULL DEFAULT 0,
+    selected_count INTEGER NOT NULL DEFAULT 0,
+    detail_count INTEGER NOT NULL DEFAULT 0,
+    payload_hash TEXT,
+    source_endpoint TEXT,
+    error TEXT,
+    PRIMARY KEY (provider, observation_date, league_id, season_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_daily_load_runs_date
+    ON fotmob_daily_load_runs(provider, observation_date, league_id, status);
 """
 
 
@@ -2936,6 +2986,8 @@ class Database:
             "fotmob_history_samples",
             "fotmob_historical_archive_index",
             "fotmob_fixture_index_runs",
+            "fotmob_daily_index",
+            "fotmob_daily_load_runs",
         }
         if table not in allowed:
             raise ValueError(f"Unsupported table: {table}")

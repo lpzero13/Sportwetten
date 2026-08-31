@@ -88,6 +88,27 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--limit", type=int)
     fetch.add_argument("--batch-size", type=int)
 
+    dates = subparsers.add_parser(
+        "dates",
+        help="FotMob-Tagesdaten für einen inklusiven Von-/Bis-Bereich laden",
+    )
+    _add_root(dates)
+    dates.add_argument("--from-date", required=True, help="Startdatum YYYY-MM-DD")
+    dates.add_argument("--to-date", required=True, help="Enddatum YYYY-MM-DD")
+    dates.add_argument(
+        "--league",
+        "--league-id",
+        dest="league_id",
+        default=None,
+        help="FotMob-Liga (Standard aus FOTMOB_HISTORY_LEAGUE_ID, aktuell 54)",
+    )
+    dates.add_argument("--workers", type=int)
+    dates.add_argument(
+        "--index-only",
+        action="store_true",
+        help="Nur Datum/Land/Liga/Match-Index laden, keine Matchdetails abrufen",
+    )
+
     return parser
 
 
@@ -185,6 +206,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "automated_usage": settings.fotmob_automated_usage,
                 },
             }
+
+        if args.command == "dates":
+            return pipeline.load_date_range(
+                args.from_date,
+                args.to_date,
+                league_id=args.league_id,
+                fetch_details=not args.index_only,
+                workers=args.workers or settings.fotmob_history_workers,
+                execution_mode="manual",
+            )
 
         season = _resolve_season(pipeline, args)
         if season is None and not getattr(args, "season_selector", None) and not getattr(args, "season_id_override", None):

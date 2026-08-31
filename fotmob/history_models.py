@@ -10,12 +10,19 @@ FOTMOB_HISTORICAL_SCHEMA_VERSION = "fotmob_historical_v1"
 FOTMOB_HISTORICAL_PARSER_VERSION = "fotmob_historical_parser_v1"
 FOTMOB_DETAIL_STATUSES = ("NOT_FETCHED", "IN_PROGRESS", "FETCHED", "PARTIAL", "FAILED")
 FOTMOB_DATA_QUALITY = ("COMPLETE", "PARTIAL", "SCORE_ONLY", "INVALID")
-FOTMOB_SOURCE_TYPES = ("FRESH_INDEX", "FRESH_FETCH", "LEGACY_IMPORT", "LEGACY_VALIDATED")
+FOTMOB_SOURCE_TYPES = (
+    "FRESH_INDEX",
+    "FRESH_FETCH",
+    "LEGACY_IMPORT",
+    "LEGACY_VALIDATED",
+    "LIVE_HT",
+)
 FOTMOB_SOURCE_PRIORITY = {
     "FRESH_INDEX": 0,
     "LEGACY_IMPORT": 10,
     "LEGACY_VALIDATED": 20,
     "FRESH_FETCH": 30,
+    "LIVE_HT": 40,
 }
 
 
@@ -160,6 +167,8 @@ def historical_row_from_match(
         "ht_away": match.ht_score_away,
         "ft_home": match.score_home,
         "ft_away": match.score_away,
+        "ht_score_source": getattr(match, "ht_score_source", None),
+        "ft_score_source": getattr(match, "ft_score_source", None),
         "second_half_goals": second_half_goals,
         "second_half_goal_class": goal_class,
         "ht_extra_stats_json": ht_stats.extra_stats if ht_stats is not None else {},

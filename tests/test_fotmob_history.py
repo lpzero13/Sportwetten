@@ -357,7 +357,11 @@ def test_history_pipeline_fetches_sample_in_batches_and_is_resumable(tmp_path: P
     assert first["fetched"] == 5
     assert first["failed"] == 0
     assert len(client.calls) == 5
-    assert database.count_rows("fotmob_historical_archive_index") == 5
+    assert database.count_rows("fotmob_historical_archive_index") == 10
+    assert database.connection.execute(
+        "SELECT COUNT(*) FROM fotmob_historical_archive_index WHERE schema_version = ?",
+        (FOTMOB_HISTORICAL_SCHEMA_VERSION,),
+    ).fetchone()[0] == 5
     assert first["progress"]["target"] == 5
     assert first["progress"]["fraction"] == 1.0
     assert first["eta_seconds"] is None
@@ -377,7 +381,7 @@ def test_history_pipeline_fetches_sample_in_batches_and_is_resumable(tmp_path: P
     assert second["status"] == "PASS"
     assert second["processed"] == 0
     assert len(client.calls) == 5
-    assert database.count_rows("fotmob_historical_archive_index") == 5
+    assert database.count_rows("fotmob_historical_archive_index") == 10
     database.close()
 
 

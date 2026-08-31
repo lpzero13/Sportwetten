@@ -83,6 +83,9 @@ class FotMobEvent:
     minute: int | None = None
     added_time: int | None = None
     team: str | None = None
+    team_id: str | None = None
+    is_home: bool | None = None
+    player_id: str | None = None
     player: str | None = None
     detail: str | None = None
     score_home: int | None = None
@@ -116,8 +119,11 @@ class FotMobMatch:
     score_away: int | None = None
     ht_score_home: int | None = None
     ht_score_away: int | None = None
+    ht_score_source: str | None = None
+    ft_score_source: str | None = None
     stats: FotMobStats = field(default_factory=FotMobStats)
     ht_stats: FotMobStats | None = None
+    second_half_stats: FotMobStats | None = None
     ht_stats_available: bool = False
     events: list[FotMobEvent] = field(default_factory=list)
     extra_data: dict[str, Any] = field(default_factory=dict)

@@ -83,15 +83,21 @@ def test_snapshot_slot_is_idempotent_and_exports_to_parquet(tmp_path: Path) -> N
     assert export["snapshots_exported"] == 1
     assert database.count_rows("snapshot_outbox") == 0
     files = list((tmp_path / "archive").rglob("*.parquet"))
-    assert len(files) == 1
+    assert len(files) == 2
     import pyarrow.parquet as pq
 
-    rows = pq.read_table(files[0]).to_pylist()
+    snapshot_file = next(path for path in files if "snapshots" in path.parts)
+    strategy_file = next(path for path in files if "strategy" in path.parts)
+    rows = pq.read_table(snapshot_file).to_pylist()
     assert len(rows) == 1
     assert rows[0]["snapshot_id"] == first_id
     assert rows[0]["schema_version"] == "tipico_snapshot_v1"
     assert rows[0]["event_id"] == details.event.event_id
     assert rows[0]["q_zero_best"] == payload["q_zero_best"]
+    strategy_rows = pq.read_table(strategy_file).to_pylist()
+    assert strategy_rows[0]["tipico_event_id"] == details.event.event_id
+    assert strategy_rows[0]["market_p1"] == payload["p1_market"]
+    assert strategy_rows[0]["p1_buffer"] == payload["p1_buffer"]
     database.close()
 
 

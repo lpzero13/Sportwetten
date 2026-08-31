@@ -261,6 +261,46 @@ Der Status bleibt `PARTIAL`, solange die bereitgestellte Tipico-Historie
 weniger als die geforderten 20 echten deutschen Bundesliga-Events enthält;
 fehlende Events werden nicht künstlich erzeugt.
 
+### FotMob Canonical Archive und Tagesauswahl (V0.5.4)
+
+V0.5.4 stellt im Bereich **Data / Debug → FotMob** ausschließlich die
+Datumsauswahl **Von/Bis** bereit. Die Auswahl ist inklusiv und wird nach dem
+FotMob-UTC-Datum ausgewertet. Für die konfigurierte Liga (Standard: FotMob
+`54`, Bundesliga) werden die Saison-/Fixture-Seiten einmal je relevanter
+Saison gelesen. Danach stehen Datum, Land, Liga, Saison, Anstoß, Teams und
+FotMob-Match-ID im SQLite-Tagesindex; die Detaildaten werden nicht als große
+Statistik-Historie in SQLite abgelegt, sondern kanonisch in Parquet.
+
+Pro Lauf werden auch Tage ohne Spiel als `fotmob_daily_load_runs` festgehalten.
+Ein erneuter Lauf ist idempotent: bereits frisch geladene Matchdetails werden
+nicht nochmals abgerufen, die deterministischen Match-Parquet-Dateien werden
+bei einer echten Aktualisierung ersetzt. Die wichtigsten Dateien liegen unter:
+
+~~~text
+/var/lib/wetten/archive/fotmob/match_core/
+/var/lib/wetten/archive/fotmob/period_stats/
+/var/lib/wetten/archive/fotmob/shots/
+/var/lib/wetten/archive/fotmob/events/
+/var/lib/wetten/archive/fotmob/ht_snapshots/
+/var/lib/wetten/archive/tipico/strategy/
+~~~
+
+Manuell per CLI ist derselbe Bereich so startbar:
+
+~~~powershell
+$env:FOTMOB_ENABLED="true"
+$env:FOTMOB_HISTORY_ENABLED="true"
+$env:FOTMOB_NETWORK_MODE="manual"
+python scripts/fotmob_history.py dates --from-date 2025-08-22 --to-date 2025-08-31 --root .
+# optional nur Datum/Land/Liga/Match indexieren:
+python scripts/fotmob_history.py dates --from-date 2025-08-22 --to-date 2025-08-31 --index-only --root .
+~~~
+
+Die Container-Vorlage aktiviert genau diese manuellen Date-Jobs. Der separate
+`wetten-fotmob.service` bleibt deaktiviert, damit kein dauerhafter FotMob-
+Poller gestartet wird. Der technische Laufstatus wird in
+`outputs/V054_STATUS.md` dokumentiert.
+
 ### Paper Trading
 
 Paper Trading arbeitet vollständig ohne Wettschein und ohne Wettabgabe. Im
@@ -321,7 +361,7 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | COLLECTOR_RETRY_DELAYS_SECONDS | 1,3,10 | Retry-Verzögerungen |
 | MAX_LIVE_ODDS_AGE_SECONDS | 10 | Freshness-Grenze für Live-Quoten |
 | DEFAULT_TOTAL_STAKE_EUR | 30 | Default-Einsatz für Szenarien |
-| FOTMOB_ENABLED | false | optionales FotMob-Enrichment und Worker; Historical-CLI benötigt zusätzlich `FOTMOB_HISTORY_ENABLED` |
+| FOTMOB_ENABLED | false | FotMob-Funktion; Proxmox-Vorlage setzt für die explizite Datumsauswahl `true` |
 | FOTMOB_API_BASE_URL | https://www.fotmob.com/api | Legacy-/Kompatibilitätsbasis für ausdrücklich konfigurierte alte API-Pfade |
 | FOTMOB_MATCH_DETAILS_PATH | /match/{match_id} | öffentliche Match-Details-Seite mit eingebettetem Next.js-Payload |
 | FOTMOB_TIMEOUT_SECONDS | 10 | FotMob-Timeout |
@@ -343,6 +383,9 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | FOTMOB_HISTORY_MAX_RETRY_ATTEMPTS | 3 | maximale Detailversuche je Match |
 | FOTMOB_HISTORY_BATCH_SIZE | 100 | Parquet-Batchgröße |
 | STORE_FOTMOB_HISTORICAL_RAW | false | optionales zstd-Raw nur für Historical-Details |
+| FOTMOB_ARCHIVE_ROOT | leer | kanonischer FotMob-Parquet-Root, Proxmox: `/var/lib/wetten/archive/fotmob` |
+| FOTMOB_HISTORY_LEAGUE_ID | 54 | konfigurierte FotMob-Liga für die Datumsauswahl |
+| FOTMOB_HT_ENRICHMENT_ENABLED | true | separates Live-HZ-Enrichment; kein permanenter Historien-Poller |
 
 Die verifizierten Tipico-Endpunkte stehen in outputs/DISCOVERY.md. Die FotMob-
 Discovery, Abschlussvalidierung und Providerentscheidung stehen in
@@ -367,7 +410,9 @@ Paper-Trades, Settlements, Ledger, Match Results und Paper-Entry-Raw bleiben erh
 
 - SQLite: data/tipico.db
 - Parquet: data/archive/tipico/snapshots/year=YYYY/month=MM/date=YYYY-MM-DD/
+- Tipico-Strategie-Parquet: data/archive/tipico/strategy/year=YYYY/month=MM/date=YYYY-MM-DD/
 - FotMob-Parquet: data/archive/fotmob/snapshots/year=YYYY/month=MM/date=YYYY-MM-DD/
+- FotMob-kanonisch: data/archive/fotmob/{match_core,period_stats,shots,events,ht_snapshots}/
 - FotMob-Historical-Parquet: data/archive/fotmob/historical/league_id=.../season=...
 - Raw-JSON: data/raw/YYYY-MM-DD/ (Debug und Paper-Entry, je nach Kompression)
 - FotMob-Historical-Raw: data/raw/fotmob/historical/league_id=.../season=.../ (optional)
@@ -388,7 +433,8 @@ und `paper_worker_runs` sowie die optionalen V0.5-Tabellen `matches`,
 `competition_provider_aliases`, `fotmob_current_state`, `fotmob_snapshots`,
 `fotmob_snapshot_outbox`, `fotmob_seasons`, `fotmob_match_index`,
 `fotmob_history_samples`, `fotmob_historical_archive_index` und
-`match_data_quality`. `current_event_state`, `current_canonical_outcomes` und
+`fotmob_daily_index`, `fotmob_daily_load_runs`, `match_data_quality`.
+`current_event_state`, `current_canonical_outcomes` und
 `current_strategy_evaluations` sind ersetzbare Betriebsdaten. `snapshots` ist
 die kurze SQLite-Staging-/Indexschicht; die historische Zeile wird als flache
 Parquet-Zeile mit `schema_version` archiviert. `market_presence`, `odds_history`
@@ -412,7 +458,10 @@ Export und die Trennung von UI-Refresh und Historie.
 Die V0.5.2-Tests prüfen echte Season-ID-Übernahme ohne Hardcoding,
 deduplizierte Matchindexierung, deterministisches Sampling, nullable
 HT-/FT-Normalisierung, Zielklassen, Queue-Claims/Retry/Stale-Recovery,
-Policy-Gating und resumierbare zstd-Parquet-Batches.
+Policy-Gating und resumierbare zstd-Parquet-Batches. Die V0.5.4-Tests prüfen
+die kanonischen Core-/Period-/Shot-/Event-Datasets, die Datumsauswahl, Land-
+und Liga-Metadaten, idempotente Wiederholung und das getrennte Tipico-
+Strategie-Parquet.
 
 Der reproduzierbare Live-Smoke-Test ruft den aktuellen Feed und genau ein Eventdetail ab:
 

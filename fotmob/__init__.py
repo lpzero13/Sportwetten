@@ -14,6 +14,14 @@ from .models import (
     FotMobStats,
 )
 from .parser import parse_fotmob_payload
+from .canonical import (
+    CANONICAL_EVENTS_SCHEMA_VERSION,
+    CANONICAL_HT_SNAPSHOT_SCHEMA_VERSION,
+    CANONICAL_MATCH_CORE_SCHEMA_VERSION,
+    CANONICAL_PERIOD_STATS_SCHEMA_VERSION,
+    CANONICAL_SHOTS_SCHEMA_VERSION,
+    FotMobCanonicalArchive,
+)
 
 __all__ = [
     "FOTMOB_SNAPSHOT_TYPES",
@@ -23,4 +31,10 @@ __all__ = [
     "FotMobSnapshot",
     "FotMobStats",
     "parse_fotmob_payload",
+    "CANONICAL_EVENTS_SCHEMA_VERSION",
+    "CANONICAL_HT_SNAPSHOT_SCHEMA_VERSION",
+    "CANONICAL_MATCH_CORE_SCHEMA_VERSION",
+    "CANONICAL_PERIOD_STATS_SCHEMA_VERSION",
+    "CANONICAL_SHOTS_SCHEMA_VERSION",
+    "FotMobCanonicalArchive",
 ]

@@ -46,7 +46,13 @@ mkdir -p \
     "$INSTALL_DIR/data/raw" \
     "$INSTALL_DIR/data/halftime_reports" \
     "$INSTALL_DIR/logs" \
-    "/var/lib/wetten/archive"
+    "/var/lib/wetten/archive/fotmob/match_core" \
+    "/var/lib/wetten/archive/fotmob/period_stats" \
+    "/var/lib/wetten/archive/fotmob/shots" \
+    "/var/lib/wetten/archive/fotmob/events" \
+    "/var/lib/wetten/archive/fotmob/ht_snapshots" \
+    "/var/lib/wetten/archive/tipico/snapshots" \
+    "/var/lib/wetten/archive/tipico/strategy"
 
 # Quellcode bleibt root-owned; der Dienst erhält Leserechte sowie Schreibrechte
 # ausschließlich für seine Laufzeitdaten und Logs.
@@ -103,8 +109,8 @@ sed \
 systemctl disable --now tipico-observer.service tipico-collector.service 2>/dev/null || true
 
 systemctl daemon-reload
-# FotMob remains installed but intentionally disabled by default.  Start it
-# explicitly only after setting FOTMOB_ENABLED=true in the env file.
+# The V0.5.4 date-range import is started from the dashboard.  Keep the
+# legacy/polling FotMob service disabled; no permanent FotMob worker is needed.
 systemctl disable --now wetten-fotmob.service 2>/dev/null || true
 systemctl enable wetten-ui.service wetten-collector.service wetten-paper.service wetten-cleanup.timer
 systemctl restart wetten-ui.service
