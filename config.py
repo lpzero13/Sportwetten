@@ -108,13 +108,13 @@ SNAPSHOT_85_ENABLED = True
 SNAPSHOT_90_ENABLED = True
 SNAPSHOT_FINAL_ENABLED = True
 
-# FotMob is an optional enrichment source.  It is deliberately disabled by
-# default: Tipico collection, analysis and paper trading must remain fully
-# operational when FotMob is unavailable or not permitted in the deployment.
-FOTMOB_ENABLED = False
+# FotMob date-range loading is enabled in the private deployment.  The
+# network mode is manual, so constructing the app or running the Tipico
+# collector never starts a FotMob worker or makes a background request.
+FOTMOB_ENABLED = True
 FOTMOB_BASE_URL = "https://www.fotmob.com"
 FOTMOB_API_BASE_URL = "https://www.fotmob.com/api"
-FOTMOB_MATCH_DETAILS_PATH = "/match/{match_id}"
+FOTMOB_MATCH_DETAILS_PATH = "/data/matchDetails?matchId={match_id}"
 FOTMOB_POLL_SECONDS = 30
 FOTMOB_TIMEOUT_SECONDS = 10
 FOTMOB_MAX_RETRIES = 3
@@ -133,8 +133,16 @@ FOTMOB_AUTOMATED_USAGE_VALUES = (
 )
 FOTMOB_LEAGUE_PATH = "/leagues/{league_id}"
 FOTMOB_SEASON_PATH = "/leagues/{league_id}?season={season_label}"
-FOTMOB_HISTORY_ENABLED = False
-FOTMOB_HISTORY_WORKERS = 1
+FOTMOB_DAILY_MATCHES_PATH = (
+    "/data/matches?date={date}&timezone={timezone}&ccode3={ccode3}"
+    "&includeNextDayLateNight=true"
+)
+FOTMOB_ALL_LEAGUES_PATH = "/data/allLeagues?locale={locale}&country={country}"
+FOTMOB_DAILY_TIMEZONE = "Europe/Berlin"
+FOTMOB_DAILY_CCODE3 = "DEU"
+FOTMOB_DAILY_LOCALE = "de"
+FOTMOB_HISTORY_ENABLED = True
+FOTMOB_HISTORY_WORKERS = 10
 FOTMOB_HISTORY_REQUESTS_PER_SECOND = 0.5
 FOTMOB_HISTORY_TIMEOUT_SECONDS = 10
 FOTMOB_HISTORY_MAX_RETRIES = 3
@@ -142,7 +150,7 @@ FOTMOB_HISTORY_STALE_MINUTES = 30
 FOTMOB_HISTORY_MAX_RETRY_ATTEMPTS = 3
 FOTMOB_HISTORY_BATCH_SIZE = 100
 STORE_FOTMOB_HISTORICAL_RAW = False
-FOTMOB_NETWORK_MODE = "off"
+FOTMOB_NETWORK_MODE = "manual"
 FOTMOB_NETWORK_MODE_VALUES = ("off", "manual", "worker")
 FOTMOB_ARCHIVE_ROOT = ""
 FOTMOB_HISTORY_LEAGUE_ID = "54"
@@ -211,6 +219,11 @@ class Settings:
     fotmob_automated_usage: str = FOTMOB_AUTOMATED_USAGE
     fotmob_league_path: str = FOTMOB_LEAGUE_PATH
     fotmob_season_path: str = FOTMOB_SEASON_PATH
+    fotmob_daily_matches_path: str = FOTMOB_DAILY_MATCHES_PATH
+    fotmob_all_leagues_path: str = FOTMOB_ALL_LEAGUES_PATH
+    fotmob_daily_timezone: str = FOTMOB_DAILY_TIMEZONE
+    fotmob_daily_ccode3: str = FOTMOB_DAILY_CCODE3
+    fotmob_daily_locale: str = FOTMOB_DAILY_LOCALE
     fotmob_history_enabled: bool = FOTMOB_HISTORY_ENABLED
     fotmob_history_workers: int = FOTMOB_HISTORY_WORKERS
     fotmob_history_requests_per_second: float = FOTMOB_HISTORY_REQUESTS_PER_SECOND
@@ -386,9 +399,27 @@ class Settings:
             ),
             fotmob_league_path=os.getenv("FOTMOB_LEAGUE_PATH", FOTMOB_LEAGUE_PATH),
             fotmob_season_path=os.getenv("FOTMOB_SEASON_PATH", FOTMOB_SEASON_PATH),
+            fotmob_daily_matches_path=os.getenv(
+                "FOTMOB_DAILY_MATCHES_PATH", FOTMOB_DAILY_MATCHES_PATH
+            ),
+            fotmob_all_leagues_path=os.getenv(
+                "FOTMOB_ALL_LEAGUES_PATH", FOTMOB_ALL_LEAGUES_PATH
+            ),
+            fotmob_daily_timezone=os.getenv(
+                "FOTMOB_DAILY_TIMEZONE", FOTMOB_DAILY_TIMEZONE
+            ).strip()
+            or FOTMOB_DAILY_TIMEZONE,
+            fotmob_daily_ccode3=os.getenv(
+                "FOTMOB_DAILY_CCODE3", FOTMOB_DAILY_CCODE3
+            ).strip().upper()
+            or FOTMOB_DAILY_CCODE3,
+            fotmob_daily_locale=os.getenv(
+                "FOTMOB_DAILY_LOCALE", FOTMOB_DAILY_LOCALE
+            ).strip()
+            or FOTMOB_DAILY_LOCALE,
             fotmob_history_enabled=_env_bool("FOTMOB_HISTORY_ENABLED", FOTMOB_HISTORY_ENABLED),
             fotmob_history_workers=min(
-                8,
+                10,
                 _env_int("FOTMOB_HISTORY_WORKERS", FOTMOB_HISTORY_WORKERS),
             ),
             fotmob_history_requests_per_second=max(

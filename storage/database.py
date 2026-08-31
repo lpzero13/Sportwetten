@@ -594,6 +594,8 @@ CREATE TABLE IF NOT EXISTS fotmob_match_index (
     season_label TEXT NOT NULL,
     league_name TEXT,
     country TEXT,
+    country_code TEXT,
+    country_name TEXT,
     kickoff_at TEXT,
     home_team_id TEXT,
     home_team_name TEXT NOT NULL,
@@ -709,6 +711,7 @@ CREATE TABLE IF NOT EXISTS fotmob_daily_index (
     away_team_name TEXT NOT NULL,
     round TEXT,
     match_status TEXT,
+    is_next_day INTEGER NOT NULL DEFAULT 0,
     source_endpoint TEXT,
     payload_hash TEXT,
     fetched_at TEXT NOT NULL,
@@ -723,6 +726,15 @@ CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_date
 CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_match
     ON fotmob_daily_index(provider, fotmob_match_id, observation_date);
 
+CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_country
+    ON fotmob_daily_index(provider, country_code, observation_date, kickoff_at_utc);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_league
+    ON fotmob_daily_index(provider, league_id, observation_date, kickoff_at_utc);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_season
+    ON fotmob_daily_index(provider, season_label, observation_date, kickoff_at_utc);
+
 CREATE TABLE IF NOT EXISTS fotmob_daily_load_runs (
     provider TEXT NOT NULL DEFAULT 'FOTMOB',
     observation_date TEXT NOT NULL,
@@ -733,6 +745,12 @@ CREATE TABLE IF NOT EXISTS fotmob_daily_load_runs (
     fixture_count INTEGER NOT NULL DEFAULT 0,
     selected_count INTEGER NOT NULL DEFAULT 0,
     detail_count INTEGER NOT NULL DEFAULT 0,
+    skipped_no_halftime_count INTEGER NOT NULL DEFAULT 0,
+    feed_group_count INTEGER NOT NULL DEFAULT 0,
+    feed_entry_count INTEGER NOT NULL DEFAULT 0,
+    feed_unique_count INTEGER NOT NULL DEFAULT 0,
+    next_day_count INTEGER NOT NULL DEFAULT 0,
+    duplicates_removed_count INTEGER NOT NULL DEFAULT 0,
     payload_hash TEXT,
     source_endpoint TEXT,
     error TEXT,
@@ -3098,6 +3116,7 @@ class Database:
         snapshot_counts = {str(row["snapshot_type"]): int(row["count"]) for row in snapshot_rows}
         coverage = {str(row["snapshot_type"]): int(row["count"]) for row in coverage_rows}
         return {
+            "date": day,
             "football_events_seen": int(event_row["count"]) if event_row else 0,
             "competitions": int(competition_row["count"]) if competition_row else 0,
             "prematch_snapshots": snapshot_counts.get("PREMATCH", 0),

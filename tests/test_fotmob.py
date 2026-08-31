@@ -338,6 +338,7 @@ def test_service_uses_same_db_and_keeps_current_refresh_out_of_history(tmp_path:
         assert result.success
     assert database.count_rows("events") == 0
     assert service.store.current_state(internal_id) is not None
+    assert service.has_current_state_for_tipico_event("tipico-1") is True
     assert len(service.store.snapshots_for_match(internal_id)) == 0
     database.close()
 

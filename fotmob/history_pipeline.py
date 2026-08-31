@@ -16,11 +16,12 @@ import sqlite3
 import threading
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from config import Settings
 
@@ -31,11 +32,14 @@ from .canonical import (
     FotMobCanonicalArchive,
 )
 from .history_discovery import (
+    extract_catalog_names,
+    extract_daily_match_index,
     extract_league_metadata,
     extract_match_index,
     extract_seasons,
     season_matches_selector,
     select_reproducible_sample,
+    summarize_daily_feed,
 )
 from .history_models import (
     FotMobMatchIndexRecord,
@@ -120,6 +124,13 @@ def _payload_hash(payload: Any) -> str | None:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def has_halftime_data(match: Any) -> bool:
+    """Return true only when FotMob supplied usable FirstHalf metrics."""
+
+    stats = getattr(match, "ht_stats", None)
+    return bool(stats is not None and stats.has_any_value())
+
+
 def _row_to_index(row: Any) -> FotMobMatchIndexRecord:
     return FotMobMatchIndexRecord(
         provider_match_id=str(row["fotmob_match_id"]),
@@ -134,13 +145,16 @@ def _row_to_index(row: Any) -> FotMobMatchIndexRecord:
         round_name=row["round"],
         match_status=row["match_status"],
         league_name=row["league_name"],
-        country=row["country"],
+        country=row["country_name"] or row["country"],
+        country_code=row["country_code"] if "country_code" in row.keys() else None,
+        country_name=row["country_name"] if "country_name" in row.keys() else None,
         first_seen_at=row["first_seen_at"],
         provider=str(row["provider"]),
         source_type=str(row["source_type"] or "FRESH_INDEX"),
         source_context=row["source_context"],
         stats_period=row["stats_period"],
         captured_live=bool(row["captured_live"]),
+        is_next_day=bool(row["is_next_day"]) if "is_next_day" in row.keys() else False,
         field_provenance=(
             json.loads(str(row["field_provenance_json"]))
             if row["field_provenance_json"]
@@ -455,6 +469,7 @@ class FotMobHistoryPipeline:
         workers: int = 1,
         retry_failed: bool = False,
         refresh_existing: bool = False,
+        require_halftime_stats: bool = False,
         execution_mode: str = "manual",
     ) -> dict[str, Any]:
         """Fetch only the fixtures selected by a date-range job.
@@ -472,6 +487,7 @@ class FotMobHistoryPipeline:
                 "failed": 0,
                 "errors": 0,
                 "skipped": 0,
+                "skipped_no_halftime": 0,
                 "canonical_files": [],
                 "historical_files": [],
                 "period_stats_rows": 0,
@@ -482,9 +498,9 @@ class FotMobHistoryPipeline:
                 "error": self._network_error(execution_mode),
             }
         ids = list(dict.fromkeys(str(item) for item in provider_match_ids if str(item).strip()))
-        workers = max(1, min(8, int(workers)))
+        workers = max(1, min(10, int(workers)))
         worker_id = f"daily-{uuid.uuid4().hex[:12]}"
-        fetched_count = partial_count = failed_count = errors = skipped = 0
+        fetched_count = partial_count = failed_count = errors = skipped = skipped_no_halftime = 0
         canonical_files: list[str] = []
         historical_files: list[str] = []
         period_rows = shot_rows = event_rows = archive_bytes = canonical_bytes = 0
@@ -524,7 +540,7 @@ class FotMobHistoryPipeline:
             buffer = []
 
         def handle(result: tuple[Any, FotMobFetchResult | None, str | None] | None) -> None:
-            nonlocal fetched_count, partial_count, failed_count, errors, skipped
+            nonlocal fetched_count, partial_count, failed_count, errors, skipped, skipped_no_halftime
             nonlocal period_rows, shot_rows, event_rows, canonical_bytes
             if result is None:
                 skipped += 1
@@ -540,6 +556,13 @@ class FotMobHistoryPipeline:
                 )
                 if failure_status == "FAILED":
                     failed_count += 1
+                return
+            if require_halftime_stats and not has_halftime_data(fetched.match):
+                skipped_no_halftime += 1
+                self.store.mark_skipped_no_halftime(
+                    str(row["fotmob_match_id"]),
+                    worker_id=worker_id,
+                )
                 return
             try:
                 canonical = self._write_canonical(
@@ -584,7 +607,7 @@ class FotMobHistoryPipeline:
                     )
                     for provider_match_id in ids
                 ]
-                for future in futures:
+                for future in as_completed(futures):
                     handle(future.result())
             flush()
         finally:
@@ -597,6 +620,7 @@ class FotMobHistoryPipeline:
             "failed": failed_count,
             "errors": errors,
             "skipped": skipped,
+            "skipped_no_halftime": skipped_no_halftime,
             "canonical_files": sorted(set(canonical_files)),
             "historical_files": sorted(set(historical_files)),
             "period_stats_rows": period_rows,
@@ -627,7 +651,7 @@ class FotMobHistoryPipeline:
                 "season_id": str(season_id),
                 "error": self._network_error(execution_mode),
             }
-        workers = max(1, min(8, int(workers)))
+        workers = max(1, min(10, int(workers)))
         batch_size = max(1, int(batch_size or self.settings.fotmob_history_batch_size))
         worker_id = f"history-{uuid.uuid4().hex[:12]}"
         target_rows = self.store.match_index(
@@ -819,6 +843,256 @@ class FotMobHistoryPipeline:
         # never silently included.
         return date(first, 7, 1), date(second, 6, 30)
 
+    def _daily_feed_endpoint(self, observation_date: date) -> str:
+        return self._endpoint(
+            getattr(
+                self.settings,
+                "fotmob_daily_matches_path",
+                "/data/matches?date={date}&timezone={timezone}&ccode3={ccode3}"
+                "&includeNextDayLateNight=true",
+            ),
+            date=observation_date.strftime("%Y%m%d"),
+            timezone=quote(
+                str(getattr(self.settings, "fotmob_daily_timezone", "Europe/Berlin")),
+                safe="",
+            ),
+            ccode3=quote(
+                str(getattr(self.settings, "fotmob_daily_ccode3", "DEU")),
+                safe="",
+            ),
+        )
+
+    def _all_leagues_date_range(
+        self,
+        start: date,
+        end: date,
+        *,
+        fetch_details: bool,
+        workers: int | None,
+        execution_mode: str,
+    ) -> dict[str, Any]:
+        """Load every match returned by FotMob's selected-day feed."""
+
+        day_count = (end - start).days + 1
+        scope_league = "ALL"
+        scope_season = "DAILY_FEED"
+        daily_records: dict[str, list[FotMobMatchIndexRecord]] = {}
+        daily_feed_summaries: dict[str, dict[str, int]] = {}
+        unique_records: dict[str, FotMobMatchIndexRecord] = {}
+        index_errors: list[str] = []
+        failed_days: set[str] = set()
+        warnings: list[str] = []
+        country_names: dict[str, str] = {}
+        league_names: dict[str, str] = {}
+
+        catalog_endpoint = self._endpoint(
+            getattr(
+                self.settings,
+                "fotmob_all_leagues_path",
+                "/data/allLeagues?locale={locale}&country={country}",
+            ),
+            locale=quote(str(getattr(self.settings, "fotmob_daily_locale", "de")), safe=""),
+            country=quote(str(getattr(self.settings, "fotmob_daily_ccode3", "DEU")), safe=""),
+        )
+        catalog_payload, catalog_error = self._fetch_json(catalog_endpoint)
+        if catalog_payload is not None:
+            catalog_names = extract_catalog_names(catalog_payload)
+            country_names = catalog_names["countries"]
+            league_names = catalog_names["leagues"]
+        elif catalog_error:
+            warnings.append(f"Länder-/Liga-Katalog nicht geladen: {catalog_error}")
+
+        for offset in range(day_count):
+            observation_date = start + timedelta(days=offset)
+            day = observation_date.isoformat()
+            endpoint = self._daily_feed_endpoint(observation_date)
+            payload, error = self._fetch_json(endpoint)
+            if payload is None:
+                message = f"{day}: {error or 'FotMob-Tagesfeed konnte nicht geladen werden'}"
+                index_errors.append(message)
+                failed_days.add(day)
+                self.store.record_daily_load_run(
+                    day,
+                    scope_league,
+                    season_id=scope_season,
+                    status="ERROR",
+                    source_endpoint=endpoint,
+                    error=error,
+                )
+                continue
+
+            fetched_at = _now()
+            feed_summary = summarize_daily_feed(payload)
+            daily_feed_summaries[day] = feed_summary
+            records = extract_daily_match_index(
+                payload,
+                observation_date=observation_date,
+                first_seen_at=fetched_at,
+                country_names=country_names,
+                league_names=league_names,
+            )
+            daily_records[day] = records
+            unique_records.update({record.provider_match_id: record for record in records})
+            self.store.upsert_match_index(records)
+            self.store.upsert_seasons(
+                FotMobSeasonRef(
+                    provider=record.provider,
+                    league_id=record.league_id,
+                    season_id=record.season_id,
+                    season_label=record.season_label,
+                    league_name=record.league_name,
+                    country=record.country_name or record.country,
+                    discovered_at=fetched_at,
+                )
+                for record in records
+            )
+            self.store.upsert_daily_index(
+                records,
+                observation_date=day,
+                source_endpoint=endpoint,
+                payload_hash=_payload_hash(payload),
+                fetched_at=fetched_at,
+            )
+            self.store.record_daily_load_run(
+                day,
+                scope_league,
+                season_id=scope_season,
+                status="COMPLETE",
+                fixture_count=len(records),
+                selected_count=len(records),
+                feed_group_count=feed_summary["feed_group_count"],
+                feed_entry_count=feed_summary["feed_entry_count"],
+                feed_unique_count=feed_summary["feed_unique_count"],
+                next_day_count=feed_summary["next_day_count"],
+                duplicates_removed_count=feed_summary["duplicates_removed_count"],
+                payload_hash=_payload_hash(payload),
+                source_endpoint=endpoint,
+                fetched_at=fetched_at,
+            )
+
+        selected_records = list(unique_records.values())
+        detail_result: dict[str, Any] = {
+            "status": "SKIPPED",
+            "requested": 0,
+            "fetched": 0,
+            "partial": 0,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "skipped_no_halftime": 0,
+        }
+        if fetch_details and selected_records:
+            detail_result = self.fetch_details_for_ids(
+                [record.provider_match_id for record in selected_records],
+                workers=workers or getattr(self.settings, "fotmob_history_workers", 1),
+                refresh_existing=True,
+                require_halftime_stats=True,
+                execution_mode=execution_mode,
+            )
+
+        status_by_id: dict[str, str] = {}
+        if daily_records:
+            catalog_rows = self.store.daily_index(
+                start_date=start.isoformat(),
+                end_date=end.isoformat(),
+                limit=max(500, len(unique_records) * 2),
+            )
+            status_by_id = {
+                str(row["fotmob_match_id"]): str(row["detail_status"] or "NOT_FETCHED")
+                for row in catalog_rows
+            }
+        successful_ids = set(str(item) for item in detail_result.get("successful_ids", []))
+        skipped_ids = {
+            match_id
+            for match_id, status in status_by_id.items()
+            if status == "SKIPPED_NO_HALFTIME"
+        }
+        for day, records in daily_records.items():
+            day_ids = {record.provider_match_id for record in records}
+            detail_count = len(day_ids.intersection(successful_ids))
+            skipped_count = len(day_ids.intersection(skipped_ids))
+            if not fetch_details:
+                # An index-only refresh must not erase the detail counters
+                # from a completed canary.  Reconstruct them from the
+                # terminal match index instead of treating all details as
+                # newly skipped.
+                detail_count = sum(
+                    status_by_id.get(match_id) in {"FETCHED", "PARTIAL"}
+                    for match_id in day_ids
+                )
+            detail_status = str(detail_result.get("status") or "SKIPPED")
+            run_status = (
+                "BLOCKED_BY_POLICY"
+                if detail_status == "BLOCKED_BY_POLICY"
+                else "PARTIAL"
+                if detail_status in {"PARTIAL", "ERROR"} or day in failed_days
+                else "COMPLETE"
+            )
+            self.store.record_daily_load_run(
+                day,
+                scope_league,
+                season_id=scope_season,
+                status=run_status,
+                fixture_count=len(records),
+                selected_count=len(records),
+                detail_count=detail_count,
+                skipped_no_halftime_count=skipped_count,
+                feed_group_count=daily_feed_summaries[day]["feed_group_count"],
+                feed_entry_count=daily_feed_summaries[day]["feed_entry_count"],
+                feed_unique_count=daily_feed_summaries[day]["feed_unique_count"],
+                next_day_count=daily_feed_summaries[day]["next_day_count"],
+                duplicates_removed_count=daily_feed_summaries[day]["duplicates_removed_count"],
+            )
+
+        detail_status = str(detail_result.get("status") or "SKIPPED")
+        if index_errors or detail_status in {"PARTIAL", "ERROR"}:
+            status = "PARTIAL"
+        elif detail_status == "BLOCKED_BY_POLICY":
+            status = "BLOCKED_BY_POLICY"
+        else:
+            status = "PASS"
+        return {
+            "status": status,
+            "scope": "ALL_LEAGUES",
+            "from_date": start.isoformat(),
+            "to_date": end.isoformat(),
+            "league_id": None,
+            "league_name": None,
+            "country": None,
+            "country_code": None,
+            "country_name": None,
+            "days": day_count,
+            "leagues": len({record.league_id for record in selected_records}),
+            "countries": len({record.country_code or record.country for record in selected_records}),
+            "seasons": sorted({record.season_label for record in selected_records}),
+            "fixtures": sum(len(records) for records in daily_records.values()),
+            "unique_fixtures": len(selected_records),
+            "daily_index_rows": sum(len(records) for records in daily_records.values()),
+            "feed": {
+                key: sum(item[key] for item in daily_feed_summaries.values())
+                for key in (
+                    "feed_group_count",
+                    "feed_entry_count",
+                    "feed_unique_count",
+                    "next_day_count",
+                    "duplicates_removed_count",
+                    "invalid_entry_count",
+                )
+            },
+            "daily_feed": daily_feed_summaries,
+            "details": detail_result,
+            "errors": index_errors,
+            "warnings": warnings,
+            "country_catalog": {
+                "status": "PASS" if catalog_payload is not None else "PARTIAL",
+                "endpoint": catalog_endpoint,
+                "countries": len(country_names),
+                "leagues": len(league_names),
+                "error": catalog_error,
+            },
+            "access": getattr(self.client, "metrics_snapshot", lambda: {})(),
+        }
+
     def load_date_range(
         self,
         start_date: date | str,
@@ -829,13 +1103,13 @@ class FotMobHistoryPipeline:
         workers: int | None = None,
         execution_mode: str = "manual",
     ) -> dict[str, Any]:
-        """Load the configured league for an inclusive UTC date range.
+        """Load an inclusive date range from FotMob's daily feed.
 
-        The provider league/season pages are fetched once per relevant season;
-        fixtures are then assigned to the selected days by their provider UTC
-        kickoff.  Every selected day, including a day without fixtures, gets a
-        durable run row in SQLite.  Match details and statistics are written to
-        the canonical Parquet datasets.
+        With no explicit ``league_id`` this is an all-league load: every fixture
+        returned for each selected FotMob day is indexed, independent of country,
+        league or kickoff time.  Detail rows without usable FirstHalf metrics
+        are deliberately skipped.  Passing a league id keeps the older
+        league/season-page path available for legacy CLI jobs.
         """
 
         start = self._coerce_date(start_date)
@@ -845,6 +1119,27 @@ class FotMobHistoryPipeline:
         day_count = (end - start).days + 1
         if day_count > 3660:
             raise ValueError("Der Datumsbereich ist auf 10 Jahre begrenzt.")
+        if league_id is None:
+            if not _history_network_allowed(self.settings, execution_mode):
+                return {
+                    "status": "BLOCKED_BY_POLICY",
+                    "scope": "ALL_LEAGUES",
+                    "from_date": start.isoformat(),
+                    "to_date": end.isoformat(),
+                    "league_id": None,
+                    "days": day_count,
+                    "fixtures": 0,
+                    "unique_fixtures": 0,
+                    "details": {},
+                    "error": self._network_error(execution_mode),
+                }
+            return self._all_leagues_date_range(
+                start,
+                end,
+                fetch_details=fetch_details,
+                workers=workers,
+                execution_mode=execution_mode,
+            )
         target_league = str(league_id or getattr(self.settings, "fotmob_history_league_id", "54"))
         if not _history_network_allowed(self.settings, execution_mode):
             return {
@@ -988,6 +1283,7 @@ class FotMobHistoryPipeline:
                 [record.provider_match_id for record in selected_records],
                 workers=workers or getattr(self.settings, "fotmob_history_workers", 1),
                 refresh_existing=True,
+                require_halftime_stats=True,
                 execution_mode=execution_mode,
             )
             successful_ids = set(detail_result.get("successful_ids", []))

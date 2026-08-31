@@ -131,6 +131,8 @@ def test_history_league_paths_use_fotmob_api_base() -> None:
     )
     assert client._url("/leagues?id=54") == "https://www.fotmob.com/api/leagues?id=54"
     assert client._url("/match/123") == "https://www.fotmob.com/match/123"
+    assert client._url("/data/matches?date=20250822") == "https://www.fotmob.com/api/data/matches?date=20250822"
+    assert client._url("/data/matchDetails?matchId=123") == "https://www.fotmob.com/api/data/matchDetails?matchId=123"
 
 
 def test_index_deduplicates_and_samples_finished_matches() -> None:
@@ -395,7 +397,12 @@ def test_policy_gate_blocks_network_without_calling_client(tmp_path: Path) -> No
 
     database = Database(tmp_path / "data" / "tipico.db")
     client = CountingClient()
-    settings = Settings(root_dir=tmp_path)
+    settings = Settings(
+        root_dir=tmp_path,
+        fotmob_enabled=False,
+        fotmob_history_enabled=False,
+        fotmob_network_mode="off",
+    )
     assert historical_automation_allowed(settings) is False
     assert manual_history_allowed(settings) is False
     assert worker_history_allowed(settings) is False

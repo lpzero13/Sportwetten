@@ -105,6 +105,10 @@ sed \
     "$INSTALL_DIR/deploy/wetten-fotmob.service" \
     > /etc/systemd/system/wetten-fotmob.service
 
+# Reconcile the V0.5.4 manual FotMob flags even when an older env file already
+# exists.  The helper keeps a timestamped backup and never enables the worker.
+TIPICO_SKIP_SERVICE_RESTART=1 bash "$INSTALL_DIR/deploy/activate_fotmob.sh" "$ENV_FILE"
+
 # V0.3 service names are retired in favour of the explicit V0.4 names.
 systemctl disable --now tipico-observer.service tipico-collector.service 2>/dev/null || true
 

@@ -135,6 +135,7 @@ class FotMobClient:
             if path.startswith("/matchDetails")
             or path.startswith("/leagues?id=")
             or path.startswith("/leagues?")
+            or path.startswith("/data/")
             or path.startswith("/api/")
             else self.base_url
         )

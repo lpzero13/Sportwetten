@@ -18,6 +18,18 @@ def load_details(name: str = "event_detail.json") -> EventDetails:
     return parse_event_details(payload)
 
 
+def test_collection_metrics_include_date_when_database_is_empty(tmp_path: Path) -> None:
+    database = Database(tmp_path / "data" / "tipico.db")
+
+    coverage = database.collection_metrics_for_date("2026-08-31")
+
+    assert coverage["date"] == "2026-08-31"
+    assert coverage["football_events_seen"] == 0
+    assert coverage["competitions"] == 0
+    assert coverage["outbox_pending"] == 0
+    database.close()
+
+
 def test_odds_history_deduplicates_identical_values_and_records_changes(tmp_path: Path) -> None:
     database = Database(tmp_path / "data" / "tipico.db")
     repository = MarketRepository(database)

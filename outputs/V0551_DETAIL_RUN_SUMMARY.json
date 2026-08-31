@@ -1,0 +1,16 @@
+{
+  "status": "PASS",
+  "scope": "ALL_LEAGUES",
+  "from_date": "2026-08-26",
+  "to_date": "2026-08-30",
+  "workers": 10,
+  "requests_per_second_limit": 0.5,
+  "requested": 1618,
+  "fetched": 608,
+  "partial": 0,
+  "failed": 0,
+  "errors": 0,
+  "skipped": 2,
+  "skipped_no_halftime": 1008,
+  "note": "CLI detail result captured at canary completion; skipped are queue claims not made because the rows were already fresh."
+}

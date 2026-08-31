@@ -378,6 +378,15 @@ class FotMobService:
     def ensure_tipico_event(self, event: Any, *, observed_at: str | None = None) -> str:
         return self.store.upsert_tipico_event(event, observed_at=observed_at)
 
+    def has_current_state_for_tipico_event(self, event_id: str) -> bool:
+        """Return whether a persisted FotMob state is available for a Tipico event."""
+
+        row = self.store.match_row_for_tipico_event(str(event_id))
+        return bool(
+            row is not None
+            and self.store.current_state(str(row["internal_match_id"])) is not None
+        )
+
     def match_tipico_event(
         self,
         event: Any,
@@ -646,9 +655,10 @@ class FotMobService:
         metrics["manual_use_allowed"] = self.manual_use_allowed
         metrics["automated_worker_allowed"] = self.automated_worker_allowed
         metrics["access"] = client_metrics
-        metrics["daily"] = self.history_pipeline.store.daily_status(
-            getattr(self.settings, "fotmob_history_league_id", "54")
-        )
+        # The date-range UI now consumes the complete daily feed.  Keep this
+        # aggregate unscoped so the debug panel does not silently report only
+        # the legacy Bundesliga queue.
+        metrics["daily"] = self.history_pipeline.store.daily_status()
         metrics["canonical_archive"] = str(self.canonical_archive.root)
         metrics["canonical_archive_bytes"] = self.canonical_archive.total_size_bytes
         return metrics

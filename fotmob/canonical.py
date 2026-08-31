@@ -228,7 +228,12 @@ def _stat_value(stats: FotMobStats | None, name: str, side: str) -> float | None
 
 
 def _identity(index: FotMobMatchIndexRecord, match: FotMobMatch) -> dict[str, Any]:
-    country_code, country_name = _country(index.country or match.competition_country)
+    country_code = getattr(index, "country_code", None)
+    country_name = getattr(index, "country_name", None)
+    if not country_code or not country_name:
+        fallback_code, fallback_name = _country(index.country or match.competition_country)
+        country_code = country_code or fallback_code
+        country_name = country_name or fallback_name
     return {
         "provider": str(index.provider or "FOTMOB").upper(),
         "fotmob_match_id": str(index.provider_match_id),
@@ -686,6 +691,22 @@ class FotMobCanonicalArchive:
             except OSError:
                 continue
         return total
+
+    def read_match_core(self, archive_path: str | Path | None) -> dict[str, Any] | None:
+        """Read one compact match-core row for UI/detail inspection."""
+
+        if pq is None or not archive_path:
+            return None
+        path = Path(str(archive_path))
+        if not path.is_absolute():
+            path = self.root / path
+        if not path.exists():
+            return None
+        try:
+            rows = pq.read_table(path).to_pylist()
+        except (OSError, ValueError, TypeError):
+            return None
+        return rows[0] if rows else None
 
     def _write_one(
         self,

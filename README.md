@@ -118,9 +118,12 @@ als `competition_country` am Event und als `country_or_region` in
 `competitions` gespeichert.
 
 Mit **Quoten** wird genau ein Event geöffnet und mit **Analyse** dieselbe
-Detailansicht mit der normalisierten Auswertung. Erst dann wird der
-Event-Detail-Endpunkt abgerufen. Die Detailansicht enthält die Tabs Analyse,
-Alle Tipico Märkte, Odds History und Raw / Debug. Auto Refresh ist
+Detailansicht mit der normalisierten Auswertung. **FotMob** ist im
+Live-Überblick als Schaltfläche vorhanden und wird aktiv, sobald für dieses
+Event ein FotMob-Current-State gespeichert ist; dann öffnet sie direkt die
+FotMob-Ansicht. Erst beim Öffnen des Events wird der Tipico-Detail-Endpunkt abgerufen. Die Detailansicht enthält
+die Tabs Analyse, Alle Tipico Märkte, FotMob HT, Odds History und Raw / Debug.
+Auto Refresh ist
 standardmäßig deaktiviert und ruft bei Aktivierung nur dieses Event alle
 5 Sekunden ab.
 Dieser Refresh aktualisiert ausschließlich Current State; er erzeugt keinen
@@ -152,17 +155,18 @@ Die Seite **Data Collection** liest ausschließlich Current State, SQLite,
 Parquet-Metadaten und `data/collector_status.json`; sie startet keinen Collector
 und entscheidet nicht über die Datensammlung.
 
-### Optionales FotMob-Enrichment (V0.5.3)
+### FotMob-Enrichment (V0.5.3)
 
-FotMob ist ein optionales Enrichment und standardmäßig deaktiviert. Der
+FotMob ist in der privaten Standardkonfiguration aktiviert, aber ausschließlich
+für bewusst ausgelöste manuelle Läufe. Der
 Tipico-Collector kann bei einer bestätigten Liga-/Team-/Kickoff-Verknüpfung
 Pre-Match nur den kleinen Match-Index nutzen und beim ersten Tipico-HZ-Signal
-genau einen öffentlichen `/match/{id}`-Abruf auslösen. Der FotMob-Tab zeigt
+genau einen öffentlichen `/api/data/matchDetails?matchId={id}`-Abruf auslösen. Der FotMob-Tab zeigt
 die FirstHalf-Werte daneben. FotMob-Werte werden weder für das Tipico-
 Market-Ranking noch für Paper-Trades oder Settlement verwendet.
 
 Die Providerentscheidung bleibt `LIMITED_USE` bei `AUTOMATED_USAGE=UNCLEAR`.
-Standardmäßig bleibt FotMob aus. Eine automatisierte HZ-Anreicherung benötigt
+Der automatische FotMob-Worker bleibt aus. Eine automatisierte HZ-Anreicherung benötigt
 zusätzlich `FOTMOB_NETWORK_MODE=worker`,
 `FOTMOB_PROVIDER_DECISION=PRODUCTION_READY` und
 `FOTMOB_AUTOMATED_USAGE=ACCEPTABLE_FOR_PROJECT`. Ohne diese Freigabe läuft
@@ -188,8 +192,8 @@ python scripts/run_collector.py --root .
 
 Für Proxmox ist `wetten-fotmob.service` vorhanden, wird vom Installationsskript
 nicht aktiviert. Bei `LIMITED_USE`/`UNCLEAR` bleiben automatische FotMob-
-Requests blockiert; die HZ-Anreicherung wird nur mit der oben beschriebenen
-expliziten Worker-Freigabe aktiv.
+Requests blockiert; die manuelle Datumsbereich-Auswahl und die Anzeige bereits
+gespeicherter Daten bleiben verfügbar.
 
 ### FotMob Historical Foundation (V0.5.2)
 
@@ -203,16 +207,19 @@ Minuten zurück. Halbzeit- und Endstand werden getrennt gespeichert; fehlende
 Werte bleiben `NULL`, und `second_half_goals` wird ausschließlich aus
 `FT total - HT total` für gültige Scores berechnet.
 
-Die Jobs sind bewusst getrennt. Standardmäßig ist `FOTMOB_NETWORK_MODE=off`;
-ein bewusst manuell gestarteter Discovery-/Index-/Fetch-Job benötigt zusätzlich
-`FOTMOB_ENABLED=true` und `FOTMOB_HISTORY_ENABLED=true`. Das ist eine
-begrenzte technische Abnahme und aktiviert keinen dauerhaften Worker:
+Die Jobs sind bewusst getrennt. Standardmäßig ist
+`FOTMOB_NETWORK_MODE=manual`; Netzwerkzugriff entsteht nur durch einen bewusst
+manuell gestarteten Discovery-/Index-/Fetch-Job beziehungsweise den Button im
+Dashboard. Der Modus aktiviert keinen dauerhaften Worker:
 
 ~~~powershell
-# ohne Opt-in: gibt BLOCKED_BY_POLICY aus und macht keinen Request
+# Bei einer expliziten Deaktivierung bleibt der Lauf ohne Netzwerkzugriff:
+# FOTMOB_ENABLED=false, FOTMOB_HISTORY_ENABLED=false oder NETWORK_MODE=off.
 python scripts/fotmob_history.py seasons --league 54 --root .
 python scripts/fotmob_history.py index --league 54 --season 2025/26 --root .
 
+# Die Variablen sind in der privaten Standardkonfiguration bereits gesetzt.
+# Bei einer temporären Deaktivierung können sie für den Lauf wieder gesetzt werden.
 $env:FOTMOB_ENABLED="true"
 $env:FOTMOB_HISTORY_ENABLED="true"
 $env:FOTMOB_NETWORK_MODE="manual"
@@ -239,7 +246,7 @@ verlangt weiterhin `FOTMOB_NETWORK_MODE=worker` sowie
 
 V0.5.3 importiert die alte `sniper_football.db` ausschließlich read-only,
 legt vor der Prüfung eine Kopie an und führt die Legacy-Zeilen über denselben
-normalisierten `/match/{id}`-Parser. `LEGACY_IMPORT` und `FRESH_FETCH` werden
+normalisierten Matchdetail-Parser. `LEGACY_IMPORT` und `FRESH_FETCH` werden
 über FotMob-Match-ID und Source-Priorität dedupliziert; frische Detaildaten
 ersetzen Legacy-Zeilen. Alte 60-Minuten-Werte bleiben als `m60_*` separat und
 werden niemals als FirstHalf verwendet. Die Halbzeit-Features kommen nur aus
@@ -264,17 +271,31 @@ fehlende Events werden nicht künstlich erzeugt.
 ### FotMob Canonical Archive und Tagesauswahl (V0.5.4)
 
 V0.5.4 stellt im Bereich **Data / Debug → FotMob** ausschließlich die
-Datumsauswahl **Von/Bis** bereit. Die Auswahl ist inklusiv und wird nach dem
-FotMob-UTC-Datum ausgewertet. Für die konfigurierte Liga (Standard: FotMob
-`54`, Bundesliga) werden die Saison-/Fixture-Seiten einmal je relevanter
-Saison gelesen. Danach stehen Datum, Land, Liga, Saison, Anstoß, Teams und
-FotMob-Match-ID im SQLite-Tagesindex; die Detaildaten werden nicht als große
-Statistik-Historie in SQLite abgelegt, sondern kanonisch in Parquet.
+Datumsauswahl **Von/Bis** bereit. Die Auswahl ist inklusiv und wird als
+FotMob-Tagesdatum mit Zeitzone `Europe/Berlin` ausgewertet. Der Standardpfad
+ruft pro Tag den vollständigen öffentlichen Tagesfeed ab: alle darin gelisteten
+Länder, Ligen und Spiele werden unabhängig von ihrer Anstoßzeit indexiert.
+Der optionale `includeNextDayLateNight`-Abschnitt wird ebenfalls übernommen.
+Der alte `--league`-CLI-Pfad bleibt für gezielte Legacy-Läufe verfügbar.
 
-Pro Lauf werden auch Tage ohne Spiel als `fotmob_daily_load_runs` festgehalten.
-Ein erneuter Lauf ist idempotent: bereits frisch geladene Matchdetails werden
-nicht nochmals abgerufen, die deterministischen Match-Parquet-Dateien werden
-bei einer echten Aktualisierung ersetzt. Die wichtigsten Dateien liegen unter:
+Für jedes indexierte Spiel wird anschließend das Matchdetail gelesen. Fehlt
+darin eine verwertbare `FirstHalf`-Statistik, erhält der Datensatz den Status
+`SKIPPED_NO_HALFTIME` und wird nicht ins Detailarchiv geschrieben. Nur Spiele
+mit Halbzeitdaten werden in der UI als Detailtabelle angezeigt. Datum, Land,
+Liga, Saison, Anstoß, Teams, Status und FotMob-Match-ID liegen im kleinen
+SQLite-Tagesindex; Halbzeitmetriken, Endstand, Schüsse, Events und weitere
+Detaildaten liegen kanonisch in Parquet.
+
+Die Saisonbezeichnung im Tagesfeed wird mangels Provider-Season-ID aus dem
+Beobachtungsdatum als konventionelles Juli–Juni-Label (`2025/26`, `2026/27`, …)
+abgeleitet und als Filter-/Archivschlüssel verwendet.
+
+Pro Lauf werden auch Tage ohne Spiel als `fotmob_daily_load_runs` festgehalten;
+die Laufzeile enthält außerdem Feed-Gruppen, Roh-Einträge, deduplizierte
+Match-IDs, Next-Day-Einträge, entfernte Duplikate und die Zahl der bewusst
+wegen fehlender FirstHalf-Daten übersprungenen Spiele. Ein erneuter Lauf ist idempotent für
+frische Matchdetails, die deterministischen Match-Parquet-Dateien werden bei
+einer echten Aktualisierung ersetzt. Die wichtigsten Dateien liegen unter:
 
 ~~~text
 /var/lib/wetten/archive/fotmob/match_core/
@@ -294,12 +315,23 @@ $env:FOTMOB_NETWORK_MODE="manual"
 python scripts/fotmob_history.py dates --from-date 2025-08-22 --to-date 2025-08-31 --root .
 # optional nur Datum/Land/Liga/Match indexieren:
 python scripts/fotmob_history.py dates --from-date 2025-08-22 --to-date 2025-08-31 --index-only --root .
+# V0.5.5.1-Report für den Fünf-Tage-Canary (mit CLI-Detailzusammenfassung):
+python scripts/report_v0551_canary.py --from-date 2026-08-26 --to-date 2026-08-30 --root . --execution-summary outputs/V0551_DETAIL_RUN_SUMMARY.json
 ~~~
 
-Die Container-Vorlage aktiviert genau diese manuellen Date-Jobs. Der separate
-`wetten-fotmob.service` bleibt deaktiviert, damit kein dauerhafter FotMob-
-Poller gestartet wird. Der technische Laufstatus wird in
-`outputs/V054_STATUS.md` dokumentiert.
+Die Container-Vorlage aktiviert genau diese manuellen Date-Jobs. Bei einem bereits
+installierten Container übernimmt `deploy/activate_fotmob.sh` die
+Schalter in `/etc/default/tipico-observer` und startet das Dashboard neu:
+
+~~~bash
+git pull
+sudo bash deploy/activate_fotmob.sh
+~~~
+
+Der separate `wetten-fotmob.service` bleibt deaktiviert, damit kein dauerhafter FotMob-
+Poller gestartet wird. Der technische Laufstatus des All-Leagues-Ausbaus wird
+in `outputs/V055_STATUS.md`, der Fünf-Tage-Nachweis in
+`outputs/V0551_FIVE_DAY_CANARY_REPORT.md` dokumentiert.
 
 ### Paper Trading
 
@@ -361,9 +393,9 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | COLLECTOR_RETRY_DELAYS_SECONDS | 1,3,10 | Retry-Verzögerungen |
 | MAX_LIVE_ODDS_AGE_SECONDS | 10 | Freshness-Grenze für Live-Quoten |
 | DEFAULT_TOTAL_STAKE_EUR | 30 | Default-Einsatz für Szenarien |
-| FOTMOB_ENABLED | false | FotMob-Funktion; Proxmox-Vorlage setzt für die explizite Datumsauswahl `true` |
-| FOTMOB_API_BASE_URL | https://www.fotmob.com/api | Legacy-/Kompatibilitätsbasis für ausdrücklich konfigurierte alte API-Pfade |
-| FOTMOB_MATCH_DETAILS_PATH | /match/{match_id} | öffentliche Match-Details-Seite mit eingebettetem Next.js-Payload |
+| FOTMOB_ENABLED | true | FotMob-Funktion; Netzwerk wird nur durch manuelle Läufe genutzt |
+| FOTMOB_API_BASE_URL | https://www.fotmob.com/api | API-Basis für den öffentlichen FotMob-Datenzugriff |
+| FOTMOB_MATCH_DETAILS_PATH | /data/matchDetails?matchId={match_id} | öffentliches Matchdetail-JSON |
 | FOTMOB_TIMEOUT_SECONDS | 10 | FotMob-Timeout |
 | FOTMOB_MAX_RETRIES | 3 | FotMob-Retry-Anzahl, Delays 1/3/10 s |
 | FOTMOB_MIN_REQUEST_INTERVAL_SECONDS | 1 | Mindestabstand zwischen FotMob-Requests |
@@ -373,9 +405,14 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | FOTMOB_AUTOMATED_USAGE | UNCLEAR | Nutzungsfreigabe; Worker benötigt ACCEPTABLE_FOR_PROJECT |
 | FOTMOB_LEAGUE_PATH | /leagues/{league_id} | öffentliche League-Seite für Discovery |
 | FOTMOB_SEASON_PATH | /leagues/{league_id}?season={season_label} | öffentliche Fixture-/Result-Seite; Label wird als sichtbares `YYYY/YYYY` übergeben |
-| FOTMOB_HISTORY_ENABLED | false | Historical-Netzwerkzugriff, zusätzlich zur Providerfreigabe |
-| FOTMOB_NETWORK_MODE | off | `off`, `manual` für explizite CLI-Jobs, `worker` nur mit Worker-Gates |
-| FOTMOB_HISTORY_WORKERS | 1 | Historical-Detailworker, maximal 8 |
+| FOTMOB_DAILY_MATCHES_PATH | /data/matches?... | vollständiger FotMob-Tagesfeed inklusive `includeNextDayLateNight=true` |
+| FOTMOB_ALL_LEAGUES_PATH | /data/allLeagues?... | lokalisierter Länder-/Liga-Katalog |
+| FOTMOB_DAILY_TIMEZONE | Europe/Berlin | Zeitzone für die Auswahl eines FotMob-Tages |
+| FOTMOB_DAILY_CCODE3 | DEU | Länderparameter des Tagesfeed-Requests; der Feed liefert mehrere Länder |
+| FOTMOB_DAILY_LOCALE | de | Sprache für Katalogbezeichnungen |
+| FOTMOB_HISTORY_ENABLED | true | Historical-Netzwerkzugriff, zusätzlich zur Providerfreigabe |
+| FOTMOB_NETWORK_MODE | manual | `off`, `manual` für explizite CLI-/UI-Läufe, `worker` nur mit Worker-Gates |
+| FOTMOB_HISTORY_WORKERS | 10 | Historical-Detailworker, maximal 10; globaler Request-Limiter bleibt aktiv |
 | FOTMOB_HISTORY_REQUESTS_PER_SECOND | 0.5 | globaler Historical-Request-Limiter |
 | FOTMOB_HISTORY_TIMEOUT_SECONDS | 10 | Historical-HTTP-Timeout |
 | FOTMOB_HISTORY_MAX_RETRIES | 3 | HTTP-Retries für transiente Fehler |
@@ -384,7 +421,7 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | FOTMOB_HISTORY_BATCH_SIZE | 100 | Parquet-Batchgröße |
 | STORE_FOTMOB_HISTORICAL_RAW | false | optionales zstd-Raw nur für Historical-Details |
 | FOTMOB_ARCHIVE_ROOT | leer | kanonischer FotMob-Parquet-Root, Proxmox: `/var/lib/wetten/archive/fotmob` |
-| FOTMOB_HISTORY_LEAGUE_ID | 54 | konfigurierte FotMob-Liga für die Datumsauswahl |
+| FOTMOB_HISTORY_LEAGUE_ID | 54 | Legacy-Fallback für die alten expliziten Liga-/Season-CLI-Befehle; die Datumsauswahl lädt alle Ligen |
 | FOTMOB_HT_ENRICHMENT_ENABLED | true | separates Live-HZ-Enrichment; kein permanenter Historien-Poller |
 
 Die verifizierten Tipico-Endpunkte stehen in outputs/DISCOVERY.md. Die FotMob-

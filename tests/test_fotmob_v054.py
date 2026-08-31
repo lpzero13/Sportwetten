@@ -138,7 +138,13 @@ def test_date_range_loader_persists_date_country_league_and_is_resumable(tmp_pat
     settings = history_settings(tmp_path, fotmob_network_mode="manual")
     pipeline = FotMobHistoryPipeline(settings, database, client=client)
 
-    result = pipeline.load_date_range("2025-08-22", "2025-08-23", fetch_details=True, execution_mode="manual")
+    result = pipeline.load_date_range(
+        "2025-08-22",
+        "2025-08-23",
+        league_id="54",
+        fetch_details=True,
+        execution_mode="manual",
+    )
     assert result["status"] == "PASS"
     assert result["fixtures"] == 1
     assert result["details"]["fetched"] == 1
@@ -153,8 +159,216 @@ def test_date_range_loader_persists_date_country_league_and_is_resumable(tmp_pat
     assert rows[0]["canonical_archive_path"].endswith("match-daily-1.parquet")
     assert pipeline.store.daily_status("54")["loaded_days"] == 2
 
-    again = pipeline.load_date_range("2025-08-22", "2025-08-23", fetch_details=True, execution_mode="manual")
+    again = pipeline.load_date_range(
+        "2025-08-22",
+        "2025-08-23",
+        league_id="54",
+        fetch_details=True,
+        execution_mode="manual",
+    )
     assert again["status"] == "PASS"
     assert again["details"]["skipped"] == 1
     assert len(list((tmp_path / "data" / "archive" / "fotmob" / "match_core").rglob("*.parquet"))) == 1
+    database.close()
+
+
+def test_date_range_loader_fetches_every_fixture_on_selected_day(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
+
+    class MultiFixtureClient(_DailyClient):
+        def fetch_json(self, endpoint: str) -> FotMobFetchResult:
+            result = super().fetch_json(endpoint)
+            if "?season=" in endpoint and result.payload is not None:
+                payload = copy.deepcopy(result.payload)
+                payload["fixtures"]["allMatches"].append(
+                    {
+                        "id": "daily-2",
+                        "status": {"utcTime": "2025-08-22T20:30:00Z", "finished": True},
+                        "home": {"id": "29", "name": "Borussia Dortmund"},
+                        "away": {"id": "30", "name": "RB Leipzig"},
+                    }
+                )
+                return FotMobFetchResult(success=True, payload=payload)
+            return result
+
+    database = Database(tmp_path / "data" / "tipico.db")
+    client = MultiFixtureClient()
+    pipeline = FotMobHistoryPipeline(
+        history_settings(tmp_path, fotmob_network_mode="manual"),
+        database,
+        client=client,
+    )
+    result = pipeline.load_date_range(
+        "2025-08-22",
+        "2025-08-22",
+        league_id="54",
+        fetch_details=True,
+        execution_mode="manual",
+    )
+
+    assert result["status"] == "PASS"
+    assert result["fixtures"] == 2
+    assert result["details"]["fetched"] == 2
+    assert sorted(client.detail_calls) == ["daily-1", "daily-2"]
+    rows = pipeline.store.daily_index(league_id="54", limit=10)
+    assert sorted(row["fotmob_match_id"] for row in rows) == ["daily-1", "daily-2"]
+    database.close()
+
+
+class _AllLeaguesClient:
+    """Small daily-feed fixture covering multiple countries and no-HZ skips."""
+
+    def __init__(self) -> None:
+        self.json_calls: list[str] = []
+        self.detail_calls: list[str] = []
+
+    def fetch_json(self, endpoint: str) -> FotMobFetchResult:
+        self.json_calls.append(endpoint)
+        if "/data/allLeagues" in endpoint:
+            return FotMobFetchResult(
+                success=True,
+                payload={
+                    "countries": [
+                        {
+                            "ccode": "GER",
+                            "localizedName": "Deutschland",
+                            "leagues": [{"id": 54, "localizedName": "Bundesliga"}],
+                        },
+                        {
+                            "ccode": "AUT",
+                            "localizedName": "Österreich",
+                            "leagues": [{"id": 146, "localizedName": "2. Liga"}],
+                        },
+                    ],
+                    "international": [
+                        {
+                            "ccode": "INT",
+                            "name": "International",
+                            "leagues": [{"id": 45, "localizedName": "Copa Libertadores"}],
+                        }
+                    ],
+                },
+            )
+        if "/data/matches" in endpoint:
+            return FotMobFetchResult(
+                success=True,
+                payload={
+                    "leagues": [
+                        {
+                            "primaryId": 54,
+                            "ccode": "GER",
+                            "name": "Bundesliga",
+                            "matches": [
+                                {
+                                    "id": "all-early",
+                                    "status": {"utcTime": "2025-08-22T00:05:00Z", "finished": True},
+                                    "home": {"id": "g-home-1", "name": "Frühes Heimteam"},
+                                    "away": {"id": "g-away-1", "name": "Frühes Gastteam"},
+                                },
+                                {
+                                    "id": "all-no-ht",
+                                    "status": {"utcTime": "2025-08-22T18:30:00Z", "finished": True},
+                                    "home": {"id": "g-home-2", "name": "Ohne HZ Heimteam"},
+                                    "away": {"id": "g-away-2", "name": "Ohne HZ Gastteam"},
+                                },
+                            ],
+                        },
+                        {
+                            "primaryId": 146,
+                            "ccode": "AUT",
+                            "name": "2. Liga",
+                            "matches": [
+                                {
+                                    "id": "all-next-day",
+                                    "isNextDay": True,
+                                    "status": {"utcTime": "2025-08-23T00:15:00Z", "finished": True},
+                                    "home": {"id": "a-home-1", "name": "Österreich Heimteam"},
+                                    "away": {"id": "a-away-1", "name": "Österreich Gastteam"},
+                                }
+                            ],
+                        },
+                    ]
+                },
+            )
+        return FotMobFetchResult(success=False, error=f"unexpected endpoint: {endpoint}")
+
+    def fetch_match_details(self, provider_match_id: str) -> FotMobFetchResult:
+        self.detail_calls.append(provider_match_id)
+        payload = copy.deepcopy(sample_payload(match_id=123))
+        if provider_match_id == "all-no-ht":
+            payload["content"]["stats"]["periods"].pop("1", None)
+        return FotMobFetchResult(
+            success=True,
+            payload=payload,
+            match=parse_fotmob_payload(payload, provider_match_id=provider_match_id),
+        )
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        return {"requests": len(self.json_calls) + len(self.detail_calls)}
+
+
+def test_all_leagues_daily_feed_indexes_every_game_and_skips_missing_first_half(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
+    database = Database(tmp_path / "data" / "tipico.db")
+    client = _AllLeaguesClient()
+    pipeline = FotMobHistoryPipeline(
+        history_settings(tmp_path, fotmob_network_mode="manual"),
+        database,
+        client=client,
+    )
+
+    result = pipeline.load_date_range(
+        "2025-08-22",
+        "2025-08-22",
+        fetch_details=True,
+        execution_mode="manual",
+    )
+
+    assert result["status"] == "PASS"
+    assert result["scope"] == "ALL_LEAGUES"
+    assert result["fixtures"] == result["unique_fixtures"] == 3
+    assert result["leagues"] == 2
+    assert result["countries"] == 2
+    assert result["details"]["fetched"] == 2
+    assert result["details"]["skipped_no_halftime"] == 1
+    assert result["feed"] == {
+        "feed_group_count": 2,
+        "feed_entry_count": 3,
+        "feed_unique_count": 3,
+        "next_day_count": 1,
+        "duplicates_removed_count": 0,
+        "invalid_entry_count": 0,
+    }
+    assert result["country_catalog"]["countries"] == 3
+    assert sorted(client.detail_calls) == ["all-early", "all-next-day", "all-no-ht"]
+
+    rows = pipeline.store.daily_index(start_date="2025-08-22", end_date="2025-08-22", limit=10)
+    assert len(rows) == 3
+    assert {row["country_name"] for row in rows} == {"Deutschland", "Österreich"}
+    assert {row["season_label"] for row in rows} == {"2025/26"}
+    assert next(row for row in rows if row["fotmob_match_id"] == "all-next-day")["is_next_day"] == 1
+    assert next(row for row in rows if row["fotmob_match_id"] == "all-no-ht")["detail_status"] == "SKIPPED_NO_HALFTIME"
+    assert len(pipeline.store.daily_index(country_code="AUT", limit=10)) == 1
+    assert len(pipeline.store.daily_index(league_name="Bundesliga", limit=10)) == 2
+    run = pipeline.store.daily_load_runs(start_date="2025-08-22", end_date="2025-08-22", limit=10)[0]
+    assert run["skipped_no_halftime_count"] == 1
+    assert run["feed_group_count"] == 2
+    assert run["feed_entry_count"] == 3
+    assert run["feed_unique_count"] == 3
+    assert run["next_day_count"] == 1
+    assert run["duplicates_removed_count"] == 0
+    assert len(list((tmp_path / "data" / "archive" / "fotmob" / "match_core").rglob("*.parquet"))) == 2
+
+    index_refresh = pipeline.load_date_range(
+        "2025-08-22",
+        "2025-08-22",
+        fetch_details=False,
+        execution_mode="manual",
+    )
+    assert index_refresh["status"] == "PASS"
+    refreshed_run = pipeline.store.daily_load_runs(
+        start_date="2025-08-22", end_date="2025-08-22", limit=10
+    )[0]
+    assert refreshed_run["detail_count"] == 2
+    assert refreshed_run["skipped_no_halftime_count"] == 1
     database.close()

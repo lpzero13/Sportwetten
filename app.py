@@ -224,14 +224,23 @@ def _load_selected_detail(
     # nicht versehentlich wieder den Quoten-Tab zurück.
     opening_intent = st.session_state.pop("detail_intent", None)
     if opening_intent:
+        intent_labels = {
+            "analysis": "Analyse",
+            "quotes": "Quoten",
+            "fotmob": "FotMob",
+        }
         st.caption(
             "Ansicht geöffnet über: "
-            + ("Analyse" if opening_intent == "analysis" else "Quoten")
+            + intent_labels.get(opening_intent, "Eventdetails")
         )
 
     if opening_intent == "quotes":
         quotes_tab, analysis_tab, fotmob_tab, history_tab, raw_tab = st.tabs(
             ["Alle Tipico Märkte", "Analyse", "FotMob HT", "Odds History", "Debug"]
+        )
+    elif opening_intent == "fotmob":
+        fotmob_tab, analysis_tab, quotes_tab, history_tab, raw_tab = st.tabs(
+            ["FotMob HT", "Analyse", "Alle Tipico Märkte", "Odds History", "Debug"]
         )
     else:
         analysis_tab, fotmob_tab, quotes_tab, history_tab, raw_tab = st.tabs(
@@ -456,6 +465,7 @@ def main() -> None:
     selected = render_live_overview(
         events,
         selected_event_id=st.session_state.get("selected_event_id"),
+        fotmob_service=fotmob_service,
     )
     if selected:
         st.session_state.selected_event_id = selected

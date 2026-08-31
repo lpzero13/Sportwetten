@@ -100,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--league-id",
         dest="league_id",
         default=None,
-        help="FotMob-Liga (Standard aus FOTMOB_HISTORY_LEAGUE_ID, aktuell 54)",
+        help="Legacy: einzelne FotMob-Liga; ohne diese Option werden alle Tagesfeed-Ligen geladen",
     )
     dates.add_argument("--workers", type=int)
     dates.add_argument(
@@ -306,6 +306,10 @@ def _record_dict(record: Any) -> dict[str, Any]:
         "match_status": record.match_status,
         "league_name": record.league_name,
         "country": record.country,
+        "country_code": record.country_code,
+        "country_name": record.country_name,
+        "is_next_day": record.is_next_day,
+        "source_context": record.source_context,
     }
 
 

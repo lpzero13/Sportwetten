@@ -8,8 +8,15 @@ from typing import Any
 
 FOTMOB_HISTORICAL_SCHEMA_VERSION = "fotmob_historical_v1"
 FOTMOB_HISTORICAL_PARSER_VERSION = "fotmob_historical_parser_v1"
-FOTMOB_DETAIL_STATUSES = ("NOT_FETCHED", "IN_PROGRESS", "FETCHED", "PARTIAL", "FAILED")
-FOTMOB_DATA_QUALITY = ("COMPLETE", "PARTIAL", "SCORE_ONLY", "INVALID")
+FOTMOB_DETAIL_STATUSES = (
+    "NOT_FETCHED",
+    "IN_PROGRESS",
+    "FETCHED",
+    "PARTIAL",
+    "FAILED",
+    "SKIPPED_NO_HALFTIME",
+)
+FOTMOB_DATA_QUALITY = ("COMPLETE", "PARTIAL", "SCORE_ONLY", "INVALID", "NO_HALFTIME")
 FOTMOB_SOURCE_TYPES = (
     "FRESH_INDEX",
     "FRESH_FETCH",
@@ -52,12 +59,15 @@ class FotMobMatchIndexRecord:
     match_status: str | None = None
     league_name: str | None = None
     country: str | None = None
+    country_code: str | None = None
+    country_name: str | None = None
     first_seen_at: str | None = None
     provider: str = "FOTMOB"
     source_type: str = "FRESH_INDEX"
     source_context: str | None = None
     stats_period: str | None = None
     captured_live: bool = False
+    is_next_day: bool = False
     field_provenance: dict[str, Any] | None = None
 
 

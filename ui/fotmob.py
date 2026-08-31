@@ -96,54 +96,58 @@ def render_fotmob_tab(service: FotMobService, event: Any) -> None:
     )
     status_columns[3].metric("FotMob-ID", link["provider_match_id"] if link else "—")
 
+    can_load = service.enabled and service.manual_use_allowed
     if not service.enabled:
-        st.info("FotMob ist deaktiviert. Für die optionale Nutzung FOTMOB_ENABLED=true setzen.")
-        return
-    if not service.manual_use_allowed:
-        st.warning("FotMob-Einzelspielnutzung ist durch die aktuelle Provider-Policy deaktiviert.")
-        return
-    st.info(
-        "V0.5.1: FotMob ist nur für ein ausdrücklich ausgewähltes Einzelspiel aktiv. "
-        "Der periodische Worker bleibt bei dieser Provider-Entscheidung deaktiviert."
-    )
-
-    provider_id = st.text_input(
-        "FotMob Match-ID",
-        value=str(link["provider_match_id"]) if link else "",
-        key=f"fotmob-provider-id-{event.event_id}",
-        help="Die numerische ID aus der FotMob-Match-URL, z. B. aus dem Fragment #5881143.",
-    )
-    if st.button("FotMob laden und deterministisch prüfen", key=f"fotmob-load-{event.event_id}"):
-        if not provider_id.strip():
-            st.warning("Bitte zuerst eine FotMob Match-ID angeben.")
-        else:
-            with st.spinner("FotMob-Match wird gelesen …"):
-                result = service.discover_and_match(event, provider_id.strip())
-            if result.success:
-                st.success("FotMob-Match erfolgreich gelesen und verknüpft.")
-            else:
-                _render_result(result)
-
-    candidate = st.session_state.get("fotmob_last_candidate")
-    if candidate is not None and (
-        link is None or link["match_status"] not in {"MANUALLY_CONFIRMED", "EXACT", "HIGH_CONFIDENCE"}
-    ):
-        st.warning(
-            f"Kandidat: {candidate.home_team} – {candidate.away_team} · "
-            f"{candidate.competition_name or 'Liga unbekannt'} · "
-            f"FotMob-ID {candidate.provider_match_id}"
+        st.info(
+            "FotMob-Netzwerkzugriff ist deaktiviert. Bereits gespeicherte Daten "
+            "werden weiterhin nur lesend angezeigt."
         )
-        confirm_col, reject_col = st.columns(2)
-        if confirm_col.button("Kandidat manuell bestätigen", key=f"fotmob-confirm-{event.event_id}"):
-            service.confirm_manual(event, candidate)
-            st.session_state.pop("fotmob_last_candidate", None)
-            st.success("FotMob-Match manuell bestätigt.")
-            st.rerun()
-        if reject_col.button("Kandidat ablehnen", key=f"fotmob-reject-{event.event_id}"):
-            service.reject_match(event, candidate.provider_match_id)
-            st.session_state.pop("fotmob_last_candidate", None)
-            st.info("Kandidat als abgelehnt gespeichert.")
-            st.rerun()
+    elif not service.manual_use_allowed:
+        st.warning("FotMob-Einzelspielnutzung ist durch die aktuelle Provider-Policy deaktiviert.")
+    else:
+        st.info(
+            "FotMob ist nur für ein ausdrücklich ausgewähltes Einzelspiel aktiv. "
+            "Der periodische Worker bleibt bei dieser Provider-Entscheidung deaktiviert."
+        )
+
+    if can_load:
+        provider_id = st.text_input(
+            "FotMob Match-ID",
+            value=str(link["provider_match_id"]) if link else "",
+            key=f"fotmob-provider-id-{event.event_id}",
+            help="Die numerische ID aus der FotMob-Match-URL, z. B. aus dem Fragment #5881143.",
+        )
+        if st.button("FotMob laden und deterministisch prüfen", key=f"fotmob-load-{event.event_id}"):
+            if not provider_id.strip():
+                st.warning("Bitte zuerst eine FotMob Match-ID angeben.")
+            else:
+                with st.spinner("FotMob-Match wird gelesen …"):
+                    result = service.discover_and_match(event, provider_id.strip())
+                if result.success:
+                    st.success("FotMob-Match erfolgreich gelesen und verknüpft.")
+                else:
+                    _render_result(result)
+
+        candidate = st.session_state.get("fotmob_last_candidate")
+        if candidate is not None and (
+            link is None or link["match_status"] not in {"MANUALLY_CONFIRMED", "EXACT", "HIGH_CONFIDENCE"}
+        ):
+            st.warning(
+                f"Kandidat: {candidate.home_team} – {candidate.away_team} · "
+                f"{candidate.competition_name or 'Liga unbekannt'} · "
+                f"FotMob-ID {candidate.provider_match_id}"
+            )
+            confirm_col, reject_col = st.columns(2)
+            if confirm_col.button("Kandidat manuell bestätigen", key=f"fotmob-confirm-{event.event_id}"):
+                service.confirm_manual(event, candidate)
+                st.session_state.pop("fotmob_last_candidate", None)
+                st.success("FotMob-Match manuell bestätigt.")
+                st.rerun()
+            if reject_col.button("Kandidat ablehnen", key=f"fotmob-reject-{event.event_id}"):
+                service.reject_match(event, candidate.provider_match_id)
+                st.session_state.pop("fotmob_last_candidate", None)
+                st.info("Kandidat als abgelehnt gespeichert.")
+                st.rerun()
 
     # A successful load updates Current State in the same interaction.  Read
     # the row again so the tab does not show one stale render cycle.
@@ -260,14 +264,88 @@ def render_fotmob_debug(service: FotMobService) -> None:
         st.info("Noch keine FotMob-Matches verknüpft.")
 
 
+def _munich_datetime(value: Any) -> str:
+    if not value:
+        return "—"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+        return parsed.astimezone(ZoneInfo("Europe/Berlin")).strftime("%d.%m.%Y %H:%M")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _historical_ht_rows(core: dict[str, Any]) -> list[dict[str, str]]:
+    fields = (
+        ("xG", "ht_xg_home", "ht_xg_away"),
+        ("Schüsse", "ht_shots_home", "ht_shots_away"),
+        ("Schüsse aufs Tor", "ht_shots_on_target_home", "ht_shots_on_target_away"),
+        ("Großchancen", "ht_big_chances_home", "ht_big_chances_away"),
+        ("Ecken", "ht_corners_home", "ht_corners_away"),
+        ("Ballbesitz (%)", "ht_possession_home", "ht_possession_away"),
+        ("Gelbe Karten", "ht_yellow_cards_home", "ht_yellow_cards_away"),
+        ("Rote Karten", "ht_red_cards_home", "ht_red_cards_away"),
+        ("Schüsse im Strafraum", "ht_shots_inside_box_home", "ht_shots_inside_box_away"),
+        ("Schüsse außerhalb", "ht_shots_outside_box_home", "ht_shots_outside_box_away"),
+        ("Ballkontakte im Strafraum", "ht_touches_in_box_home", "ht_touches_in_box_away"),
+        ("Pässe", "ht_passes_home", "ht_passes_away"),
+        ("Genaue Pässe", "ht_accurate_passes_home", "ht_accurate_passes_away"),
+        ("Torwartparaden", "ht_goalkeeper_saves_home", "ht_goalkeeper_saves_away"),
+        ("Expected Threat", "ht_expected_threat_home", "ht_expected_threat_away"),
+        ("Fouls", "ht_fouls_home", "ht_fouls_away"),
+        ("Abseits", "ht_offsides_home", "ht_offsides_away"),
+    )
+    rows: list[dict[str, str]] = []
+    for label, home_key, away_key in fields:
+        home = core.get(home_key)
+        away = core.get(away_key)
+        if home is not None or away is not None:
+            rows.append({"Metrik": label, "Heim": _display(home), "Auswärts": _display(away)})
+    try:
+        extra_stats = json.loads(str(core.get("ht_extra_stats_json") or "{}"))
+    except (TypeError, ValueError):
+        extra_stats = {}
+    if isinstance(extra_stats, dict):
+        for label, value in sorted(extra_stats.items(), key=lambda item: str(item[0])):
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
+                home, away = value[0], value[1]
+            else:
+                home, away = value, None
+            rows.append({"Metrik": str(label), "Heim": _display(home), "Auswärts": _display(away)})
+    return rows
+
+
+def _historical_table_row(row: Any, core: dict[str, Any]) -> dict[str, str]:
+    return {
+        "Datum": str(row["observation_date"]),
+        "Anstoß München": _munich_datetime(row["kickoff_at_utc"]),
+        "Folgetag-Eintrag": "ja" if row["is_next_day"] else "nein",
+        "Land": row["country_name"] or row["country_code"] or "—",
+        "Liga": row["league_name"] or row["league_id"],
+        "Saison": row["season_label"] or row["season_id"] or "—",
+        "Spiel": f"{row['home_team_name']} – {row['away_team_name']}",
+        "Halbzeit": _score_label(core.get("ht_score_home"), core.get("ht_score_away")),
+        "HZ xG": _score_label(core.get("ht_xg_home"), core.get("ht_xg_away")),
+        "HZ Schüsse": _score_label(core.get("ht_shots_home"), core.get("ht_shots_away")),
+        "HZ SOT": _score_label(
+            core.get("ht_shots_on_target_home"), core.get("ht_shots_on_target_away")
+        ),
+        "HZ Ecken": _score_label(core.get("ht_corners_home"), core.get("ht_corners_away")),
+        "Endstand": _score_label(core.get("ft_score_home"), core.get("ft_score_away")),
+        "FotMob-ID": str(row["fotmob_match_id"]),
+    }
+
+
 def _render_historical_date_loader(service: FotMobService) -> None:
-    """Render the intentionally small V0.5.4 date-range import control."""
+    """Load and inspect every FotMob-listed game for a selected date range."""
 
     st.subheader("FotMob-Historie laden")
     st.caption(
-        "Bundesliga · Deutschland · Tagesauswahl nach FotMob-UTC-Datum. "
-        "Die Auswahl schreibt den Fixture-Index in SQLite und die Detaildaten "
-        "in das kanonische Parquet-Archiv."
+        "Alle Länder und Ligen aus dem FotMob-Tagesfeed. Jede dort gelistete "
+        "Partie wird unabhängig von der Anstoßzeit geprüft; Partien ohne "
+        "FirstHalf-Daten werden nicht ins Detailarchiv übernommen. "
+        "Index/Katalog liegen in SQLite, Detailmetriken im kanonischen Parquet-Archiv."
     )
     munich_today = datetime.now(ZoneInfo("Europe/Berlin")).date()
     default_from = munich_today - timedelta(days=7)
@@ -290,11 +368,10 @@ def _render_historical_date_loader(service: FotMobService) -> None:
         )
     if submitted:
         try:
-            with st.spinner("FotMob-Tagesdaten werden geladen …"):
+            with st.spinner("FotMob-Tagesdaten für alle Länder und Ligen werden geladen …"):
                 result = service.history_pipeline.load_date_range(
                     start_date,
                     end_date,
-                    league_id=service.settings.fotmob_history_league_id,
                     fetch_details=True,
                     workers=service.settings.fotmob_history_workers,
                     execution_mode="manual",
@@ -303,6 +380,8 @@ def _render_historical_date_loader(service: FotMobService) -> None:
         except (TypeError, ValueError, OSError, RuntimeError) as exc:
             st.session_state["fotmob_last_date_load"] = {
                 "status": "ERROR",
+                "from_date": str(start_date),
+                "to_date": str(end_date),
                 "error": str(exc),
             }
 
@@ -310,47 +389,103 @@ def _render_historical_date_loader(service: FotMobService) -> None:
     if isinstance(last_result, dict):
         status = str(last_result.get("status", ""))
         if status == "PASS":
+            scope = "alle Länder/Ligen" if last_result.get("scope") == "ALL_LEAGUES" else "die ausgewählte Liga"
             st.success(
-                f"FotMob abgeschlossen: {last_result.get('fixtures', 0)} Spiele "
-                f"für {last_result.get('from_date', '—')} bis {last_result.get('to_date', '—')}."
+                f"FotMob abgeschlossen: {last_result.get('unique_fixtures', last_result.get('fixtures', 0))} "
+                f"einzigartige Spiele für {last_result.get('from_date', '—')} bis "
+                f"{last_result.get('to_date', '—')} ({scope})."
             )
         elif status == "BLOCKED_BY_POLICY":
             st.warning(str(last_result.get("error") or "FotMob-Historie ist durch die Konfiguration blockiert."))
         else:
+            errors = last_result.get("errors", [])
             st.warning(
                 f"FotMob-Lauf {status or 'FEHLER'}: "
-                f"{last_result.get('error') or '; '.join(last_result.get('errors', [])) or 'siehe Details'}"
+                f"{last_result.get('error') or '; '.join(str(item) for item in errors) or 'siehe Details'}"
             )
+        warnings = last_result.get("warnings", [])
+        if warnings:
+            st.caption("Hinweis: " + "; ".join(str(item) for item in warnings))
         details = last_result.get("details") or {}
-        detail_columns = st.columns(4)
-        detail_columns[0].metric("Index-Zeilen", last_result.get("daily_index_rows", 0))
-        detail_columns[1].metric("Details komplett", details.get("fetched", 0))
-        detail_columns[2].metric("Period-Stats", details.get("period_stats_rows", 0))
-        detail_columns[3].metric("Schüsse / Events", f"{details.get('shot_rows', 0)} / {details.get('event_rows', 0)}")
+        detail_columns = st.columns(5)
+        detail_columns[0].metric("Index-Einträge", last_result.get("daily_index_rows", 0))
+        detail_columns[1].metric("Spiele", last_result.get("unique_fixtures", last_result.get("fixtures", 0)))
+        detail_columns[2].metric("HZ-Daten geladen", details.get("fetched", 0))
+        detail_columns[3].metric("Ohne HZ übersprungen", details.get("skipped_no_halftime", 0))
+        detail_columns[4].metric("Period-Stats", details.get("period_stats_rows", 0))
 
+    loaded_from = str(last_result.get("from_date")) if isinstance(last_result, dict) and last_result.get("from_date") else default_from.isoformat()
+    loaded_to = str(last_result.get("to_date")) if isinstance(last_result, dict) and last_result.get("to_date") else munich_today.isoformat()
     rows = service.history_pipeline.store.daily_index(
-        league_id=service.settings.fotmob_history_league_id,
-        limit=5000,
+        start_date=loaded_from,
+        end_date=loaded_to,
+        limit=20000,
+        order_by="observation_date",
+        ascending=False,
     )
-    if rows:
-        st.caption("Zuletzt gespeicherter FotMob-Tagesindex")
+    if not rows:
+        st.info("Noch kein FotMob-Tagesindex für diesen Zeitraum geladen.")
+        return
+
+    country_options = sorted({str(row["country_name"] or row["country_code"]) for row in rows if row["country_name"] or row["country_code"]})
+    league_options = sorted({str(row["league_name"] or row["league_id"]) for row in rows if row["league_name"] or row["league_id"]})
+    season_options = sorted({str(row["season_label"] or row["season_id"]) for row in rows if row["season_label"] or row["season_id"]}, reverse=True)
+    filter_columns = st.columns(3)
+    country_filter = filter_columns[0].selectbox("Land", ["Alle"] + country_options, key="fotmob-history-country-filter")
+    league_filter = filter_columns[1].selectbox("Liga", ["Alle"] + league_options, key="fotmob-history-league-filter")
+    season_filter = filter_columns[2].selectbox("Saison", ["Alle"] + season_options, key="fotmob-history-season-filter")
+
+    filtered_rows = [
+        row
+        for row in rows
+        if (country_filter == "Alle" or str(row["country_name"] or row["country_code"]) == country_filter)
+        and (league_filter == "Alle" or str(row["league_name"] or row["league_id"]) == league_filter)
+        and (season_filter == "Alle" or str(row["season_label"] or row["season_id"]) == season_filter)
+    ]
+    skipped_count = sum(row["detail_status"] == "SKIPPED_NO_HALFTIME" for row in filtered_rows)
+    detail_rows: list[tuple[Any, dict[str, Any]]] = []
+    for row in filtered_rows:
+        if row["detail_status"] not in {"FETCHED", "PARTIAL"} or not row["canonical_archive_path"]:
+            continue
+        core = service.history_pipeline.canonical_archive.read_match_core(row["canonical_archive_path"])
+        if core is not None and core.get("ht_score_home") is not None and core.get("ht_score_away") is not None:
+            detail_rows.append((row, core))
+
+    summary_columns = st.columns(4)
+    summary_columns[0].metric("Index gefiltert", len(filtered_rows))
+    summary_columns[1].metric("Mit Halbzeitdaten", len(detail_rows))
+    summary_columns[2].metric("Ohne Halbzeitdaten", skipped_count)
+    summary_columns[3].metric("Länder / Ligen", f"{len({row['country_code'] for row in filtered_rows})} / {len({row['league_id'] for row in filtered_rows})}")
+
+    if detail_rows:
+        st.caption("Gespeicherte Spiele mit FirstHalf-Daten. Die Tabelle ist nach jeder Spalte sortierbar.")
         st.dataframe(
-            [
-                {
-                    "Datum": row["observation_date"],
-                    "Anstoß UTC": row["kickoff_at_utc"] or "—",
-                    "Land": row["country_name"] or row["country_code"] or "—",
-                    "Liga": row["league_name"] or row["league_id"],
-                    "Season": row["season_label"] or row["season_id"] or "—",
-                    "Spiel": f"{row['home_team_name']} – {row['away_team_name']}",
-                    "FotMob-ID": row["fotmob_match_id"],
-                    "Detail": row["detail_status"] or "NOT_FETCHED",
-                    "Qualität": row["data_quality"] or "—",
-                }
-                for row in rows
-            ],
+            [_historical_table_row(row, core) for row, core in detail_rows],
             hide_index=True,
             width="stretch",
         )
+        detail_by_id = {str(row["fotmob_match_id"]): (row, core) for row, core in detail_rows}
+        selected_id = st.selectbox(
+            "Spiel für Halbzeitdetails",
+            list(detail_by_id),
+            format_func=lambda match_id: (
+                f"{detail_by_id[match_id][0]['home_team_name']} – "
+                f"{detail_by_id[match_id][0]['away_team_name']} · {match_id}"
+            ),
+            key="fotmob-history-selected-match",
+        )
+        selected_row, selected_core = detail_by_id[selected_id]
+        st.subheader(
+            f"Halbzeitdaten · {selected_row['home_team_name']} – {selected_row['away_team_name']}"
+        )
+        st.dataframe(_historical_ht_rows(selected_core), hide_index=True, width="stretch")
+        st.caption(
+            f"Land: {selected_row['country_name'] or selected_row['country_code'] or '—'} · "
+            f"Liga: {selected_row['league_name'] or selected_row['league_id']} · "
+            f"Saison: {selected_row['season_label'] or selected_row['season_id'] or '—'} · "
+            f"FotMob-ID: {selected_id} · Archiv: {selected_row['canonical_archive_path']}"
+        )
+    elif skipped_count:
+        st.info("Für die aktuelle Auswahl existieren nur Spiele ohne FotMob-FirstHalf-Daten; sie wurden bewusst übersprungen.")
     else:
-        st.info("Noch kein FotMob-Tagesindex geladen.")
+        st.info("Für die aktuelle Auswahl sind noch keine vollständigen Halbzeitdetails archiviert.")

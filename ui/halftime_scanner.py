@@ -195,7 +195,3 @@ def render_halftime_scanner(
                 hide_index=True,
                 width="stretch",
             )
-    st.info(
-        "Das Ranking beschreibt Marktstruktur und ist keine Wettempfehlung. "
-        "Es gibt keine Wettabgabe."
-    )

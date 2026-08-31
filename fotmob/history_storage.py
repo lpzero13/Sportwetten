@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS fotmob_match_index (
     season_label TEXT NOT NULL,
     league_name TEXT,
     country TEXT,
+    country_code TEXT,
+    country_name TEXT,
     kickoff_at TEXT,
     home_team_id TEXT,
     home_team_name TEXT NOT NULL,
@@ -143,6 +145,7 @@ CREATE TABLE IF NOT EXISTS fotmob_daily_index (
     away_team_name TEXT NOT NULL,
     round TEXT,
     match_status TEXT,
+    is_next_day INTEGER NOT NULL DEFAULT 0,
     source_endpoint TEXT,
     payload_hash TEXT,
     fetched_at TEXT NOT NULL,
@@ -157,6 +160,15 @@ CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_date
 CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_match
     ON fotmob_daily_index(provider, fotmob_match_id, observation_date);
 
+CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_country
+    ON fotmob_daily_index(provider, country_code, observation_date, kickoff_at_utc);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_league
+    ON fotmob_daily_index(provider, league_id, observation_date, kickoff_at_utc);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_daily_index_season
+    ON fotmob_daily_index(provider, season_label, observation_date, kickoff_at_utc);
+
 CREATE TABLE IF NOT EXISTS fotmob_daily_load_runs (
     provider TEXT NOT NULL DEFAULT 'FOTMOB',
     observation_date TEXT NOT NULL,
@@ -167,6 +179,12 @@ CREATE TABLE IF NOT EXISTS fotmob_daily_load_runs (
     fixture_count INTEGER NOT NULL DEFAULT 0,
     selected_count INTEGER NOT NULL DEFAULT 0,
     detail_count INTEGER NOT NULL DEFAULT 0,
+    skipped_no_halftime_count INTEGER NOT NULL DEFAULT 0,
+    feed_group_count INTEGER NOT NULL DEFAULT 0,
+    feed_entry_count INTEGER NOT NULL DEFAULT 0,
+    feed_unique_count INTEGER NOT NULL DEFAULT 0,
+    next_day_count INTEGER NOT NULL DEFAULT 0,
+    duplicates_removed_count INTEGER NOT NULL DEFAULT 0,
     payload_hash TEXT,
     source_endpoint TEXT,
     error TEXT,
@@ -214,6 +232,8 @@ class FotMobHistoryStore:
             # additive and do not rebuild or delete the historical catalog.
             for table, columns in {
                 "fotmob_match_index": {
+                    "country_code": "TEXT",
+                    "country_name": "TEXT",
                     "source_type": "TEXT NOT NULL DEFAULT 'FRESH_INDEX'",
                     "source_context": "TEXT",
                     "stats_period": "TEXT",
@@ -227,6 +247,17 @@ class FotMobHistoryStore:
                     "stats_period": "TEXT",
                     "captured_live": "INTEGER NOT NULL DEFAULT 0",
                     "field_provenance_json": "TEXT NOT NULL DEFAULT '{}'",
+                },
+                "fotmob_daily_index": {
+                    "is_next_day": "INTEGER NOT NULL DEFAULT 0",
+                },
+                "fotmob_daily_load_runs": {
+                    "skipped_no_halftime_count": "INTEGER NOT NULL DEFAULT 0",
+                    "feed_group_count": "INTEGER NOT NULL DEFAULT 0",
+                    "feed_entry_count": "INTEGER NOT NULL DEFAULT 0",
+                    "feed_unique_count": "INTEGER NOT NULL DEFAULT 0",
+                    "next_day_count": "INTEGER NOT NULL DEFAULT 0",
+                    "duplicates_removed_count": "INTEGER NOT NULL DEFAULT 0",
                 },
             }.items():
                 existing_columns = {
@@ -324,11 +355,12 @@ class FotMobHistoryStore:
                     """
                     INSERT INTO fotmob_match_index (
                         fotmob_match_id, provider, league_id, season_id, season_label,
-                        league_name, country, kickoff_at, home_team_id, home_team_name,
+                        league_name, country, country_code, country_name, kickoff_at,
+                        home_team_id, home_team_name,
                         away_team_id, away_team_name, round, match_status,
                         first_seen_at, last_seen_at, source_type, source_context,
                         stats_period, captured_live, field_provenance_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(fotmob_match_id) DO UPDATE SET
                         provider = excluded.provider,
                         league_id = excluded.league_id,
@@ -336,6 +368,8 @@ class FotMobHistoryStore:
                         season_label = excluded.season_label,
                         league_name = COALESCE(excluded.league_name, fotmob_match_index.league_name),
                         country = COALESCE(excluded.country, fotmob_match_index.country),
+                        country_code = COALESCE(excluded.country_code, fotmob_match_index.country_code),
+                        country_name = COALESCE(excluded.country_name, fotmob_match_index.country_name),
                         kickoff_at = COALESCE(excluded.kickoff_at, fotmob_match_index.kickoff_at),
                         home_team_id = COALESCE(excluded.home_team_id, fotmob_match_index.home_team_id),
                         home_team_name = excluded.home_team_name,
@@ -364,6 +398,8 @@ class FotMobHistoryStore:
                         record.season_label,
                         record.league_name,
                         record.country,
+                        record.country_code or self._country_code(record.country),
+                        record.country_name or self._country_name(record.country),
                         record.kickoff_at,
                         record.home_team_id,
                         record.home_team_name,
@@ -500,8 +536,8 @@ class FotMobHistoryStore:
         inserted = updated = 0
         with self._lock, self.connection:
             for record in record_list:
-                country_code = self._country_code(record.country)
-                country_name = self._country_name(record.country)
+                country_code = record.country_code or self._country_code(record.country)
+                country_name = record.country_name or self._country_name(record.country)
                 existing = self.connection.execute(
                     """
                     SELECT 1 FROM fotmob_daily_index
@@ -516,10 +552,10 @@ class FotMobHistoryStore:
                         provider, observation_date, fotmob_match_id, league_id,
                         league_name, country_code, country_name, season_id,
                         season_label, kickoff_at_utc, home_team_id, home_team_name,
-                        away_team_id, away_team_name, round, match_status,
+                        away_team_id, away_team_name, round, match_status, is_next_day,
                         source_endpoint, payload_hash, fetched_at, first_seen_at,
                         last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(provider, observation_date, fotmob_match_id) DO UPDATE SET
                         league_id = excluded.league_id,
                         league_name = COALESCE(excluded.league_name, fotmob_daily_index.league_name),
@@ -534,6 +570,7 @@ class FotMobHistoryStore:
                         away_team_name = excluded.away_team_name,
                         round = COALESCE(excluded.round, fotmob_daily_index.round),
                         match_status = COALESCE(excluded.match_status, fotmob_daily_index.match_status),
+                        is_next_day = excluded.is_next_day,
                         source_endpoint = COALESCE(excluded.source_endpoint, fotmob_daily_index.source_endpoint),
                         payload_hash = COALESCE(excluded.payload_hash, fotmob_daily_index.payload_hash),
                         fetched_at = excluded.fetched_at,
@@ -545,7 +582,7 @@ class FotMobHistoryStore:
                         country_name, record.season_id, record.season_label,
                         record.kickoff_at, record.home_team_id, record.home_team_name,
                         record.away_team_id, record.away_team_name, record.round_name,
-                        record.match_status, source_endpoint, payload_hash, fetched,
+                        record.match_status, int(bool(record.is_next_day)), source_endpoint, payload_hash, fetched,
                         first_seen, fetched,
                     ),
                 )
@@ -565,6 +602,12 @@ class FotMobHistoryStore:
         fixture_count: int = 0,
         selected_count: int = 0,
         detail_count: int = 0,
+        skipped_no_halftime_count: int = 0,
+        feed_group_count: int | None = None,
+        feed_entry_count: int | None = None,
+        feed_unique_count: int | None = None,
+        next_day_count: int | None = None,
+        duplicates_removed_count: int | None = None,
         payload_hash: str | None = None,
         source_endpoint: str | None = None,
         error: str | None = None,
@@ -577,14 +620,25 @@ class FotMobHistoryStore:
                 INSERT INTO fotmob_daily_load_runs (
                     provider, observation_date, league_id, season_id, status,
                     fetched_at, fixture_count, selected_count, detail_count,
+                    skipped_no_halftime_count,
+                    feed_group_count, feed_entry_count, feed_unique_count,
+                    next_day_count, duplicates_removed_count,
                     payload_hash, source_endpoint, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          COALESCE(?, 0), COALESCE(?, 0), COALESCE(?, 0),
+                          COALESCE(?, 0), COALESCE(?, 0), ?, ?, ?)
                 ON CONFLICT(provider, observation_date, league_id, season_id) DO UPDATE SET
                     status = excluded.status,
                     fetched_at = excluded.fetched_at,
                     fixture_count = excluded.fixture_count,
                     selected_count = excluded.selected_count,
                     detail_count = excluded.detail_count,
+                    skipped_no_halftime_count = excluded.skipped_no_halftime_count,
+                    feed_group_count = CASE WHEN ? IS NULL THEN fotmob_daily_load_runs.feed_group_count ELSE excluded.feed_group_count END,
+                    feed_entry_count = CASE WHEN ? IS NULL THEN fotmob_daily_load_runs.feed_entry_count ELSE excluded.feed_entry_count END,
+                    feed_unique_count = CASE WHEN ? IS NULL THEN fotmob_daily_load_runs.feed_unique_count ELSE excluded.feed_unique_count END,
+                    next_day_count = CASE WHEN ? IS NULL THEN fotmob_daily_load_runs.next_day_count ELSE excluded.next_day_count END,
+                    duplicates_removed_count = CASE WHEN ? IS NULL THEN fotmob_daily_load_runs.duplicates_removed_count ELSE excluded.duplicates_removed_count END,
                     payload_hash = COALESCE(excluded.payload_hash, fotmob_daily_load_runs.payload_hash),
                     source_endpoint = COALESCE(excluded.source_endpoint, fotmob_daily_load_runs.source_endpoint),
                     error = COALESCE(excluded.error, fotmob_daily_load_runs.error)
@@ -593,7 +647,12 @@ class FotMobHistoryStore:
                     provider.upper(), str(observation_date), str(league_id),
                     season_id, str(status), fetched_at or _now(),
                     max(0, int(fixture_count)), max(0, int(selected_count)),
-                    max(0, int(detail_count)), payload_hash, source_endpoint, error,
+                    max(0, int(detail_count)), max(0, int(skipped_no_halftime_count)),
+                    feed_group_count, feed_entry_count, feed_unique_count,
+                    next_day_count, duplicates_removed_count,
+                    payload_hash, source_endpoint, error,
+                    feed_group_count, feed_entry_count, feed_unique_count,
+                    next_day_count, duplicates_removed_count,
                 ),
             )
 
@@ -603,8 +662,15 @@ class FotMobHistoryStore:
         end_date: str | None = None,
         *,
         league_id: str | None = None,
+        league_name: str | None = None,
+        country_code: str | None = None,
+        country_name: str | None = None,
+        season_id: str | None = None,
+        season_label: str | None = None,
         provider: str = "FOTMOB",
         limit: int = 500,
+        order_by: str = "observation_date",
+        ascending: bool = False,
     ) -> list[sqlite3.Row]:
         clauses = ["i.provider = ?"]
         params: list[Any] = [provider.upper()]
@@ -617,6 +683,33 @@ class FotMobHistoryStore:
         if league_id:
             clauses.append("i.league_id = ?")
             params.append(str(league_id))
+        if league_name:
+            clauses.append("i.league_name = ?")
+            params.append(str(league_name))
+        if country_code:
+            clauses.append("i.country_code = ?")
+            params.append(str(country_code).upper())
+        if country_name:
+            clauses.append("i.country_name = ?")
+            params.append(str(country_name))
+        if season_id:
+            clauses.append("i.season_id = ?")
+            params.append(str(season_id))
+        if season_label:
+            clauses.append("i.season_label = ?")
+            params.append(str(season_label))
+        sort_columns = {
+            "observation_date": "i.observation_date",
+            "kickoff_at_utc": "i.kickoff_at_utc",
+            "country_name": "i.country_name",
+            "league_name": "i.league_name",
+            "season_label": "i.season_label",
+            "home_team_name": "i.home_team_name",
+            "away_team_name": "i.away_team_name",
+            "fotmob_match_id": "i.fotmob_match_id",
+        }
+        sort_column = sort_columns.get(str(order_by), "i.observation_date")
+        sort_direction = "ASC" if ascending else "DESC"
         params.append(max(1, int(limit)))
         with self._lock:
             return list(self.connection.execute(
@@ -635,7 +728,7 @@ class FotMobHistoryStore:
                   ON legacy.provider = i.provider AND legacy.fotmob_match_id = i.fotmob_match_id
                  AND legacy.schema_version = 'fotmob_historical_v1'
                 WHERE {' AND '.join(clauses)}
-                ORDER BY i.observation_date DESC, i.kickoff_at_utc, i.fotmob_match_id
+                ORDER BY {sort_column} {sort_direction}, i.kickoff_at_utc, i.fotmob_match_id
                 LIMIT ?
                 """,
                 params,
@@ -929,7 +1022,9 @@ class FotMobHistoryStore:
                 allowed = status == "NOT_FETCHED" or (
                     retry_failed and status == "FAILED"
                 )
-                if refresh_existing and source != "FRESH_FETCH" and status in {"FETCHED", "PARTIAL"}:
+                if refresh_existing and source != "FRESH_FETCH" and status in {
+                    "FETCHED", "PARTIAL", "SKIPPED_NO_HALFTIME",
+                }:
                     allowed = True
                 if not allowed or int(row["attempt_count"] or 0) >= max(1, int(max_attempts)):
                     self.connection.commit()
@@ -1002,6 +1097,32 @@ class FotMobHistoryStore:
                 ),
             )
         return detail_status
+
+    def mark_skipped_no_halftime(
+        self,
+        provider_match_id: str,
+        *,
+        reason: str = "FotMob FirstHalf-Statistiken nicht vorhanden",
+        worker_id: str | None = None,
+    ) -> str:
+        """Record a deliberate detail skip without creating an archive row."""
+
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                UPDATE fotmob_match_index
+                SET detail_status = 'SKIPPED_NO_HALFTIME',
+                    last_checked_at = ?, last_error = ?, worker_id = NULL,
+                    data_quality = 'NO_HALFTIME', ml_eligible = 0,
+                    parser_version = NULL, schema_version = NULL,
+                    raw_payload_path = NULL, payload_hash = NULL,
+                    second_half_goals = NULL, second_half_goal_class = NULL
+                WHERE fotmob_match_id = ?
+                  AND (? IS NULL OR worker_id = ?)
+                """,
+                (_now(), str(reason)[:2000], str(provider_match_id), worker_id, worker_id),
+            )
+        return "SKIPPED_NO_HALFTIME"
 
     def mark_failure(self, provider_match_id: str, error: str, *, max_attempts: int = 3, worker_id: str | None = None) -> str:
         with self._lock, self.connection:
