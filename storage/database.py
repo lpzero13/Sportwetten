@@ -759,6 +759,60 @@ CREATE TABLE IF NOT EXISTS fotmob_daily_load_runs (
 
 CREATE INDEX IF NOT EXISTS idx_fotmob_daily_load_runs_date
     ON fotmob_daily_load_runs(provider, observation_date, league_id, status);
+
+CREATE TABLE IF NOT EXISTS fotmob_performance_profile (
+    profile_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    tested_at TEXT NOT NULL,
+    from_date TEXT,
+    to_date TEXT,
+    phase TEXT NOT NULL DEFAULT 'RPS',
+    rps REAL NOT NULL,
+    workers INTEGER NOT NULL,
+    requests INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    successful INTEGER NOT NULL DEFAULT 0,
+    http_429 INTEGER NOT NULL DEFAULT 0,
+    http_403 INTEGER NOT NULL DEFAULT 0,
+    http_5xx INTEGER NOT NULL DEFAULT 0,
+    timeouts INTEGER NOT NULL DEFAULT 0,
+    connection_errors INTEGER NOT NULL DEFAULT 0,
+    retries INTEGER NOT NULL DEFAULT 0,
+    parse_failures INTEGER NOT NULL DEFAULT 0,
+    success_rate REAL NOT NULL DEFAULT 0,
+    rate_limit_rate REAL NOT NULL DEFAULT 0,
+    error_rate REAL NOT NULL DEFAULT 0,
+    median_latency_ms REAL NOT NULL DEFAULT 0,
+    p95_latency_ms REAL NOT NULL DEFAULT 0,
+    effective_rps REAL NOT NULL DEFAULT 0,
+    matches_per_minute REAL NOT NULL DEFAULT 0,
+    megabytes_per_minute REAL NOT NULL DEFAULT 0,
+    connection_pool_size INTEGER,
+    cpu_time_seconds REAL,
+    cpu_utilization_percent REAL,
+    rss_peak_bytes INTEGER,
+    rss_delta_bytes INTEGER,
+    rate_wait_ms REAL,
+    rate_wait_ratio REAL,
+    controller_rps REAL,
+    rate_slot_rps REAL,
+    rate_slot_span_seconds REAL,
+    rate_slot_interval_median_ms REAL,
+    request_start_rps REAL,
+    request_start_span_seconds REAL,
+    request_start_interval_median_ms REAL,
+    detail_call_median_ms REAL,
+    detail_call_p95_ms REAL,
+    parse_median_ms REAL,
+    parse_p95_ms REAL,
+    status TEXT NOT NULL,
+    bottleneck TEXT,
+    notes TEXT,
+    UNIQUE(run_id, phase, rps, workers)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_performance_profile_lookup
+    ON fotmob_performance_profile(phase, status, rps, workers, tested_at);
 """
 
 
@@ -852,6 +906,27 @@ class Database:
         ):
             self._ensure_column("snapshots", column, definition)
         self._ensure_column("paper_trades", "entry_raw_payload_path", "TEXT")
+        for column, definition in (
+            ("connection_pool_size", "INTEGER"),
+            ("cpu_time_seconds", "REAL"),
+            ("cpu_utilization_percent", "REAL"),
+            ("rss_peak_bytes", "INTEGER"),
+            ("rss_delta_bytes", "INTEGER"),
+            ("rate_wait_ms", "REAL"),
+            ("rate_wait_ratio", "REAL"),
+            ("controller_rps", "REAL"),
+            ("rate_slot_rps", "REAL"),
+            ("rate_slot_span_seconds", "REAL"),
+            ("rate_slot_interval_median_ms", "REAL"),
+            ("request_start_rps", "REAL"),
+            ("request_start_span_seconds", "REAL"),
+            ("request_start_interval_median_ms", "REAL"),
+            ("detail_call_median_ms", "REAL"),
+            ("detail_call_p95_ms", "REAL"),
+            ("parse_median_ms", "REAL"),
+            ("parse_p95_ms", "REAL"),
+        ):
+            self._ensure_column("fotmob_performance_profile", column, definition)
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_odds_history_snapshot ON odds_history(snapshot_id)"
         )
@@ -3006,6 +3081,7 @@ class Database:
             "fotmob_fixture_index_runs",
             "fotmob_daily_index",
             "fotmob_daily_load_runs",
+            "fotmob_performance_profile",
         }
         if table not in allowed:
             raise ValueError(f"Unsupported table: {table}")

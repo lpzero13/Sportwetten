@@ -142,8 +142,35 @@ FOTMOB_DAILY_TIMEZONE = "Europe/Berlin"
 FOTMOB_DAILY_CCODE3 = "DEU"
 FOTMOB_DAILY_LOCALE = "de"
 FOTMOB_HISTORY_ENABLED = True
-FOTMOB_HISTORY_WORKERS = 10
-FOTMOB_HISTORY_REQUESTS_PER_SECOND = 0.5
+# Historical research starts at a measurable throughput and can ramp in
+# configured steps.  The old 0.5 req/s value is retained only as a legacy
+# environment-variable compatibility name below; it is no longer the default.
+FOTMOB_RATE_MODE = "ADAPTIVE"
+FOTMOB_RATE_MODE_VALUES = ("ADAPTIVE", "FIXED", "CONSERVATIVE")
+FOTMOB_INITIAL_RPS = 5.0
+FOTMOB_RPS_STEP = 5.0
+FOTMOB_MIN_RPS = 0.5
+# V0.5.6.1: two independent three-day canaries reached 100 target RPS with
+# 100% success and no 429/403/5xx/timeout/parse failures. Windows scheduling
+# currently delivers about 63 effective starts/s, so this is a measured
+# ceiling rather than an expectation of 100 completed matches/s.
+FOTMOB_MAX_RPS = 100.0
+FOTMOB_INITIAL_WORKERS = 10
+FOTMOB_MAX_WORKERS = 40
+FOTMOB_RATE_WINDOW_REQUESTS = 20
+FOTMOB_RATE_COOLDOWN_SECONDS = 5.0
+FOTMOB_MAX_ERROR_RATE = 0.10
+FOTMOB_MAX_5XX_RATE = 0.05
+FOTMOB_MAX_TIMEOUT_RATE = 0.05
+FOTMOB_MAX_CONNECTION_ERROR_RATE = 0.05
+FOTMOB_MAX_P95_LATENCY_MS = 3000.0
+FOTMOB_CONNECTION_POOL_SIZE = 40
+FOTMOB_PERFORMANCE_REQUESTS_PER_LEVEL = 25
+FOTMOB_PERFORMANCE_WORKER_LEVELS = (10, 20, 30, 40)
+FOTMOB_PERFORMANCE_STABLE_CONFIRMATIONS = 2
+# Backwards-compatible setting names.  Code paths use the adaptive settings.
+FOTMOB_HISTORY_WORKERS = FOTMOB_INITIAL_WORKERS
+FOTMOB_HISTORY_REQUESTS_PER_SECOND = FOTMOB_INITIAL_RPS
 FOTMOB_HISTORY_TIMEOUT_SECONDS = 10
 FOTMOB_HISTORY_MAX_RETRIES = 3
 FOTMOB_HISTORY_STALE_MINUTES = 30
@@ -225,6 +252,25 @@ class Settings:
     fotmob_daily_ccode3: str = FOTMOB_DAILY_CCODE3
     fotmob_daily_locale: str = FOTMOB_DAILY_LOCALE
     fotmob_history_enabled: bool = FOTMOB_HISTORY_ENABLED
+    fotmob_rate_mode: str = FOTMOB_RATE_MODE
+    fotmob_initial_rps: float = FOTMOB_INITIAL_RPS
+    fotmob_rps_step: float = FOTMOB_RPS_STEP
+    fotmob_min_rps: float = FOTMOB_MIN_RPS
+    fotmob_max_rps: float = FOTMOB_MAX_RPS
+    fotmob_initial_workers: int = FOTMOB_INITIAL_WORKERS
+    fotmob_max_workers: int = FOTMOB_MAX_WORKERS
+    fotmob_rate_window_requests: int = FOTMOB_RATE_WINDOW_REQUESTS
+    fotmob_rate_cooldown_seconds: float = FOTMOB_RATE_COOLDOWN_SECONDS
+    fotmob_max_error_rate: float = FOTMOB_MAX_ERROR_RATE
+    fotmob_max_5xx_rate: float = FOTMOB_MAX_5XX_RATE
+    fotmob_max_timeout_rate: float = FOTMOB_MAX_TIMEOUT_RATE
+    fotmob_max_connection_error_rate: float = FOTMOB_MAX_CONNECTION_ERROR_RATE
+    fotmob_max_p95_latency_ms: float = FOTMOB_MAX_P95_LATENCY_MS
+    fotmob_connection_pool_size: int = FOTMOB_CONNECTION_POOL_SIZE
+    fotmob_performance_requests_per_level: int = FOTMOB_PERFORMANCE_REQUESTS_PER_LEVEL
+    fotmob_performance_worker_levels: tuple[int, ...] = FOTMOB_PERFORMANCE_WORKER_LEVELS
+    fotmob_performance_stable_confirmations: int = FOTMOB_PERFORMANCE_STABLE_CONFIRMATIONS
+    # Legacy aliases remain visible for existing integrations and reports.
     fotmob_history_workers: int = FOTMOB_HISTORY_WORKERS
     fotmob_history_requests_per_second: float = FOTMOB_HISTORY_REQUESTS_PER_SECOND
     fotmob_history_timeout_seconds: int = FOTMOB_HISTORY_TIMEOUT_SECONDS
@@ -273,6 +319,30 @@ class Settings:
     @classmethod
     def from_env(cls, root_dir: Path | None = None) -> "Settings":
         """Build settings without requiring a dotenv file."""
+
+        # Do not let an old deployment's explicit 0.5 req/s compatibility
+        # variable silently reintroduce the retired historical bottleneck.
+        # Operators can still choose a lower value explicitly through the new
+        # FOTMOB_INITIAL_RPS setting.
+        initial_rps = max(0.0, _env_float("FOTMOB_INITIAL_RPS", FOTMOB_INITIAL_RPS))
+        min_rps = max(0.0, _env_float("FOTMOB_MIN_RPS", FOTMOB_MIN_RPS))
+        max_rps = max(
+            min_rps,
+            initial_rps,
+            _env_float("FOTMOB_MAX_RPS", FOTMOB_MAX_RPS),
+        )
+        initial_workers = max(1, _env_int("FOTMOB_INITIAL_WORKERS", FOTMOB_INITIAL_WORKERS))
+        max_workers = max(
+            initial_workers,
+            _env_int("FOTMOB_MAX_WORKERS", FOTMOB_MAX_WORKERS),
+        )
+        worker_levels = tuple(
+            value
+            for value in _env_int_tuple(
+                "FOTMOB_PERFORMANCE_WORKER_LEVELS", FOTMOB_PERFORMANCE_WORKER_LEVELS
+            )
+            if value > 0
+        ) or FOTMOB_PERFORMANCE_WORKER_LEVELS
 
         return cls(
             root_dir=root_dir or Path(__file__).resolve().parent,
@@ -418,17 +488,58 @@ class Settings:
             ).strip()
             or FOTMOB_DAILY_LOCALE,
             fotmob_history_enabled=_env_bool("FOTMOB_HISTORY_ENABLED", FOTMOB_HISTORY_ENABLED),
-            fotmob_history_workers=min(
-                10,
-                _env_int("FOTMOB_HISTORY_WORKERS", FOTMOB_HISTORY_WORKERS),
+            fotmob_rate_mode=_env_choice(
+                "FOTMOB_RATE_MODE", FOTMOB_RATE_MODE, FOTMOB_RATE_MODE_VALUES
             ),
-            fotmob_history_requests_per_second=max(
-                0.01,
+            fotmob_initial_rps=initial_rps,
+            fotmob_rps_step=max(0.0, _env_float("FOTMOB_RPS_STEP", FOTMOB_RPS_STEP)),
+            fotmob_min_rps=min_rps,
+            fotmob_max_rps=max_rps,
+            fotmob_initial_workers=initial_workers,
+            fotmob_max_workers=max_workers,
+            fotmob_rate_window_requests=_env_int(
+                "FOTMOB_RATE_WINDOW_REQUESTS", FOTMOB_RATE_WINDOW_REQUESTS
+            ),
+            fotmob_rate_cooldown_seconds=max(
+                0.0,
+                _env_float("FOTMOB_RATE_COOLDOWN_SECONDS", FOTMOB_RATE_COOLDOWN_SECONDS),
+            ),
+            fotmob_max_error_rate=max(
+                0.0, _env_float("FOTMOB_MAX_ERROR_RATE", FOTMOB_MAX_ERROR_RATE)
+            ),
+            fotmob_max_5xx_rate=max(
+                0.0, _env_float("FOTMOB_MAX_5XX_RATE", FOTMOB_MAX_5XX_RATE)
+            ),
+            fotmob_max_timeout_rate=max(
+                0.0, _env_float("FOTMOB_MAX_TIMEOUT_RATE", FOTMOB_MAX_TIMEOUT_RATE)
+            ),
+            fotmob_max_connection_error_rate=max(
+                0.0,
                 _env_float(
-                    "FOTMOB_HISTORY_REQUESTS_PER_SECOND",
-                    FOTMOB_HISTORY_REQUESTS_PER_SECOND,
+                    "FOTMOB_MAX_CONNECTION_ERROR_RATE", FOTMOB_MAX_CONNECTION_ERROR_RATE
                 ),
             ),
+            fotmob_max_p95_latency_ms=max(
+                0.0,
+                _env_float("FOTMOB_MAX_P95_LATENCY_MS", FOTMOB_MAX_P95_LATENCY_MS),
+            ),
+            fotmob_connection_pool_size=max(
+                1, _env_int("FOTMOB_CONNECTION_POOL_SIZE", FOTMOB_CONNECTION_POOL_SIZE)
+            ),
+            fotmob_performance_requests_per_level=_env_int(
+                "FOTMOB_PERFORMANCE_REQUESTS_PER_LEVEL",
+                FOTMOB_PERFORMANCE_REQUESTS_PER_LEVEL,
+            ),
+            fotmob_performance_worker_levels=worker_levels,
+            fotmob_performance_stable_confirmations=_env_int(
+                "FOTMOB_PERFORMANCE_STABLE_CONFIRMATIONS",
+                FOTMOB_PERFORMANCE_STABLE_CONFIRMATIONS,
+            ),
+            fotmob_history_workers=min(
+                max_workers,
+                _env_int("FOTMOB_HISTORY_WORKERS", initial_workers),
+            ),
+            fotmob_history_requests_per_second=initial_rps,
             fotmob_history_timeout_seconds=_env_int(
                 "FOTMOB_HISTORY_TIMEOUT_SECONDS", FOTMOB_HISTORY_TIMEOUT_SECONDS
             ),

@@ -214,6 +214,30 @@ def render_data_collection(
             f"{fotmob['outbox_pending']} · Auto-Link-Rate: "
             f"{fotmob['automatic_match_rate'] * 100:.1f}% · getrennt von Tipico-Strategie und Paper Trading."
         )
+        fotmob_access = fotmob.get("access", {}) or {}
+        fotmob_rate = fotmob_access.get("rate_control", {}) or {}
+        fotmob_config = fotmob.get("performance_configuration", {}) or {}
+        performance_columns = st.columns(5)
+        performance_columns[0].metric(
+            "FotMob RPS",
+            f"{float(fotmob_access.get('current_rps', fotmob_rate.get('current_rps', 0.0)) or 0.0):.2f}",
+        )
+        performance_columns[1].metric(
+            "Effektiv RPS",
+            f"{float(fotmob_access.get('effective_rps', 0.0) or 0.0):.2f}",
+        )
+        performance_columns[2].metric(
+            "FotMob Requests",
+            fotmob_access.get("requests", 0),
+        )
+        performance_columns[3].metric(
+            "FotMob 429",
+            fotmob_access.get("429", fotmob_access.get("rate_limit_responses", 0)),
+        )
+        performance_columns[4].metric(
+            "Worker / Max",
+            f"{fotmob_config.get('initial_workers', '—')} / {fotmob_config.get('max_workers', '—')}",
+        )
     st.subheader("Persistenz")
     persistence_columns = st.columns(4)
     persistence_columns[0].metric("Historische Snapshots", database.count_rows("snapshots"))

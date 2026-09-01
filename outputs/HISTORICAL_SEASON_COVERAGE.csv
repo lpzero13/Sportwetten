@@ -1,0 +1,4 @@
+season_id,season_label,first_date,last_date,country_count,league_count,feed_rows,unique_matches,hz_rows,hz_unique_matches,no_hz_rows,no_hz_unique_matches,no_data_rows,no_data_unique_matches,unknown_rows,next_day_rows
+calendar-2024-25,2024/25,2024-09-01,2025-06-30,94,410,61239,54521,22526,19030,38713,35491,0,0,0,5772
+calendar-2025-26,2025/26,2025-07-01,2026-06-30,97,485,75452,66633,31930,26986,43517,39642,5,5,0,7649
+calendar-2026-27,2026/27,2026-07-01,2026-08-31,89,255,12110,10484,4991,3899,7119,6585,0,0,0,1604

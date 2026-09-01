@@ -215,10 +215,62 @@ def render_fotmob_debug(service: FotMobService) -> None:
     )
     _render_historical_date_loader(service)
     st.subheader("FotMob Access")
+    access = metrics.get("access", {}) or {}
+    rate_control = access.get("rate_control", {}) or {}
+    performance_configuration = metrics.get("performance_configuration", {}) or {}
+    access_columns = st.columns(6)
+    access_columns[0].metric("Current RPS", _display(access.get("current_rps", rate_control.get("current_rps"))))
+    access_columns[1].metric("Effective RPS", _display(access.get("effective_rps")))
+    access_columns[2].metric(
+        "Workers",
+        f"{performance_configuration.get('initial_workers', '—')} / {performance_configuration.get('max_workers', '—')}",
+    )
+    access_columns[3].metric("Requests", access.get("requests", 0))
+    access_columns[4].metric("Success Rate", f"{float(access.get('success_rate', 0.0)) * 100:.1f}%")
+    access_columns[5].metric("429 / Retries", f"{access.get('429', access.get('rate_limit_responses', 0))} / {access.get('retries', 0)}")
+    latency_columns = st.columns(5)
+    latency_columns[0].metric("Median ms", _display(access.get("median_response_ms")))
+    latency_columns[1].metric("P95 ms", _display(access.get("p95_response_ms")))
+    latency_columns[2].metric("Mode", rate_control.get("mode", performance_configuration.get("rate_mode", "—")))
+    latency_columns[3].metric("Stable max RPS", _display(metrics.get("known_stable_max_rps")))
+    latency_columns[4].metric("Max RPS config", _display(performance_configuration.get("max_rps")))
+    st.caption(
+        "Runtime-Grenzen: "
+        f"Mode={rate_control.get('mode', performance_configuration.get('rate_mode', '—'))} · "
+        f"Initial/Max RPS={performance_configuration.get('initial_rps', '—')}/"
+        f"{performance_configuration.get('max_rps', '—')} · "
+        f"Worker Initial/Max={performance_configuration.get('initial_workers', '—')}/"
+        f"{performance_configuration.get('max_workers', '—')} · "
+        f"Netzwerk={metrics.get('network_mode', '—')} · "
+        f"Letzter erfolgreicher Request={access.get('last_success_at', '—')}"
+    )
+    st.caption("Verfügbare Performance-Modi: ADAPTIVE · FIXED · CONSERVATIVE")
+    profiles = metrics.get("performance_profiles", []) or []
+    if profiles:
+        st.caption("Persistierte V0.5.6-Performance-Profile (zuletzt gemessene Stufen):")
+        st.dataframe(
+            [
+                {
+                    "Phase": row.get("phase"),
+                    "RPS": row.get("rps"),
+                    "Worker": row.get("workers"),
+                    "Requests": row.get("requests"),
+                    "Success": row.get("success_rate"),
+                    "429": row.get("http_429"),
+                    "Retries": row.get("retries"),
+                    "Median ms": row.get("median_latency_ms"),
+                    "P95 ms": row.get("p95_latency_ms"),
+                    "Status": row.get("status"),
+                }
+                for row in profiles
+            ],
+            hide_index=True,
+            width="stretch",
+        )
     st.write(
         {
-            "FotMob access": metrics.get("access", {}),
-            "Letzter erfolgreicher Request": metrics.get("access", {}).get("last_success_at", "—"),
+            "FotMob access": access,
+            "Letzter erfolgreicher Request": access.get("last_success_at", "—"),
         }
     )
     st.subheader("Provider Matching")

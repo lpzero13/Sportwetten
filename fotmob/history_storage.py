@@ -193,11 +193,83 @@ CREATE TABLE IF NOT EXISTS fotmob_daily_load_runs (
 
 CREATE INDEX IF NOT EXISTS idx_fotmob_daily_load_runs_date
     ON fotmob_daily_load_runs(provider, observation_date, league_id, status);
+
+CREATE TABLE IF NOT EXISTS fotmob_performance_profile (
+    profile_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    tested_at TEXT NOT NULL,
+    from_date TEXT,
+    to_date TEXT,
+    phase TEXT NOT NULL DEFAULT 'RPS',
+    rps REAL NOT NULL,
+    workers INTEGER NOT NULL,
+    requests INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    successful INTEGER NOT NULL DEFAULT 0,
+    http_429 INTEGER NOT NULL DEFAULT 0,
+    http_403 INTEGER NOT NULL DEFAULT 0,
+    http_5xx INTEGER NOT NULL DEFAULT 0,
+    timeouts INTEGER NOT NULL DEFAULT 0,
+    connection_errors INTEGER NOT NULL DEFAULT 0,
+    retries INTEGER NOT NULL DEFAULT 0,
+    parse_failures INTEGER NOT NULL DEFAULT 0,
+    success_rate REAL NOT NULL DEFAULT 0,
+    rate_limit_rate REAL NOT NULL DEFAULT 0,
+    error_rate REAL NOT NULL DEFAULT 0,
+    median_latency_ms REAL NOT NULL DEFAULT 0,
+    p95_latency_ms REAL NOT NULL DEFAULT 0,
+    effective_rps REAL NOT NULL DEFAULT 0,
+    matches_per_minute REAL NOT NULL DEFAULT 0,
+    megabytes_per_minute REAL NOT NULL DEFAULT 0,
+    connection_pool_size INTEGER,
+    cpu_time_seconds REAL,
+    cpu_utilization_percent REAL,
+    rss_peak_bytes INTEGER,
+    rss_delta_bytes INTEGER,
+    rate_wait_ms REAL,
+    rate_wait_ratio REAL,
+    controller_rps REAL,
+    rate_slot_rps REAL,
+    rate_slot_span_seconds REAL,
+    rate_slot_interval_median_ms REAL,
+    request_start_rps REAL,
+    request_start_span_seconds REAL,
+    request_start_interval_median_ms REAL,
+    detail_call_median_ms REAL,
+    detail_call_p95_ms REAL,
+    parse_median_ms REAL,
+    parse_p95_ms REAL,
+    status TEXT NOT NULL,
+    bottleneck TEXT,
+    notes TEXT,
+    UNIQUE(run_id, phase, rps, workers)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_performance_profile_lookup
+    ON fotmob_performance_profile(phase, status, rps, workers, tested_at);
 """
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _json(value: Any) -> str:
@@ -258,6 +330,27 @@ class FotMobHistoryStore:
                     "feed_unique_count": "INTEGER NOT NULL DEFAULT 0",
                     "next_day_count": "INTEGER NOT NULL DEFAULT 0",
                     "duplicates_removed_count": "INTEGER NOT NULL DEFAULT 0",
+                },
+                "fotmob_performance_profile": {
+                    "rate_limit_rate": "REAL NOT NULL DEFAULT 0",
+                    "connection_pool_size": "INTEGER",
+                    "cpu_time_seconds": "REAL",
+                    "cpu_utilization_percent": "REAL",
+                    "rss_peak_bytes": "INTEGER",
+                    "rss_delta_bytes": "INTEGER",
+                    "rate_wait_ms": "REAL",
+                    "rate_wait_ratio": "REAL",
+                    "controller_rps": "REAL",
+                    "rate_slot_rps": "REAL",
+                    "rate_slot_span_seconds": "REAL",
+                    "rate_slot_interval_median_ms": "REAL",
+                    "request_start_rps": "REAL",
+                    "request_start_span_seconds": "REAL",
+                    "request_start_interval_median_ms": "REAL",
+                    "detail_call_median_ms": "REAL",
+                    "detail_call_p95_ms": "REAL",
+                    "parse_median_ms": "REAL",
+                    "parse_p95_ms": "REAL",
                 },
             }.items():
                 existing_columns = {
@@ -641,7 +734,10 @@ class FotMobHistoryStore:
                     duplicates_removed_count = CASE WHEN ? IS NULL THEN fotmob_daily_load_runs.duplicates_removed_count ELSE excluded.duplicates_removed_count END,
                     payload_hash = COALESCE(excluded.payload_hash, fotmob_daily_load_runs.payload_hash),
                     source_endpoint = COALESCE(excluded.source_endpoint, fotmob_daily_load_runs.source_endpoint),
-                    error = COALESCE(excluded.error, fotmob_daily_load_runs.error)
+                    error = CASE
+                        WHEN excluded.status IN ('COMPLETE', 'PASS') THEN NULL
+                        ELSE COALESCE(excluded.error, fotmob_daily_load_runs.error)
+                    END
                 """,
                 (
                     provider.upper(), str(observation_date), str(league_id),
@@ -794,6 +890,161 @@ class FotMobHistoryStore:
             "last_date": index["last_date"] if index else None,
             "run_status": {str(row["status"]): int(row["n"] or 0) for row in statuses},
         }
+
+    def save_performance_profile(self, profile: Mapping[str, Any]) -> int:
+        """Insert or update one measured RPS/worker profile."""
+
+        values = {
+            "run_id": str(profile.get("run_id") or "unknown"),
+            "tested_at": str(profile.get("tested_at") or _now()),
+            "from_date": profile.get("from_date"),
+            "to_date": profile.get("to_date"),
+            "phase": str(profile.get("phase") or "RPS").upper(),
+            "rps": float(profile.get("rps") or 0.0),
+            "workers": max(1, int(profile.get("workers") or 1)),
+            "requests": max(0, int(profile.get("requests") or 0)),
+            "attempts": max(0, int(profile.get("attempts") or 0)),
+            "successful": max(0, int(profile.get("successful") or 0)),
+            "http_429": max(0, int(profile.get("429") or profile.get("http_429") or 0)),
+            "http_403": max(0, int(profile.get("403") or profile.get("http_403") or 0)),
+            "http_5xx": max(0, int(profile.get("5xx") or profile.get("http_5xx") or 0)),
+            "timeouts": max(0, int(profile.get("timeouts") or profile.get("timeout") or 0)),
+            "connection_errors": max(0, int(profile.get("connection_errors") or 0)),
+            "retries": max(0, int(profile.get("retries") or 0)),
+            "parse_failures": max(0, int(profile.get("parse_failures") or 0)),
+            "success_rate": float(profile.get("success_rate") or 0.0),
+            "rate_limit_rate": float(
+                profile.get("429_rate")
+                or profile.get("rate_limit_rate")
+                or 0.0
+            ),
+            "error_rate": float(profile.get("error_rate") or 0.0),
+            "median_latency_ms": float(profile.get("median_latency_ms") or 0.0),
+            "p95_latency_ms": float(profile.get("p95_latency_ms") or 0.0),
+            "effective_rps": float(profile.get("effective_rps") or 0.0),
+            "matches_per_minute": float(profile.get("matches_per_minute") or 0.0),
+            "megabytes_per_minute": float(profile.get("megabytes_per_minute") or 0.0),
+            "connection_pool_size": (
+                max(1, int(profile["connection_pool_size"]))
+                if profile.get("connection_pool_size") is not None
+                else None
+            ),
+            "cpu_time_seconds": _optional_float(profile.get("cpu_time_seconds")),
+            "cpu_utilization_percent": _optional_float(
+                profile.get("cpu_utilization_percent")
+            ),
+            "rss_peak_bytes": _optional_int(profile.get("rss_peak_bytes")),
+            "rss_delta_bytes": _optional_int(profile.get("rss_delta_bytes")),
+            "rate_wait_ms": _optional_float(profile.get("rate_wait_ms")),
+            "rate_wait_ratio": _optional_float(profile.get("rate_wait_ratio")),
+            "controller_rps": _optional_float(profile.get("controller_rps")),
+            "rate_slot_rps": _optional_float(profile.get("rate_slot_rps")),
+            "rate_slot_span_seconds": _optional_float(
+                profile.get("rate_slot_span_seconds")
+            ),
+            "rate_slot_interval_median_ms": _optional_float(
+                profile.get("rate_slot_interval_median_ms")
+            ),
+            "request_start_rps": _optional_float(profile.get("request_start_rps")),
+            "request_start_span_seconds": _optional_float(
+                profile.get("request_start_span_seconds")
+            ),
+            "request_start_interval_median_ms": _optional_float(
+                profile.get("request_start_interval_median_ms")
+            ),
+            "detail_call_median_ms": _optional_float(
+                profile.get("detail_call_median_ms")
+            ),
+            "detail_call_p95_ms": _optional_float(profile.get("detail_call_p95_ms")),
+            "parse_median_ms": _optional_float(profile.get("parse_median_ms")),
+            "parse_p95_ms": _optional_float(profile.get("parse_p95_ms")),
+            "status": str(profile.get("status") or "UNKNOWN").upper(),
+            "bottleneck": profile.get("bottleneck"),
+            "notes": profile.get("notes"),
+        }
+        columns = tuple(values)
+        placeholders = ", ".join("?" for _ in columns)
+        updates = ", ".join(
+            f"{column} = excluded.{column}"
+            for column in columns
+            if column not in {"run_id", "phase", "rps", "workers"}
+        )
+        with self._lock, self.connection:
+            self.connection.execute(
+                f"""
+                INSERT INTO fotmob_performance_profile ({', '.join(columns)})
+                VALUES ({placeholders})
+                ON CONFLICT(run_id, phase, rps, workers) DO UPDATE SET {updates}
+                """,
+                tuple(values[column] for column in columns),
+            )
+            row = self.connection.execute(
+                """
+                SELECT profile_id
+                FROM fotmob_performance_profile
+                WHERE run_id = ? AND phase = ? AND rps = ? AND workers = ?
+                """,
+                (values["run_id"], values["phase"], values["rps"], values["workers"]),
+            ).fetchone()
+        return int(row["profile_id"]) if row else 0
+
+    def performance_profiles(
+        self,
+        *,
+        run_id: str | None = None,
+        phase: str | None = None,
+        limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        clauses = ["1 = 1"]
+        params: list[Any] = []
+        if run_id:
+            clauses.append("run_id = ?")
+            params.append(str(run_id))
+        if phase:
+            clauses.append("phase = ?")
+            params.append(str(phase).upper())
+        params.append(max(1, int(limit)))
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    f"""
+                    SELECT * FROM fotmob_performance_profile
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY tested_at DESC, phase, rps, workers
+                    LIMIT ?
+                    """,
+                    params,
+                ).fetchall()
+            )
+
+    def known_stable_max_rps(
+        self,
+        *,
+        confirmations: int = 2,
+        workers: int | None = None,
+    ) -> float | None:
+        clauses = ["phase = 'RPS'", "status = 'STABLE'"]
+        params: list[Any] = []
+        if workers is not None:
+            clauses.append("workers = ?")
+            params.append(max(1, int(workers)))
+        with self._lock:
+            row = self.connection.execute(
+                f"""
+                SELECT MAX(rps) AS max_rps
+                FROM (
+                    SELECT rps
+                    FROM fotmob_performance_profile
+                    WHERE {' AND '.join(clauses)}
+                    GROUP BY rps
+                    HAVING COUNT(DISTINCT run_id) >= ?
+                )
+                """,
+                (*params, max(1, int(confirmations))),
+            ).fetchone()
+        if not row or row["max_rps"] is None:
+            return None
+        return float(row["max_rps"])
 
     def match_index(
         self,
@@ -1123,6 +1374,32 @@ class FotMobHistoryStore:
                 (_now(), str(reason)[:2000], str(provider_match_id), worker_id, worker_id),
             )
         return "SKIPPED_NO_HALFTIME"
+
+    def mark_skipped_no_data(
+        self,
+        provider_match_id: str,
+        *,
+        reason: str = "FotMob Detaildaten nicht vorhanden",
+        worker_id: str | None = None,
+    ) -> str:
+        """Record a provider fixture whose detail endpoint has no data."""
+
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                UPDATE fotmob_match_index
+                SET detail_status = 'SKIPPED_NO_DATA',
+                    last_checked_at = ?, last_error = ?, worker_id = NULL,
+                    data_quality = 'NO_DATA', ml_eligible = 0,
+                    parser_version = NULL, schema_version = NULL,
+                    raw_payload_path = NULL, payload_hash = NULL,
+                    second_half_goals = NULL, second_half_goal_class = NULL
+                WHERE fotmob_match_id = ?
+                  AND (? IS NULL OR worker_id = ?)
+                """,
+                (_now(), str(reason)[:2000], str(provider_match_id), worker_id, worker_id),
+            )
+        return "SKIPPED_NO_DATA"
 
     def mark_failure(self, provider_match_id: str, error: str, *, max_attempts: int = 3, worker_id: str | None = None) -> str:
         with self._lock, self.connection:

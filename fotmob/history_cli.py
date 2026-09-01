@@ -14,6 +14,8 @@ from storage.database import Database
 
 from .history_models import FotMobSeasonRef
 from .history_pipeline import FotMobHistoryPipeline
+from .max_throughput import write_max_status_report, write_max_throughput_report
+from .performance import write_performance_report, write_status_report
 
 
 def _add_root(parser: argparse.ArgumentParser) -> None:
@@ -109,6 +111,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="Nur Datum/Land/Liga/Match-Index laden, keine Matchdetails abrufen",
     )
 
+    performance = subparsers.add_parser(
+        "performance",
+        aliases=["probe"],
+        help="V0.5.6: drei abgeschlossene Tage messen und RPS/Worker-Profil speichern",
+    )
+    _add_root(performance)
+    performance.add_argument("--from-date", required=True, help="Startdatum YYYY-MM-DD")
+    performance.add_argument("--to-date", required=True, help="Enddatum YYYY-MM-DD")
+    performance.add_argument(
+        "--requests-per-level",
+        type=int,
+        help="Detailanfragen je RPS-/Worker-Stufe (Standard aus FOTMOB_PERFORMANCE_REQUESTS_PER_LEVEL)",
+    )
+
+    max_performance = subparsers.add_parser(
+        "max-throughput",
+        aliases=["performance-max", "probe-max"],
+        help="V0.5.6.1: maximal stabile RPS und den technischen Bottleneck messen",
+    )
+    _add_root(max_performance)
+    max_performance.add_argument("--from-date", required=True, help="Startdatum YYYY-MM-DD")
+    max_performance.add_argument("--to-date", required=True, help="Enddatum YYYY-MM-DD")
+    max_performance.add_argument(
+        "--requests-per-level",
+        type=int,
+        default=100,
+        help="Detailanfragen je RPS-/Worker-Stufe (Standard: 100)",
+    )
+    max_performance.add_argument(
+        "--critical-requests",
+        type=int,
+        default=250,
+        help="Detailanfragen für die zusätzliche höchste stabile Stufe (Standard: 250)",
+    )
+    max_performance.add_argument(
+        "--max-target-rps",
+        type=float,
+        default=100.0,
+        help="Temporäres oberes Benchmark-Limit; Standard ist 100 RPS",
+    )
+    max_performance.add_argument(
+        "--include-worker-50",
+        action="store_true",
+        help="Optional zusätzlich 50 Worker messen, wenn mehr Parallelität begründet ist",
+    )
+
     return parser
 
 
@@ -185,6 +233,58 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     database = Database(settings.database_path)
     pipeline = FotMobHistoryPipeline(settings, database)
     try:
+        if args.command in {"performance", "probe"}:
+            from scripts.audit_project_capabilities import generate_report
+
+            audit_path = generate_report(root)
+            result = pipeline.run_performance_probe(
+                args.from_date,
+                args.to_date,
+                requests_per_level=args.requests_per_level,
+                execution_mode="manual",
+            )
+            report_path = write_performance_report(
+                result,
+                root / "outputs" / "V056_FOTMOB_PERFORMANCE_REPORT.md",
+            )
+            status_path = write_status_report(
+                result,
+                root / "outputs" / "V056_STATUS.md",
+            )
+            result = {
+                **result,
+                "audit_path": str(audit_path),
+                "report_path": str(report_path),
+                "status_path": str(status_path),
+            }
+            return result
+        if args.command in {"max-throughput", "performance-max", "probe-max"}:
+            from scripts.audit_project_capabilities import generate_report
+
+            audit_path = generate_report(root)
+            result = pipeline.run_max_throughput_probe(
+                args.from_date,
+                args.to_date,
+                requests_per_level=args.requests_per_level,
+                critical_requests=args.critical_requests,
+                max_target_rps=args.max_target_rps,
+                include_worker_50=args.include_worker_50,
+                execution_mode="manual",
+            )
+            report_path = write_max_throughput_report(
+                result,
+                root / "outputs" / "V0561_MAX_THROUGHPUT_REPORT.md",
+            )
+            status_path = write_max_status_report(
+                result,
+                root / "outputs" / "V0561_STATUS.md",
+            )
+            return {
+                **result,
+                "audit_path": str(audit_path),
+                "report_path": str(report_path),
+                "status_path": str(status_path),
+            }
         payload = _load_payload(getattr(args, "payload", None))
         if args.command == "seasons":
             result = pipeline.discover_league(

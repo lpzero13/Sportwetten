@@ -53,7 +53,21 @@ set_env_value FOTMOB_ALL_LEAGUES_PATH '/data/allLeagues?locale={locale}&country=
 set_env_value FOTMOB_DAILY_TIMEZONE Europe/Berlin
 set_env_value FOTMOB_DAILY_CCODE3 DEU
 set_env_value FOTMOB_DAILY_LOCALE de
+set_env_value FOTMOB_RATE_MODE adaptive
+set_env_value FOTMOB_INITIAL_RPS 5
+set_env_value FOTMOB_RPS_STEP 5
+set_env_value FOTMOB_MIN_RPS 0.5
+set_env_value FOTMOB_MAX_RPS 100
+set_env_value FOTMOB_INITIAL_WORKERS 10
+set_env_value FOTMOB_MAX_WORKERS 40
+set_env_value FOTMOB_RATE_WINDOW_REQUESTS 20
+set_env_value FOTMOB_RATE_COOLDOWN_SECONDS 5
+set_env_value FOTMOB_CONNECTION_POOL_SIZE 40
+set_env_value FOTMOB_PERFORMANCE_REQUESTS_PER_LEVEL 25
+set_env_value FOTMOB_PERFORMANCE_WORKER_LEVELS 10,20,30,40
+set_env_value FOTMOB_PERFORMANCE_STABLE_CONFIRMATIONS 2
 set_env_value FOTMOB_HISTORY_WORKERS 10
+set_env_value FOTMOB_HISTORY_REQUESTS_PER_SECOND 5
 set_env_value FOTMOB_HISTORY_LEAGUE_ID 54
 set_env_value FOTMOB_HT_ENRICHMENT_ENABLED true
 

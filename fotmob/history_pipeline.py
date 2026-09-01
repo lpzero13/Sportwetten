@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -131,6 +131,16 @@ def has_halftime_data(match: Any) -> bool:
     return bool(stats is not None and stats.has_any_value())
 
 
+def is_no_data_result(fetched: FotMobFetchResult | None) -> bool:
+    """Identify FotMob's explicit empty-detail response."""
+
+    payload = getattr(fetched, "payload", None)
+    if not isinstance(payload, dict) or not payload.get("error"):
+        return False
+    message = str(payload.get("message") or "").strip().casefold()
+    return message in {"data not found", "match data not found"}
+
+
 def _row_to_index(row: Any) -> FotMobMatchIndexRecord:
     return FotMobMatchIndexRecord(
         provider_match_id=str(row["fotmob_match_id"]),
@@ -187,7 +197,26 @@ class FotMobHistoryPipeline:
             match_details_path=settings.fotmob_match_details_path,
             timeout_seconds=settings.fotmob_history_timeout_seconds,
             max_retries=settings.fotmob_history_max_retries,
-            min_request_interval_seconds=1.0 / max(0.01, settings.fotmob_history_requests_per_second),
+            min_request_interval_seconds=None,
+            rate_mode=getattr(settings, "fotmob_rate_mode", "ADAPTIVE"),
+            initial_rps=getattr(
+                settings,
+                "fotmob_initial_rps",
+                getattr(settings, "fotmob_history_requests_per_second", 5.0),
+            ),
+            rps_step=getattr(settings, "fotmob_rps_step", 5.0),
+            min_rps=getattr(settings, "fotmob_min_rps", 0.5),
+            max_rps=getattr(settings, "fotmob_max_rps", 30.0),
+            rate_window_requests=getattr(settings, "fotmob_rate_window_requests", 20),
+            rate_cooldown_seconds=getattr(settings, "fotmob_rate_cooldown_seconds", 5.0),
+            max_error_rate=getattr(settings, "fotmob_max_error_rate", 0.10),
+            max_5xx_rate=getattr(settings, "fotmob_max_5xx_rate", 0.05),
+            max_timeout_rate=getattr(settings, "fotmob_max_timeout_rate", 0.05),
+            max_connection_error_rate=getattr(
+                settings, "fotmob_max_connection_error_rate", 0.05
+            ),
+            max_p95_latency_ms=getattr(settings, "fotmob_max_p95_latency_ms", 3000.0),
+            connection_pool_size=getattr(settings, "fotmob_connection_pool_size", 40),
             logger=self.logger,
         )
         self.archive = FotMobHistoricalArchive(settings.archive_path, settings.parquet_compression)
@@ -196,6 +225,42 @@ class FotMobHistoryPipeline:
             settings.parquet_compression,
         )
         self._archive_lock = threading.RLock()
+        known_stable_rps = self.store.known_stable_max_rps(
+            confirmations=int(
+                getattr(self.settings, "fotmob_performance_stable_confirmations", 2)
+            )
+        )
+        self.logger.info(
+            "FotMob historical collector configuration: mode=%s initial_rps=%.2f "
+            "rps_step=%.2f max_rps=%.2f workers=%d max_workers=%d pool=%d "
+            "known_stable_rps=%s",
+            getattr(self.settings, "fotmob_rate_mode", "ADAPTIVE"),
+            float(getattr(self.settings, "fotmob_initial_rps", 5.0)),
+            float(getattr(self.settings, "fotmob_rps_step", 5.0)),
+            float(getattr(self.settings, "fotmob_max_rps", 30.0)),
+            int(getattr(self.settings, "fotmob_initial_workers", 10)),
+            int(getattr(self.settings, "fotmob_max_workers", 40)),
+            int(getattr(self.settings, "fotmob_connection_pool_size", 40)),
+            known_stable_rps if known_stable_rps is not None else "unknown",
+        )
+
+    def _configured_workers(self, workers: int | None) -> int:
+        default_workers = int(
+            getattr(
+                self.settings,
+                "fotmob_initial_workers",
+                getattr(self.settings, "fotmob_history_workers", 10),
+            )
+        )
+        max_workers = int(
+            getattr(
+                self.settings,
+                "fotmob_max_workers",
+                max(default_workers, getattr(self.settings, "fotmob_history_workers", 10)),
+            )
+        )
+        requested = default_workers if workers is None else int(workers)
+        return max(1, min(max_workers, requested))
 
     def _network_error(self, execution_mode: str) -> str:
         return (
@@ -466,7 +531,7 @@ class FotMobHistoryPipeline:
         self,
         provider_match_ids: list[str] | tuple[str, ...],
         *,
-        workers: int = 1,
+        workers: int | None = None,
         retry_failed: bool = False,
         refresh_existing: bool = False,
         require_halftime_stats: bool = False,
@@ -486,21 +551,24 @@ class FotMobHistoryPipeline:
                 "partial": 0,
                 "failed": 0,
                 "errors": 0,
-                "skipped": 0,
-                "skipped_no_halftime": 0,
-                "canonical_files": [],
+            "skipped": 0,
+            "skipped_no_halftime": 0,
+            "skipped_no_data": 0,
+            "canonical_files": [],
                 "historical_files": [],
                 "period_stats_rows": 0,
                 "shot_rows": 0,
                 "event_rows": 0,
                 "archive_bytes": 0,
-                "canonical_bytes": 0,
-                "error": self._network_error(execution_mode),
+            "canonical_bytes": 0,
+            "workers": self._configured_workers(workers),
+            "error": self._network_error(execution_mode),
             }
         ids = list(dict.fromkeys(str(item) for item in provider_match_ids if str(item).strip()))
-        workers = max(1, min(10, int(workers)))
+        workers = self._configured_workers(workers)
         worker_id = f"daily-{uuid.uuid4().hex[:12]}"
-        fetched_count = partial_count = failed_count = errors = skipped = skipped_no_halftime = 0
+        fetched_count = partial_count = failed_count = errors = skipped = 0
+        skipped_no_halftime = skipped_no_data = 0
         canonical_files: list[str] = []
         historical_files: list[str] = []
         period_rows = shot_rows = event_rows = archive_bytes = canonical_bytes = 0
@@ -540,13 +608,22 @@ class FotMobHistoryPipeline:
             buffer = []
 
         def handle(result: tuple[Any, FotMobFetchResult | None, str | None] | None) -> None:
-            nonlocal fetched_count, partial_count, failed_count, errors, skipped, skipped_no_halftime
+            nonlocal fetched_count, partial_count, failed_count, errors, skipped
+            nonlocal skipped_no_halftime, skipped_no_data
             nonlocal period_rows, shot_rows, event_rows, canonical_bytes
             if result is None:
                 skipped += 1
                 return
             row, fetched, error = result
             if error or fetched is None or fetched.match is None:
+                if is_no_data_result(fetched):
+                    skipped_no_data += 1
+                    self.store.mark_skipped_no_data(
+                        str(row["fotmob_match_id"]),
+                        reason=str((fetched.payload or {}).get("message") or error or "FotMob Detaildaten nicht vorhanden"),
+                        worker_id=worker_id,
+                    )
+                    return
                 errors += 1
                 failure_status = self.store.mark_failure(
                     str(row["fotmob_match_id"]),
@@ -597,18 +674,35 @@ class FotMobHistoryPipeline:
 
         try:
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="fotmob-daily") as executor:
-                futures = [
-                    executor.submit(
-                        self._fetch_specific,
-                        provider_match_id,
-                        worker_id=worker_id,
-                        retry_failed=retry_failed,
-                        refresh_existing=refresh_existing,
-                    )
-                    for provider_match_id in ids
-                ]
-                for future in as_completed(futures):
-                    handle(future.result())
+                # Keep the executor queue bounded.  Submitting every detail
+                # request at once is cheap for a small sample, but a
+                # two-year all-leagues backfill can create hundreds of
+                # thousands of Future objects before the first one finishes.
+                pending: set[Any] = set()
+                id_iter = iter(ids)
+
+                def submit_available() -> None:
+                    while len(pending) < max(workers * 4, workers):
+                        try:
+                            provider_match_id = next(id_iter)
+                        except StopIteration:
+                            return
+                        pending.add(
+                            executor.submit(
+                                self._fetch_specific,
+                                provider_match_id,
+                                worker_id=worker_id,
+                                retry_failed=retry_failed,
+                                refresh_existing=refresh_existing,
+                            )
+                        )
+
+                submit_available()
+                while pending:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        handle(future.result())
+                    submit_available()
             flush()
         finally:
             self.store.release_worker(worker_id)
@@ -621,6 +715,7 @@ class FotMobHistoryPipeline:
             "errors": errors,
             "skipped": skipped,
             "skipped_no_halftime": skipped_no_halftime,
+            "skipped_no_data": skipped_no_data,
             "canonical_files": sorted(set(canonical_files)),
             "historical_files": sorted(set(historical_files)),
             "period_stats_rows": period_rows,
@@ -628,6 +723,7 @@ class FotMobHistoryPipeline:
             "event_rows": event_rows,
             "archive_bytes": archive_bytes,
             "canonical_bytes": canonical_bytes,
+            "workers": workers,
             "successful_ids": sorted(successful_ids),
             "access": getattr(self.client, "metrics_snapshot", lambda: {})(),
         }
@@ -637,7 +733,7 @@ class FotMobHistoryPipeline:
         league_id: str,
         season_id: str,
         *,
-        workers: int = 1,
+        workers: int | None = None,
         retry_failed: bool = False,
         only_sample: bool = False,
         limit: int | None = None,
@@ -651,7 +747,7 @@ class FotMobHistoryPipeline:
                 "season_id": str(season_id),
                 "error": self._network_error(execution_mode),
             }
-        workers = max(1, min(10, int(workers)))
+        workers = self._configured_workers(workers)
         batch_size = max(1, int(batch_size or self.settings.fotmob_history_batch_size))
         worker_id = f"history-{uuid.uuid4().hex[:12]}"
         target_rows = self.store.match_index(
@@ -876,9 +972,16 @@ class FotMobHistoryPipeline:
         day_count = (end - start).days + 1
         scope_league = "ALL"
         scope_season = "DAILY_FEED"
-        daily_records: dict[str, list[FotMobMatchIndexRecord]] = {}
+        # Keep only provider IDs between the feed and detail phases.  A
+        # two-year all-leagues run can contain hundreds of thousands of
+        # records; retaining every dataclass object here made the old path
+        # grow into multiple gigabytes before the first detail request.
+        daily_records: dict[str, list[str]] = {}
         daily_feed_summaries: dict[str, dict[str, int]] = {}
-        unique_records: dict[str, FotMobMatchIndexRecord] = {}
+        unique_match_ids: set[str] = set()
+        observed_league_ids: set[str] = set()
+        observed_country_codes: set[str] = set()
+        observed_seasons: set[str] = set()
         index_errors: list[str] = []
         failed_days: set[str] = set()
         warnings: list[str] = []
@@ -931,8 +1034,15 @@ class FotMobHistoryPipeline:
                 country_names=country_names,
                 league_names=league_names,
             )
-            daily_records[day] = records
-            unique_records.update({record.provider_match_id: record for record in records})
+            daily_records[day] = [record.provider_match_id for record in records]
+            unique_match_ids.update(record.provider_match_id for record in records)
+            observed_league_ids.update(str(record.league_id) for record in records if record.league_id)
+            observed_country_codes.update(
+                str(record.country_code or record.country or "")
+                for record in records
+                if record.country_code or record.country
+            )
+            observed_seasons.update(str(record.season_label) for record in records if record.season_label)
             self.store.upsert_match_index(records)
             self.store.upsert_seasons(
                 FotMobSeasonRef(
@@ -970,7 +1080,6 @@ class FotMobHistoryPipeline:
                 fetched_at=fetched_at,
             )
 
-        selected_records = list(unique_records.values())
         detail_result: dict[str, Any] = {
             "status": "SKIPPED",
             "requested": 0,
@@ -981,9 +1090,9 @@ class FotMobHistoryPipeline:
             "skipped": 0,
             "skipped_no_halftime": 0,
         }
-        if fetch_details and selected_records:
+        if fetch_details and unique_match_ids:
             detail_result = self.fetch_details_for_ids(
-                [record.provider_match_id for record in selected_records],
+                sorted(unique_match_ids),
                 workers=workers or getattr(self.settings, "fotmob_history_workers", 1),
                 refresh_existing=True,
                 require_halftime_stats=True,
@@ -995,7 +1104,7 @@ class FotMobHistoryPipeline:
             catalog_rows = self.store.daily_index(
                 start_date=start.isoformat(),
                 end_date=end.isoformat(),
-                limit=max(500, len(unique_records) * 2),
+                limit=max(500, len(unique_match_ids) * 2),
             )
             status_by_id = {
                 str(row["fotmob_match_id"]): str(row["detail_status"] or "NOT_FETCHED")
@@ -1007,8 +1116,8 @@ class FotMobHistoryPipeline:
             for match_id, status in status_by_id.items()
             if status == "SKIPPED_NO_HALFTIME"
         }
-        for day, records in daily_records.items():
-            day_ids = {record.provider_match_id for record in records}
+        for day, record_ids in daily_records.items():
+            day_ids = set(record_ids)
             detail_count = len(day_ids.intersection(successful_ids))
             skipped_count = len(day_ids.intersection(skipped_ids))
             if not fetch_details:
@@ -1033,8 +1142,8 @@ class FotMobHistoryPipeline:
                 scope_league,
                 season_id=scope_season,
                 status=run_status,
-                fixture_count=len(records),
-                selected_count=len(records),
+                fixture_count=len(record_ids),
+                selected_count=len(record_ids),
                 detail_count=detail_count,
                 skipped_no_halftime_count=skipped_count,
                 feed_group_count=daily_feed_summaries[day]["feed_group_count"],
@@ -1062,11 +1171,11 @@ class FotMobHistoryPipeline:
             "country_code": None,
             "country_name": None,
             "days": day_count,
-            "leagues": len({record.league_id for record in selected_records}),
-            "countries": len({record.country_code or record.country for record in selected_records}),
-            "seasons": sorted({record.season_label for record in selected_records}),
+            "leagues": len(observed_league_ids),
+            "countries": len(observed_country_codes),
+            "seasons": sorted(observed_seasons),
             "fixtures": sum(len(records) for records in daily_records.values()),
-            "unique_fixtures": len(selected_records),
+            "unique_fixtures": len(unique_match_ids),
             "daily_index_rows": sum(len(records) for records in daily_records.values()),
             "feed": {
                 key: sum(item[key] for item in daily_feed_summaries.values())
@@ -1344,3 +1453,51 @@ class FotMobHistoryPipeline:
 
     def status(self, league_id: str, season_id: str) -> dict[str, Any]:
         return self.store.status(league_id, season_id)
+
+    def run_performance_probe(
+        self,
+        start_date: date | str,
+        end_date: date | str,
+        *,
+        requests_per_level: int | None = None,
+        worker_levels: tuple[int, ...] | list[int] | None = None,
+        execution_mode: str = "manual",
+    ) -> dict[str, Any]:
+        """Run the finite V0.5.6 throughput probe with this pipeline's client."""
+
+        from .performance import FotMobPerformanceProbe
+
+        return FotMobPerformanceProbe(self, logger=self.logger).run(
+            start_date,
+            end_date,
+            requests_per_level=requests_per_level,
+            worker_levels=worker_levels,
+            execution_mode=execution_mode,
+        )
+
+    def run_max_throughput_probe(
+        self,
+        start_date: date | str,
+        end_date: date | str,
+        *,
+        requests_per_level: int = 100,
+        critical_requests: int = 250,
+        max_target_rps: float = 100.0,
+        worker_levels: tuple[int, ...] | list[int] | None = None,
+        include_worker_50: bool = False,
+        execution_mode: str = "manual",
+    ) -> dict[str, Any]:
+        """Run the finite V0.5.6.1 max-throughput/bottleneck probe."""
+
+        from .max_throughput import FotMobMaxThroughputProbe
+
+        return FotMobMaxThroughputProbe(self, logger=self.logger).run(
+            start_date,
+            end_date,
+            requests_per_level=requests_per_level,
+            critical_requests=critical_requests,
+            max_target_rps=max_target_rps,
+            worker_levels=worker_levels,
+            include_worker_50=include_worker_50,
+            execution_mode=execution_mode,
+        )

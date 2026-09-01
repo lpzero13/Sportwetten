@@ -1,0 +1,8 @@
+dataset,files,bytes,physical_rows,range_matches,notes
+events,49498,676480260,864502,49802,normalized timeline events; only matches with event rows create files
+historical,3579,244070243,49802,0,legacy historical archive retained alongside canonical data
+match_core,49802,2045183251,49802,49802,one canonical core row per HZ-eligible match
+period_stats,49802,450081893,5184046,49802,long-format period metrics
+shots,27623,474624978,709093,49802,normalized shots; only matches with shot rows create files
+sqlite_daily_index,1,265297920,148801,131496,queryable daily catalog; WAL measured separately in storage report
+sqlite_match_index,1,0,131793,131496,match queue/status catalog; byte attribution included in SQLite total

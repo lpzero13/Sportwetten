@@ -328,6 +328,60 @@ git pull
 sudo bash deploy/activate_fotmob.sh
 ~~~
 
+### Performance-Freigabe und Capability Audit (V0.5.6)
+
+V0.5.6 entfernt den historischen globalen `0.5 req/s`-Default. Manuelle
+Historical-Läufe starten standardmäßig mit `ADAPTIVE`, 5 req/s und zehn
+Detail-Workern. Bei stabilen Fenstern wird in konfigurierten +5-req/s-Schritten
+bis zum Maximum erhöht; bei 429/403, Fehler-, Timeout- oder Latenzproblemen
+greift ein begrenzter Backoff mit Cooldown. Der Client verwendet eine langlebige
+Session mit Keep-Alive, Kompression und einem konfigurierbaren Connection-Pool.
+Provider-Schutz wird nicht umgangen.
+
+Die drei abgeschlossenen Tage des kontrollierten Performance-Tests werden mit
+demselben Client geladen. Jede Stufe schreibt ihre Messung in
+`fotmob_performance_profile`; die UI zeigt Current/Effective RPS, Worker,
+Requests, Erfolgsrate, 429, Retries, Median/P95 und den bekannten stabilen
+Maximalwert. `SKIPPED_NO_HALFTIME` bleibt eine Datenqualitätsentscheidung und
+ist kein Performancefehler. Der vollständige Audit steht in
+`outputs/PROJECT_CAPABILITY_AUDIT.md`, der Messreport in
+`outputs/V056_FOTMOB_PERFORMANCE_REPORT.md` und der Abschlussstatus in
+`outputs/V056_STATUS.md`.
+
+Beispiel für einen bewusst gestarteten Drei-Tage-Test:
+
+~~~powershell
+$env:FOTMOB_ENABLED="true"
+$env:FOTMOB_HISTORY_ENABLED="true"
+$env:FOTMOB_NETWORK_MODE="manual"
+python scripts/fotmob_history.py performance --from-date 2026-08-26 --to-date 2026-08-28 --root .
+~~~
+
+### Max-Throughput- und Bottleneck-Probe (V0.5.6.1)
+
+Der separate manuelle Max-Throughput-Test misst den realen Pfad oberhalb der
+bisherigen 30-RPS-Grenze. Er verwendet exakt drei abgeschlossene Tage, 100
+Detailanfragen je Stufe, eine 250er-Bestätigung der höchsten stabilen Stufe
+und testet 30, 35, ... 60 sowie bei Stabilität 70, 80, 90 und 100 Ziel-RPS.
+Dabei werden Rate-Slots, tatsächliche HTTP-Starts, Detail-/Parserzeit, CPU,
+RSS, Worker und Connection-Pool protokolliert. Es gibt keinen Proxy-,
+Fingerprint- oder Challenge-Bypass. Die Ergebnisse stehen in
+`outputs/V0561_MAX_THROUGHPUT_REPORT.md`, `outputs/V0561_STATUS.md` und der
+Tabelle `fotmob_performance_profile`.
+
+Beispiel:
+
+~~~powershell
+$env:FOTMOB_NETWORK_MODE="manual"
+python scripts/fotmob_history.py max-throughput --from-date 2026-08-26 --to-date 2026-08-28 --root .
+~~~
+
+Die aktuelle Messung bestätigte 100 Ziel-RPS ohne Provider- oder Parserfehler.
+Der praktische Durchsatz liegt auf Windows wegen quantisierter Worker-/Timer-
+Scheduling-Intervalle bei rund 63 effektiven Detailstarts/s; deshalb bleiben
+10 Worker und ein Pool von 40 die Empfehlung. Der normal verwendete
+`FOTMOB_MAX_RPS`-Default ist auf den bestätigten Wert 100 angehoben.
+
 Der separate `wetten-fotmob.service` bleibt deaktiviert, damit kein dauerhafter FotMob-
 Poller gestartet wird. Der technische Laufstatus des All-Leagues-Ausbaus wird
 in `outputs/V055_STATUS.md`, der Fünf-Tage-Nachweis in
@@ -398,7 +452,7 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | FOTMOB_MATCH_DETAILS_PATH | /data/matchDetails?matchId={match_id} | öffentliches Matchdetail-JSON |
 | FOTMOB_TIMEOUT_SECONDS | 10 | FotMob-Timeout |
 | FOTMOB_MAX_RETRIES | 3 | FotMob-Retry-Anzahl, Delays 1/3/10 s |
-| FOTMOB_MIN_REQUEST_INTERVAL_SECONDS | 1 | Mindestabstand zwischen FotMob-Requests |
+| FOTMOB_MIN_REQUEST_INTERVAL_SECONDS | 1 | Legacy-Intervall nur für `FIXED`; historische Standardläufe nutzen adaptive RPS |
 | FOTMOB_MATCHING_TOLERANCE_MINUTES | 15 | Kickoff-Matchingfenster |
 | FOTMOB_POLL_SECONDS | 30 | optionaler Worker-Poll |
 | FOTMOB_PROVIDER_DECISION | LIMITED_USE | V0.5.1-Providerentscheidung; Worker benötigt PRODUCTION_READY |
@@ -412,8 +466,19 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | FOTMOB_DAILY_LOCALE | de | Sprache für Katalogbezeichnungen |
 | FOTMOB_HISTORY_ENABLED | true | Historical-Netzwerkzugriff, zusätzlich zur Providerfreigabe |
 | FOTMOB_NETWORK_MODE | manual | `off`, `manual` für explizite CLI-/UI-Läufe, `worker` nur mit Worker-Gates |
-| FOTMOB_HISTORY_WORKERS | 10 | Historical-Detailworker, maximal 10; globaler Request-Limiter bleibt aktiv |
-| FOTMOB_HISTORY_REQUESTS_PER_SECOND | 0.5 | globaler Historical-Request-Limiter |
+| FOTMOB_RATE_MODE | adaptive | `adaptive`, `fixed` oder `conservative` |
+| FOTMOB_INITIAL_RPS | 5 | Startwert für adaptive Historical-Läufe |
+| FOTMOB_RPS_STEP | 5 | RPS-Schritt beim gesunden Ramp-up |
+| FOTMOB_MIN_RPS / FOTMOB_MAX_RPS | 0.5 / 100 | Adaptive Unter-/Obergrenze; 100 in V0.5.6.1 real bestätigt |
+| FOTMOB_INITIAL_WORKERS / FOTMOB_MAX_WORKERS | 10 / 40 | konfigurierbare Historical-Workergrenzen |
+| FOTMOB_RATE_WINDOW_REQUESTS | 20 | Auswertungsfenster der Adaptive Rate Control |
+| FOTMOB_RATE_COOLDOWN_SECONDS | 5 | Cooldown nach Backoff |
+| FOTMOB_CONNECTION_POOL_SIZE | 40 | Keep-Alive-Connection-Pool des HTTP-Clients |
+| FOTMOB_PERFORMANCE_REQUESTS_PER_LEVEL | 25 | Detailanfragen je Probe-Stufe |
+| FOTMOB_PERFORMANCE_WORKER_LEVELS | 10,20,30,40 | Worker-Benchmarkstufen |
+| FOTMOB_PERFORMANCE_STABLE_CONFIRMATIONS | 2 | Anzahl stabiler Läufe für den bekannten Maximalwert |
+| FOTMOB_HISTORY_WORKERS | 10 | Legacy-Alias; wird auf `FOTMOB_MAX_WORKERS` begrenzt |
+| FOTMOB_HISTORY_REQUESTS_PER_SECOND | 5 | Legacy-Alias; neue historische Ratensteuerung verwendet `FOTMOB_RATE_MODE` |
 | FOTMOB_HISTORY_TIMEOUT_SECONDS | 10 | Historical-HTTP-Timeout |
 | FOTMOB_HISTORY_MAX_RETRIES | 3 | HTTP-Retries für transiente Fehler |
 | FOTMOB_HISTORY_STALE_MINUTES | 30 | Rücksetzung verwaister IN_PROGRESS-Claims |
@@ -470,7 +535,8 @@ und `paper_worker_runs` sowie die optionalen V0.5-Tabellen `matches`,
 `competition_provider_aliases`, `fotmob_current_state`, `fotmob_snapshots`,
 `fotmob_snapshot_outbox`, `fotmob_seasons`, `fotmob_match_index`,
 `fotmob_history_samples`, `fotmob_historical_archive_index` und
-`fotmob_daily_index`, `fotmob_daily_load_runs`, `match_data_quality`.
+`fotmob_daily_index`, `fotmob_daily_load_runs`, `fotmob_performance_profile`,
+`match_data_quality`.
 `current_event_state`, `current_canonical_outcomes` und
 `current_strategy_evaluations` sind ersetzbare Betriebsdaten. `snapshots` ist
 die kurze SQLite-Staging-/Indexschicht; die historische Zeile wird als flache
@@ -498,7 +564,9 @@ HT-/FT-Normalisierung, Zielklassen, Queue-Claims/Retry/Stale-Recovery,
 Policy-Gating und resumierbare zstd-Parquet-Batches. Die V0.5.4-Tests prüfen
 die kanonischen Core-/Period-/Shot-/Event-Datasets, die Datumsauswahl, Land-
 und Liga-Metadaten, idempotente Wiederholung und das getrennte Tipico-
-Strategie-Parquet.
+Strategie-Parquet. Die V0.5.6-Tests prüfen den thread-sicheren Rate-Controller,
+Backoff/Ramp-up, persistierte Performance-Profile sowie den kontrollierten
+Drei-Tage-Probeablauf.
 
 Der reproduzierbare Live-Smoke-Test ruft den aktuellen Feed und genau ein Eventdetail ab:
 

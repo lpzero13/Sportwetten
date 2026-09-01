@@ -142,7 +142,26 @@ class FotMobService:
             match_details_path=settings.fotmob_match_details_path,
             timeout_seconds=settings.fotmob_timeout_seconds,
             max_retries=settings.fotmob_max_retries,
-            min_request_interval_seconds=settings.fotmob_min_request_interval_seconds,
+            min_request_interval_seconds=(
+                settings.fotmob_min_request_interval_seconds
+                if str(getattr(settings, "fotmob_rate_mode", "ADAPTIVE")).upper() == "FIXED"
+                else None
+            ),
+            rate_mode=getattr(settings, "fotmob_rate_mode", "ADAPTIVE"),
+            initial_rps=getattr(settings, "fotmob_initial_rps", 5.0),
+            rps_step=getattr(settings, "fotmob_rps_step", 5.0),
+            min_rps=getattr(settings, "fotmob_min_rps", 0.5),
+            max_rps=getattr(settings, "fotmob_max_rps", 30.0),
+            rate_window_requests=getattr(settings, "fotmob_rate_window_requests", 20),
+            rate_cooldown_seconds=getattr(settings, "fotmob_rate_cooldown_seconds", 5.0),
+            max_error_rate=getattr(settings, "fotmob_max_error_rate", 0.10),
+            max_5xx_rate=getattr(settings, "fotmob_max_5xx_rate", 0.05),
+            max_timeout_rate=getattr(settings, "fotmob_max_timeout_rate", 0.05),
+            max_connection_error_rate=getattr(
+                settings, "fotmob_max_connection_error_rate", 0.05
+            ),
+            max_p95_latency_ms=getattr(settings, "fotmob_max_p95_latency_ms", 3000.0),
+            connection_pool_size=getattr(settings, "fotmob_connection_pool_size", 40),
             logger=self.logger,
         )
         self.archive = FotMobParquetArchive(settings.archive_path, settings.parquet_compression)
@@ -659,6 +678,23 @@ class FotMobService:
         # aggregate unscoped so the debug panel does not silently report only
         # the legacy Bundesliga queue.
         metrics["daily"] = self.history_pipeline.store.daily_status()
+        performance_store = self.history_pipeline.store
+        metrics["performance_profiles"] = [
+            {str(key): row[key] for key in row.keys()}
+            for row in performance_store.performance_profiles(limit=20)
+        ]
+        metrics["known_stable_max_rps"] = performance_store.known_stable_max_rps(
+            confirmations=int(
+                getattr(self.settings, "fotmob_performance_stable_confirmations", 2)
+            )
+        )
+        metrics["performance_configuration"] = {
+            "rate_mode": str(getattr(self.settings, "fotmob_rate_mode", "ADAPTIVE")).upper(),
+            "initial_rps": float(getattr(self.settings, "fotmob_initial_rps", 5.0)),
+            "max_rps": float(getattr(self.settings, "fotmob_max_rps", 30.0)),
+            "initial_workers": int(getattr(self.settings, "fotmob_initial_workers", 10)),
+            "max_workers": int(getattr(self.settings, "fotmob_max_workers", 40)),
+        }
         metrics["canonical_archive"] = str(self.canonical_archive.root)
         metrics["canonical_archive_bytes"] = self.canonical_archive.total_size_bytes
         return metrics

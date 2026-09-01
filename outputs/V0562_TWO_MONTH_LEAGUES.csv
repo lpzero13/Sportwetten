@@ -1,0 +1,257 @@
+country_code,country_name,league_id,league_name,feed_rows,unique_matches,hz_rows,no_hz_rows,unknown_rows,hz_unique,no_hz_unique,next_day_rows,countries,leagues
+USA,USA,10282,MLS Next Pro,245,137,243,2,0,136,1,108,1,1
+USA,USA,130,MLS,218,111,218,0,0,111,0,107,1,1
+USA,USA,8972,USL Championship,214,108,210,4,0,106,2,105,1,1
+ARG,Argentinien,112,Liga Profesional,167,105,167,0,0,105,0,66,1,1
+BRA,Brasilien,8814,Serie B,159,100,159,0,0,100,0,60,1,1
+INT,International,489,Vereins-Freundschaftsspiele,529,523,95,434,0,92,431,6,1,1
+ECU,Ecuador,246,Serie A,133,89,133,0,0,89,0,44,1,1
+INT,International,10615,Conference League Qualifikation,260,260,83,177,0,83,177,0,1,1
+USA,USA,9134,NWSL,147,81,147,0,0,81,0,67,1,1
+USA,USA,9296,USL League One,163,82,155,8,0,78,4,81,1,1
+BOL,Bolivien,144,Primera Division,116,77,116,0,0,77,0,39,1,1
+CHN,China,120,Super League,74,72,71,3,0,69,3,0,1,1
+SWE,Schweden,67,Allsvenskan,69,69,69,0,0,69,0,0,1,1
+BRA,Brasilien,268,Serie A,109,72,101,8,0,68,4,38,1,1
+KOR,Südkorea,9116,K League 2,72,72,68,4,0,68,4,0,1,1
+KOR,Südkorea,9080,K League 1,65,65,65,0,0,65,0,0,1,1
+PER,Peru,131,Liga 1,80,62,80,0,0,62,0,18,1,1
+COL,Kolumbien,274,Primera A,124,74,95,29,0,58,16,51,1,1
+ENG,England,133,EFL Cup,58,58,58,0,0,58,0,0,1,1
+INT,International,10043,Leagues Cup,115,58,111,4,0,56,2,57,1,1
+NOR,Norwegen,59,Eliteserien,55,55,55,0,0,55,0,0,1,1
+ROU,Rumänien,189,Liga I,55,55,55,0,0,55,0,0,1,1
+MEX,Mexiko,230,Liga MX,107,54,107,0,0,54,0,53,1,1
+ISL,Island,215,Besta deildin,51,51,51,0,0,51,0,0,1,1
+FIN,Finnland,51,Veikkausliiga,50,50,50,0,0,50,0,0,1,1
+RUS,Russland,63,Premier League,48,48,48,0,0,48,0,0,1,1
+POL,Polen,196,Ekstraklasa,52,52,47,5,0,47,5,0,1,1
+CHI,Chile,273,Liga de Primera,68,48,65,3,0,46,2,22,1,1
+SRB,Serbien,182,Super Liga,51,49,45,6,0,45,4,2,1,1
+INT,International,10613,Europa League Qualifikation,82,82,43,39,0,43,39,0,1,1
+CZE,Tschechien,122,1. Liga,44,44,43,1,0,43,1,0,1,1
+NED,Niederlande,111,Eerste Divisie,42,42,42,0,0,42,0,0,1,1
+PAR,Paraguay,199,Division Profesional,42,42,42,0,0,42,0,0,1,1
+VEN,Venezuela,339,Primera Division,88,42,86,2,0,41,1,34,1,1
+JPN,Japan,223,J. League,40,40,40,0,0,40,0,0,1,1
+TUR,Türkei,165,1. Lig,40,40,40,0,0,40,0,0,1,1
+CAN,Kanada,9986,Premier League,58,37,56,2,0,36,1,21,1,1
+DEN,Dänemark,85,1. Division,36,36,36,0,0,36,0,0,1,1
+ENG,England,48,Championship,36,36,36,0,0,36,0,0,1,1
+ENG,England,109,League Two,36,36,36,0,0,36,0,0,1,1
+FRA,Frankreich,110,Ligue 2,36,36,36,0,0,36,0,0,1,1
+ENG,England,108,League One,35,35,35,0,0,35,0,0,1,1
+KSA,Saudi-Arabien,536,Saudi Pro League,35,35,35,0,0,35,0,0,1,1
+INT,International,10611,Champions League Qualifikation,90,90,34,56,0,34,56,0,1,1
+SVK,Slowakei,176,1. liga,36,36,34,2,0,34,2,0,1,1
+DEN,Dänemark,46,Superligaen,34,34,34,0,0,34,0,0,1,1
+INT,International,10371,Women's Africa Cup of Nations,34,34,34,0,0,34,0,0,1,1
+LVA,Lettland,226,Virsliga,35,34,33,2,0,33,1,1,1,1
+NED,Niederlande,57,Eredivisie,34,34,33,1,0,33,1,0,1,1
+POR,Portugal,61,Liga Portugal,34,34,33,1,0,33,1,0,1,1
+BEL,Belgien,40,First Division A,33,33,33,0,0,33,0,0,1,1
+ESP,Spanien,140,LaLiga2,33,33,33,0,0,33,0,0,1,1
+INT,International,299,Copa Sudamericana,64,32,64,0,0,32,0,32,1,1
+RSA,Südafrika,537,Premier Soccer League,32,32,32,0,0,32,0,0,1,1
+GER,Deutschland,209,DFB Pokal,30,30,30,0,0,30,0,0,1,1
+IRL,Irland,126,Premier Liga,30,30,30,0,0,30,0,0,1,1
+ESP,Spanien,87,LaLiga,30,30,30,0,0,30,0,0,1,1
+ENG,England,9084,Premier League 2,30,30,29,1,0,29,1,0,1,1
+SCO,Schottland,11019,SWPL Cup,30,30,28,2,0,28,2,0,1,1
+AUS,Australien,9471,Australia Cup,29,28,29,0,0,28,0,1,1,1
+CAN,Kanada,10872,Northern Super League,40,28,40,0,0,28,0,12,1,1
+GER,Deutschland,208,3. Liga,30,30,27,3,0,27,3,0,1,1
+SUI,Schweiz,69,Super League,28,28,27,1,0,27,1,0,1,1
+GER,Deutschland,146,2. Bundesliga,27,27,27,0,0,27,0,0,1,1
+TUR,Türkei,71,Süper Lig,27,27,27,0,0,27,0,0,1,1
+AUT,Österreich,38,Bundesliga,27,27,27,0,0,27,0,0,1,1
+INT,International,9265,ASEAN Championship,26,26,26,0,0,26,0,0,1,1
+INT,International,77,WM,34,26,34,0,0,26,0,8,1,1
+SUI,Schweiz,163,Challenge League,26,26,26,0,0,26,0,0,1,1
+INT,International,9656,CONCACAF Championship U20,41,25,41,0,0,25,0,16,1,1
+CRO,Kroatien,252,HNL,25,25,24,1,0,24,1,0,1,1
+USA,USA,10654,USL Cup,47,24,47,0,0,24,0,23,1,1
+EGY,Ägypten,519,Premier League,23,23,23,0,0,23,0,0,1,1
+BEL,Belgien,264,First Division B,21,21,21,0,0,21,0,0,1,1
+KSA,Saudi-Arabien,10721,Saudi First Division,21,21,21,0,0,21,0,0,1,1
+UAE,Vereinigte Arabische Emirate,538,Pro League,21,21,21,0,0,21,0,0,1,1
+BRA,Brasilien,9067,Copa do Brasil,36,20,36,0,0,20,0,16,1,1
+ENG,England,47,Premier League,20,20,20,0,0,20,0,0,1,1
+ITA,Italien,55,Serie A,20,20,20,0,0,20,0,0,1,1
+ITA,Italien,86,Serie B,20,20,20,0,0,20,0,0,1,1
+SCO,Schottland,64,Premiership,21,21,19,2,0,19,2,0,1,1
+FRA,Frankreich,53,Ligue 1,18,18,18,0,0,18,0,0,1,1
+ITA,Italien,141,Coppa Italia,20,20,16,4,0,16,4,0,1,1
+INT,International,45,Copa Libertadores,32,16,32,0,0,16,0,16,1,1
+KSA,Saudi-Arabien,9942,King's Cup,16,16,15,1,0,15,1,0,1,1
+SCO,Schottland,10791,SWPL 1,15,15,15,0,0,15,0,0,1,1
+GER,Deutschland,9676,Frauen Bundesliga,14,14,14,0,0,14,0,0,1,1
+ENG,England,10705,National League Cup,16,16,13,3,0,13,3,0,1,1
+GRE,Griechenland,135,Super League 1,14,14,13,1,0,13,1,0,1,1
+ARG,Argentinien,9305,Copa Argentina,20,12,20,0,0,12,0,8,1,1
+ISR,Israel,127,Ligat ha'Al,12,12,12,0,0,12,0,0,1,1
+QAT,Katar,535,Qatar Stars League,12,12,12,0,0,12,0,0,1,1
+INT,International,287,UEFA U19 Championship,10,10,10,0,0,10,0,0,1,1
+GER,Deutschland,54,Bundesliga,9,9,9,0,0,9,0,0,1,1
+ENG,England,142,EFL Trophy,9,9,8,1,0,8,1,0,1,1
+CAN,Kanada,9837,Canadian Championship,14,8,14,0,0,8,0,6,1,1
+ESP,Spanien,9907,Liga F,8,8,8,0,0,8,0,0,1,1
+RSA,Südafrika,9474,South Africa 8 Cup,8,8,8,0,0,8,0,0,1,1
+QAT,Katar,11030,Second Division,10,10,6,4,0,6,4,0,1,1
+CHI,Chile,11697,Copa de la Liga,7,4,7,0,0,4,0,3,1,1
+ENG,England,12889,EFL Cup Qualifikation,2,2,2,0,0,2,0,0,1,1
+WAL,Wales,287,UEFA U19 Championship,2,2,2,0,0,2,0,0,1,1
+BEL,Belgien,266,Super Cup,1,1,1,0,0,1,0,0,1,1
+GER,Deutschland,8924,Super Cup,1,1,1,0,0,1,0,0,1,1
+GER,Deutschland,11034,Supercup der Frauen,1,1,1,0,0,1,0,0,1,1
+ENG,England,247,Community Shield,1,1,1,0,0,1,0,0,1,1
+FRA,Frankreich,207,Trophée des champions,1,1,1,0,0,1,0,0,1,1
+INT,International,10703,FIFA Intercontinental Cup,1,1,1,0,0,1,0,0,1,1
+INT,International,74,UEFA Super Cup,1,1,1,0,0,1,0,0,1,1
+ISR,Israel,9862,Super Cup,1,1,1,0,0,1,0,0,1,1
+MEX,Mexiko,11039,Campeón de Campeones,2,1,2,0,0,1,0,1,1,1
+NED,Niederlande,237,Super Cup,1,1,1,0,0,1,0,0,1,1
+POL,Polen,200,Superpuchar Polski,1,1,1,0,0,1,0,0,1,1
+POR,Portugal,188,Super Cup,1,1,1,0,0,1,0,0,1,1
+RUS,Russland,195,Super Cup,1,1,1,0,0,1,0,0,1,1
+ENG,England,8947,Premier Liga,283,283,0,283,0,0,283,0,1,1
+ARG,Argentinien,9213,Primera B Metropolitana & Torneo Federal A,301,274,0,301,0,0,274,28,1,1
+GER,Deutschland,512,Regionalliga,248,247,0,248,0,0,247,0,1,1
+NOR,Norwegen,205,Norsk Tipping-ligaen,206,206,0,206,0,0,206,0,1,1
+SCO,Schottland,9545,Highland / Lowland,175,175,0,175,0,0,175,0,1,1
+ARG,Argentinien,8965,Primera B Nacional,196,163,0,196,0,0,163,27,1,1
+ENG,England,8944,National North & South,142,142,0,142,0,0,142,0,1,1
+SCO,Schottland,180,League Cup,88,88,0,88,0,0,88,0,1,1
+SWE,Schweden,169,Ettan,80,80,0,80,0,0,80,0,1,1
+RUS,Russland,338,1. Division,76,76,0,76,0,0,76,0,1,1
+BRA,Brasilien,8971,Serie C,98,73,0,98,0,0,73,25,1,1
+CHN,China,9137,China League One,72,72,0,72,0,0,72,0,1,1
+INT,International,10612,Women's Champions League Qualifikation,71,71,0,71,0,0,71,0,1,1
+NOR,Norwegen,204,PostNord-ligaen,71,71,0,71,0,0,71,0,1,1
+CHI,Chile,9126,Liga de Ascenso,90,64,0,90,0,0,64,27,1,1
+UZB,Usbekistan,540,Superliga,64,64,0,64,0,0,64,0,1,1
+BRA,Brasilien,9464,Serie D,70,62,0,70,0,0,62,8,1,1
+KAZ,Kasachstan,225,Premier League,63,62,0,63,0,0,62,0,1,1
+NOR,Norwegen,206,Norgesmesterskapet,62,62,0,62,0,0,62,0,1,1
+FIN,Finnland,8969,Ykkonen,60,60,0,60,0,0,60,0,1,1
+ISL,Island,216,1. Deild,60,60,0,60,0,0,60,0,1,1
+ISL,Island,10226,2. Deild,60,60,0,60,0,0,60,0,1,1
+ITA,Italien,147,Serie C,60,60,0,60,0,0,60,0,1,1
+ENG,England,117,National League,59,59,0,59,0,0,59,0,1,1
+URU,Uruguay,161,Liga AUF Uruguaya,77,58,0,77,0,0,58,15,1,1
+BLR,Belarus,263,Premier League,56,56,0,56,0,0,56,0,1,1
+NOR,Norwegen,203,OBOS-ligaen,56,56,0,56,0,0,56,0,1,1
+URU,Uruguay,9122,Segunda Division,74,56,0,74,0,0,56,14,1,1
+ROU,Rumänien,9113,Liga II,55,55,0,55,0,0,55,0,1,1
+SWE,Schweden,168,Superettan,55,55,0,55,0,0,55,0,1,1
+BUL,Bulgarien,9096,Second Professional League,54,54,0,54,0,0,54,0,1,1
+POL,Polen,197,I Liga,54,54,0,54,0,0,54,0,1,1
+POL,Polen,8935,II Liga,54,54,0,54,0,0,54,0,1,1
+BRA,Brasilien,11646,Copa Paulista,67,52,0,67,0,0,52,17,1,1
+KOR,Südkorea,9551,Cup,51,51,0,51,0,0,51,0,1,1
+BUL,Bulgarien,270,First Professional League,49,49,0,49,0,0,49,0,1,1
+COL,Kolumbien,9125,Primera B,78,48,0,78,0,0,48,25,1,1
+SVK,Slowakei,8973,2. Liga,48,48,0,48,0,0,48,0,1,1
+CZE,Tschechien,253,FNL,48,48,0,48,0,0,48,0,1,1
+HUN,Ungarn,9117,NB II,48,48,0,48,0,0,48,0,1,1
+WAL,Wales,116,Cymru Premier,48,48,0,48,0,0,48,0,1,1
+MEX,Mexiko,8976,Liga de Expansión MX,89,47,0,89,0,0,47,42,1,1
+MEX,Mexiko,9906,Liga MX Femenil,82,46,0,82,0,0,46,37,1,1
+FIN,Finnland,251,Ykkosliiga,45,45,0,45,0,0,45,0,1,1
+ENG,England,10068,Premier League U18,43,43,0,43,0,0,43,0,1,1
+IND,Indien,10309,Durand Cup,43,43,0,43,0,0,43,0,1,1
+SWE,Schweden,10308,Eliteettan (W),42,42,0,42,0,0,42,0,1,1
+SLV,El Salvador,335,Primera Division,65,41,0,65,0,0,41,24,1,1
+CHI,Chile,9091,Copa Chile,58,40,0,58,0,0,40,18,1,1
+INT,International,9682,CONCACAF Central American Cup,80,40,0,80,0,0,40,40,1,1
+IRQ,Irak,524,Stars League,40,40,0,40,0,0,40,0,1,1
+IRL,Irland,218,First Division,40,40,0,40,0,0,40,0,1,1
+JPN,Japan,8974,J. League 2,40,40,0,40,0,0,40,0,1,1
+LUX,Luxemburg,229,National Liga,40,40,0,40,0,0,40,0,1,1
+SCO,Schottland,179,Challenge Cup,40,40,0,40,0,0,40,0,1,1
+AUT,Österreich,119,2. Liga,40,40,0,40,0,0,40,0,1,1
+IRL,Irland,10210,Women's Premier Liga,40,39,0,40,0,0,39,0,1,1
+JPN,Japan,9136,J. League 3,39,39,0,39,0,0,39,0,1,1
+EST,Estland,248,Regular Season,36,36,0,36,0,0,36,0,1,1
+FRA,Frankreich,8970,Ligue 3,36,36,0,36,0,0,36,0,1,1
+IRN,Iran,523,Persian Gulf,36,36,0,36,0,0,36,0,1,1
+MDA,Moldau,231,National Division,36,36,0,36,0,0,36,0,1,1
+PAN,Panama,9039,LPF,65,36,0,65,0,0,36,30,1,1
+POR,Portugal,185,Liga Portugal 2,36,36,0,36,0,0,36,0,1,1
+GUA,Guatemala,336,Liga Nacional,57,35,0,57,0,0,35,22,1,1
+SWE,Schweden,9089,Damallsvenskan (W),35,35,0,35,0,0,35,0,1,1
+SVN,Slowenien,173,Prva Liga,35,35,0,35,0,0,35,0,1,1
+TAN,Tansania,9066,Premier League,35,35,0,35,0,0,35,0,1,1
+HUN,Ungarn,212,Nemzeti Bajnokság I,34,34,0,34,0,0,34,0,1,1
+JPN,Japan,9011,Emperor Cup,32,32,0,32,0,0,32,0,1,1
+LTU,Litauen,228,Toplyga,32,32,0,32,0,0,32,0,1,1
+AUT,Österreich,278,Austrian Cup,32,32,0,32,0,0,32,0,1,1
+SWE,Schweden,171,Svenska Cupen,31,31,0,31,0,0,31,0,1,1
+UKR,Ukraine,441,Premier League,31,31,0,31,0,0,31,0,1,1
+ARM,Armenien,118,Premier League,30,30,0,30,0,0,30,0,1,1
+CRC,Costa Rica,121,Primera Division,57,30,0,57,0,0,30,27,1,1
+DEN,Dänemark,239,2. Division,30,30,0,30,0,0,30,0,1,1
+DEN,Dänemark,240,3. Division,30,30,0,30,0,0,30,0,1,1
+FRO,Färöer-Inseln,250,Premier League,30,30,0,30,0,0,30,0,1,1
+HON,Honduras,337,Liga Nacional,50,30,0,50,0,0,30,20,1,1
+NOR,Norwegen,332,1. Division Kvinner,30,30,0,30,0,0,30,0,1,1
+POR,Portugal,9112,Liga 3,30,30,0,30,0,0,30,0,1,1
+FIN,Finnland,10174,Kansallinen (Women),28,28,0,28,0,0,28,0,1,1
+KOR,Südkorea,9537,K League 3,28,28,0,28,0,0,28,0,1,1
+IRN,Iran,9372,Azadegan League,27,27,0,27,0,0,27,0,1,1
+NED,Niederlande,9195,Tweede Divisie,27,27,0,27,0,0,27,0,1,1
+COL,Kolumbien,9490,Copa Colombia,50,26,0,50,0,0,26,23,1,1
+CZE,Tschechien,254,Czech Cup,26,26,0,26,0,0,26,0,1,1
+MNE,Montenegro,232,1. CFL,25,25,0,25,0,0,25,0,1,1
+MKD,Nordmazedonien,249,Prva Liga,25,25,0,25,0,0,25,0,1,1
+SCO,Schottland,125,League Two,25,25,0,25,0,0,25,0,1,1
+DEN,Dänemark,256,A-Liga,24,24,0,24,0,0,24,0,1,1
+DEN,Dänemark,242,DBU Pokalen,24,24,0,24,0,0,24,0,1,1
+IRL,Irland,219,FAI Cup,24,24,0,24,0,0,24,0,1,1
+ISR,Israel,128,Leumit League,24,24,0,24,0,0,24,0,1,1
+SCO,Schottland,124,League One,24,24,0,24,0,0,24,0,1,1
+NIR,Nordirland,129,Premiership,23,23,0,23,0,0,23,0,1,1
+SCO,Schottland,123,Championship,20,20,0,20,0,0,20,0,1,1
+ESP,Spanien,8968,Primera Federación,20,20,0,20,0,0,20,0,1,1
+BIH,Bosnien und Herzegowina,267,Premier League,19,19,0,19,0,0,19,0,1,1
+GEO,Georgien,439,Erovnuli Liga,19,19,0,19,0,0,19,0,1,1
+AZE,Aserbaidschan,262,Premier League,18,18,0,18,0,0,18,0,1,1
+GER,Deutschland,10650,DFB Pokal Frauen,16,16,0,16,0,0,16,0,1,1
+IDN,Indonesien,10059,President's Cup,16,16,0,16,0,0,16,0,1,1
+CRO,Kroatien,275,Croatian Cup,16,16,0,16,0,0,16,0,1,1
+MAR,Marokko,530,Botola Pro,16,16,0,16,0,0,16,0,1,1
+PAR,Paraguay,10230,Copa Paraguay,16,16,0,16,0,0,16,0,1,1
+RUS,Russland,193,Russian Cup,16,16,0,16,0,0,16,0,1,1
+TUN,Tunesien,544,Ligue I,16,16,0,16,0,0,16,0,1,1
+NOR,Norwegen,331,Toppserien,15,15,0,15,0,0,15,0,1,1
+IRL,Irland,10307,FAI Women's Cup (W),14,14,0,14,0,0,14,0,1,1
+MAS,Malaysia,8985,Liga Super,14,14,0,14,0,0,14,0,1,1
+SUI,Schweiz,164,Swiss Cup,13,13,0,13,0,0,13,0,1,1
+FIN,Finnland,10186,Kansallinen Qualification (Women),12,12,0,12,0,0,12,0,1,1
+INT,International,11129,UEFA Women's Europa Cup,12,12,0,12,0,0,12,0,1,1
+JPN,Japan,9500,WE League,12,12,0,12,0,0,12,0,1,1
+GRE,Griechenland,145,Greece Cup,11,11,0,11,0,0,11,0,1,1
+USA,USA,10699,USL Super League Women,21,11,0,21,0,0,11,10,1,1
+ALB,Albanien,260,Kategoria Superiore,10,10,0,10,0,0,10,0,1,1
+KUW,Kuwait,529,Premier League,10,10,0,10,0,0,10,0,1,1
+NED,Niederlande,10289,Eredivisie Vrouwen,10,10,0,10,0,0,10,0,1,1
+NGA,Nigeria,533,Professional Football League,10,10,0,10,0,0,10,0,1,1
+CHN,China,9550,Chinese FA Cup,8,8,0,8,0,0,8,0,1,1
+ISR,Israel,9098,Toto Cup Leumit,8,8,0,8,0,0,8,0,1,1
+CYP,Zypern,136,1. Division,7,7,0,7,0,0,7,0,1,1
+TAN,Tansania,10028,Premier League Qualifikation,5,5,0,5,0,0,5,0,1,1
+INT,International,10622,AFC Champions League Elite Qualifikation,4,4,0,4,0,0,4,0,1,1
+ITA,Italien,11014,Coppa Italia Women,2,2,0,2,0,0,2,0,1,1
+ARG,Argentinien,9381,Super Copa International,1,1,0,1,0,0,1,0,1,1
+CRC,Costa Rica,12888,Primera Liga Qualifikation,2,1,0,2,0,0,1,1,1,1
+CRC,Costa Rica,10223,Super cup,2,1,0,2,0,0,1,1,1,1
+FIN,Finnland,143,Suomen Cup,1,1,0,1,0,0,1,0,1,1
+GRE,Griechenland,8816,Super Cup,1,1,0,1,0,0,1,0,1,1
+INT,International,9469,AFC Champions League Two,1,1,0,1,0,0,1,0,1,1
+INT,International,114,Freundschaftsspiele,1,1,0,1,0,0,1,0,1,1
+INT,International,13169,MLS All-Star Game,2,1,0,2,0,0,1,1,1,1
+ISL,Island,217,Icelandic Cup,1,1,0,1,0,0,1,0,1,1
+MAR,Marokko,11840,Throne Cup,1,1,0,1,0,0,1,0,1,1
+NED,Niederlande,11029,Super Cup,1,1,0,1,0,0,1,0,1,1
+ROU,Rumänien,192,Supercupa,1,1,0,1,0,0,1,0,1,1
+VIE,Vietnam,10737,Super Cup,1,1,0,1,0,0,1,0,1,1
