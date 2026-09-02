@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from models.event import LiveEvent
 from models.market import EventDetails
-from .database import Database, state_from_event
+from .database import Database
 
 
 class EventRepository:
@@ -12,9 +12,10 @@ class EventRepository:
         self.database = database
 
     def save_observation(self, event: LiveEvent, observed_at: str) -> bool:
-        self.database.upsert_event(event, observed_at)
-        return self.database.upsert_current_event_state(
-            state_from_event(event, observed_at)
+        return self.database.persist_event_observation(
+            event,
+            observed_at,
+            record_history=False,
         )
 
 
@@ -30,10 +31,13 @@ class MarketRepository:
         store_odds_history: bool = True,
         snapshot_id: int | None = None,
     ) -> int:
-        self.database.upsert_event(details.event, observed_at)
-        self.database.record_event_state_if_changed(
-            state_from_event(details.event, observed_at)
+        accepted = self.database.persist_event_observation(
+            details.event,
+            observed_at,
+            record_history=True,
         )
+        if not accepted:
+            return 0
         changes = 0
         for market in details.markets:
             self.database.upsert_market(market, observed_at)
@@ -48,14 +52,18 @@ class MarketRepository:
                     changes += 1
         return changes
 
-    def save_current_details(self, details: EventDetails, observed_at: str) -> None:
+    def save_current_details(self, details: EventDetails, observed_at: str) -> bool:
         """Update only operational event/market state; never append history."""
 
-        self.database.upsert_event(details.event, observed_at)
-        self.database.upsert_current_event_state(
-            state_from_event(details.event, observed_at)
+        accepted = self.database.persist_event_observation(
+            details.event,
+            observed_at,
+            record_history=False,
         )
+        if not accepted:
+            return False
         for market in details.markets:
             self.database.upsert_market(market, observed_at)
             for outcome in market.outcomes:
                 self.database.upsert_outcome(outcome, details.event.event_id, observed_at)
+        return True

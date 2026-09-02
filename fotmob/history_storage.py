@@ -19,6 +19,7 @@ from .history_models import (
     FotMobMatchIndexRecord,
     FotMobSeasonRef,
 )
+from .matching import country_name_for_code
 
 
 HISTORY_SCHEMA = """
@@ -609,7 +610,7 @@ class FotMobHistoryStore:
             "ITA": "Italien",
             "NED": "Niederlande",
         }
-        return names.get(text.upper(), text)
+        return names.get(text.upper()) or country_name_for_code(text) or text
 
     def upsert_daily_index(
         self,

@@ -300,6 +300,7 @@ class Collector:
         self._universe_detail_requests_avoided = 0
         self._fotmob_detail_requests_avoided = 0
         self._last_universe_decisions: dict[str, LiveUniverseDecision] = {}
+        self._fotmob_link_resolution_results: dict[str, Any] = {}
 
     @property
     def queue_depth(self) -> int:
@@ -481,12 +482,18 @@ class Collector:
         current_events = {event.event_id: event for event in result.events}
         for event_id, event in current_events.items():
             decision = self._universe_decision(event)
+            previous = previous_events.get(event_id)
             if decision is not None and decision.priority in {P3_MINIMAL, P4_IGNORE}:
                 # Keep the complete feed in the radar and in current state;
                 # only expensive detail scheduling is skipped.
                 self._universe_detail_requests_avoided += 1
                 continue
-            previous = previous_events.get(event_id)
+            # If prematch polling did not see this event, the first live
+            # appearance is the second deterministic opportunity to resolve
+            # it.  The resolver uses the daily fixture index and keeps a
+            # confirmed link in the durable provider-link layer.
+            if previous is None:
+                self._resolve_fotmob_link(event)
             state = self._event_states.setdefault(event_id, CollectorEventState())
             observed_at = result.metrics.response_received_at if result.metrics else _now_iso()
             previous_h2 = self._second_half_goals(previous) if previous is not None else None
@@ -590,11 +597,21 @@ class Collector:
             self._fotmob_detail_requests_avoided += 1
             return
         try:
-            resolved = self._resolve_fotmob_link(event)
+            resolved = self._fotmob_link_resolution_results.get(str(event.event_id))
+            resolved_status = getattr(
+                getattr(resolved, "match_result", None), "status", "UNMATCHED"
+            )
+            if resolved is None or resolved_status not in {
+                "EXACT",
+                "HIGH_CONFIDENCE",
+                "MANUAL",
+                "MANUALLY_CONFIRMED",
+            }:
+                resolved = self._resolve_fotmob_link(event)
             if resolved is None:
                 return
             status = getattr(getattr(resolved, "match_result", None), "status", "UNMATCHED")
-            if status not in {"EXACT", "HIGH_CONFIDENCE", "MANUALLY_CONFIRMED"}:
+            if status not in {"EXACT", "HIGH_CONFIDENCE", "MANUAL", "MANUALLY_CONFIRMED"}:
                 self.logger.info(
                     "FotMob HZ enrichment unavailable: event=%s status=%s",
                     event.event_id,
@@ -622,7 +639,10 @@ class Collector:
         if service is None or not getattr(service, "automated_worker_allowed", False):
             return None
         try:
-            return service.resolver.resolve(event)
+            resolved = service.resolver.resolve(event)
+            if resolved is not None:
+                self._fotmob_link_resolution_results[str(event.event_id)] = resolved
+            return resolved
         except Exception as exc:  # optional enrichment must never stop polling
             self.logger.warning(
                 "FotMob provider-link resolution failed: event=%s reason=%s",
@@ -675,7 +695,9 @@ class Collector:
             observed_at = response.metrics.response_received_at
             # Keep the pre-match event/competition metadata available even
             # before the first detail snapshot is due.
-            self.event_service.repository.save_observation(event, observed_at)
+            accepted = self.event_service.repository.save_observation(event, observed_at)
+            if not accepted:
+                continue
             decision = self._universe_decision(event)
             if decision is None or decision.priority not in {P3_MINIMAL, P4_IGNORE}:
                 self._resolve_fotmob_link(event)
@@ -820,20 +842,31 @@ class Collector:
         self,
         details: EventDetails,
         observed_at: str,
-    ) -> MarketAnalysis | None:
+    ) -> tuple[MarketAnalysis | None, bool]:
         """Write only the replaceable operational view for a detail response."""
 
-        self.market_repository.save_current_details(details, observed_at)
+        accepted = self.market_repository.save_current_details(details, observed_at)
+        if not accepted:
+            return None, False
+        status = str(details.event.status or "").strip().casefold()
+        period = str(details.event.period or "").strip().casefold()
+        terminal = status in {"finished", "ended", "complete", "completed", "final", "no_longer_live"} or period in {
+            "finished", "ended", "complete", "completed", "final", "no_longer_live"
+        }
         try:
-            return self.intelligence_service.analyze(
+            analysis = self.intelligence_service.analyze(
                 details,
                 observed_at=observed_at,
                 now=datetime.fromisoformat(observed_at.replace("Z", "+00:00")),
-                persist=True,
+                # A terminal detail response may contain still-open provider
+                # markets.  Keep the terminal odds close authoritative and
+                # use the analysis only to build the final immutable snapshot.
+                persist=not terminal,
             )
+            return analysis, True
         except Exception as exc:
             self._record_error(f"Current intelligence failed: event={details.event.event_id}: {exc}")
-            return None
+            return None, True
 
     @staticmethod
     def _has_relevant_tradeable_market(analysis: MarketAnalysis | None) -> bool:
@@ -1051,7 +1084,14 @@ class Collector:
             return
 
         details = result.details
-        analysis = self._update_current_state(details, observed_at)
+        analysis, state_accepted = self._update_current_state(details, observed_at)
+        if not state_accepted:
+            self.logger.info(
+                "Ignored stale terminal detail state: event=%s type=%s",
+                job.event_id,
+                job.snapshot_type,
+            )
+            return
         state = self._event_states.setdefault(job.event_id, CollectorEventState())
         state.latest_details = details
         state.last_status = details.event.status

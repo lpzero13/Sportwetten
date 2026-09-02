@@ -22,8 +22,63 @@ MATCH_STATUSES = (
     "HIGH_CONFIDENCE",
     "AMBIGUOUS",
     "UNMATCHED",
+    "MANUAL",
     "MANUALLY_CONFIRMED",
+    "INVALIDATED",
     "REJECTED",
+)
+
+# FotMob generally exposes ISO-like three-letter country codes while Tipico
+# exposes localized country names. Keep the same conversion for matching and
+# for labels stored by the daily-index persistence path.
+COUNTRY_CODE_NAMES = {
+    "AFG": "Afghanistan", "ALB": "Albanien", "ALG": "Algerien", "AND": "Andorra",
+    "ANG": "Angola", "ARG": "Argentinien", "ARM": "Armenien", "AUS": "Australien",
+    "AUT": "Österreich", "AZE": "Aserbaidschan", "BAH": "Bahamas", "BAN": "Bangladesch",
+    "BAR": "Barbados", "BEL": "Belgien", "BEN": "Benin", "BER": "Bermuda",
+    "BFA": "Burkina Faso", "BHR": "Bahrain", "BIH": "Bosnien und Herzegowina",
+    "BLR": "Belarus", "BOL": "Bolivien", "BOT": "Botswana", "BRA": "Brasilien",
+    "BRU": "Brunei", "BUL": "Bulgarien", "CAM": "Kamerun", "CAN": "Kanada",
+    "CHA": "Tschad", "CHI": "Chile", "CHN": "China", "CIV": "Elfenbeinküste",
+    "CMR": "Kamerun", "COD": "Demokratische Republik Kongo", "COL": "Kolumbien",
+    "COM": "Komoren", "CPV": "Kap Verde", "CRC": "Costa Rica", "CRO": "Kroatien",
+    "CUB": "Kuba", "CUW": "Curaçao", "CYP": "Zypern", "CZE": "Tschechien",
+    "DEN": "Dänemark", "DJI": "Dschibuti", "DMA": "Dominica",
+    "DOM": "Dominikanische Republik", "ECU": "Ecuador", "EGY": "Ägypten",
+    "ENG": "England", "ERI": "Eritrea", "ESP": "Spanien", "EST": "Estland",
+    "ETH": "Äthiopien", "FIJ": "Fidschi", "FIN": "Finnland", "FRA": "Frankreich",
+    "GAB": "Gabun", "GAM": "Gambia", "GEO": "Georgien", "GER": "Deutschland",
+    "GHA": "Ghana", "GIB": "Gibraltar", "GRE": "Griechenland", "GUA": "Guatemala",
+    "GUI": "Guinea", "GUY": "Guyana", "HAI": "Haiti", "HKG": "Hongkong",
+    "HON": "Honduras", "HUN": "Ungarn", "IDN": "Indonesien", "IND": "Indien",
+    "IRL": "Irland", "IRN": "Iran", "IRQ": "Irak", "ISL": "Island", "ISR": "Israel",
+    "ITA": "Italien", "JAM": "Jamaika", "JOR": "Jordanien", "JPN": "Japan",
+    "KAZ": "Kasachstan", "KEN": "Kenia", "KGZ": "Kirgisistan", "KOR": "Südkorea",
+    "KSA": "Saudi-Arabien", "KUW": "Kuwait", "LAO": "Laos", "LBN": "Libanon",
+    "LBR": "Liberia", "LBY": "Libyen", "LIE": "Liechtenstein", "LTU": "Litauen",
+    "LUX": "Luxemburg", "LVA": "Lettland", "MAC": "Macau", "MAD": "Madagaskar",
+    "MAR": "Marokko", "MAS": "Malaysia", "MEX": "Mexiko", "MLT": "Malta",
+    "MNE": "Montenegro", "MNG": "Mongolei", "MOZ": "Mosambik", "MRI": "Mauritius",
+    "MTN": "Mauretanien", "MWI": "Malawi", "NAM": "Namibia", "NCA": "Nicaragua",
+    "NED": "Niederlande", "NEP": "Nepal", "NGA": "Nigeria", "NIG": "Niger",
+    "NOR": "Norwegen", "NZL": "Neuseeland", "OMA": "Oman", "PAK": "Pakistan",
+    "PAN": "Panama", "PAR": "Paraguay", "PER": "Peru", "PHI": "Philippinen",
+    "PLE": "Palästina", "POL": "Polen", "POR": "Portugal", "PRK": "Nordkorea",
+    "PUR": "Puerto Rico", "QAT": "Katar", "ROU": "Rumänien", "RSA": "Südafrika",
+    "RUS": "Russland", "RWA": "Ruanda", "SCO": "Schottland", "SEN": "Senegal",
+    "SGP": "Singapur", "SLE": "Sierra Leone", "SLO": "Slowenien", "SMR": "San Marino",
+    "SRB": "Serbien", "SUD": "Sudan", "SUI": "Schweiz", "SVK": "Slowakei",
+    "SWE": "Schweden", "SWZ": "Eswatini", "SYR": "Syrien", "TAH": "Tahiti",
+    "TAN": "Tansania", "THA": "Thailand", "TJK": "Tadschikistan", "TKM": "Turkmenistan",
+    "TOG": "Togo", "TRI": "Trinidad und Tobago", "TUN": "Tunesien", "TUR": "Türkei",
+    "UAE": "Vereinigte Arabische Emirate", "UGA": "Uganda", "UKR": "Ukraine",
+    "URU": "Uruguay", "USA": "USA", "UZB": "Usbekistan", "VEN": "Venezuela",
+    "VIE": "Vietnam", "WAL": "Wales", "YEM": "Jemen", "ZAM": "Sambia",
+    "ZIM": "Simbabwe", "INT": "International",
+}
+
+AUTO_LINK_STATUSES = frozenset(
+    {"EXACT", "HIGH_CONFIDENCE", "MANUAL", "MANUALLY_CONFIRMED"}
 )
 
 
@@ -39,7 +94,10 @@ def normalize_name(value: Any) -> str:
     text = re.sub(r"\bmunich\b", "munchen", text)
     text = re.sub(r"\bmuenchen\b", "munchen", text)
     text = re.sub(r"\bvienna\b", "wien", text)
-    text = re.sub(r"[^a-z0-9]+", " ", text)
+    # Keep letters/digits from every Unicode script.  Restricting this to
+    # ASCII makes two unrelated non-Latin clubs normalize to the same empty
+    # string, which can turn a missing-name pair into a false exact match.
+    text = "".join(char if char.isalnum() else " " for char in text)
     return " ".join(text.split())
 
 
@@ -179,8 +237,37 @@ def normalize_country(value: Any) -> str:
         "irl": "irland",
         "scotland": "schottland",
         "sco": "schottland",
+        "armenia": "armenien",
+        "azerbaijan": "aserbaidschan",
+        "bosnia and herzegovina": "bosnien und herzegowina",
+        "cote divoire": "elfenbeinkuste",
+        "ivory coast": "elfenbeinkuste",
+        "democratic republic of the congo": "demokratische republik kongo",
+        "hong kong": "hongkong",
+        "kazakhstan": "kasachstan",
+        "kyrgyzstan": "kirgisistan",
+        "north korea": "nordkorea",
+        "new zealand": "neuseeland",
+        "saudi arabia": "saudi arabien",
+        "south africa": "sudafrika",
+        "south korea": "sudkorea",
+        "turkey": "turkei",
+        "united arab emirates": "vereinigte arabische emirate",
+        "international": "international",
     }
+    aliases.update(
+        {
+            code.casefold(): normalize_name(name)
+            for code, name in COUNTRY_CODE_NAMES.items()
+        }
+    )
     return aliases.get(normalized, normalized)
+
+
+def country_name_for_code(value: Any) -> str | None:
+    """Return a stable German/UI label for a provider country code."""
+
+    return COUNTRY_CODE_NAMES.get(normalize_name(value).upper())
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -280,7 +367,7 @@ class MatchMatchResult:
 
     @property
     def auto_linkable(self) -> bool:
-        return self.status in {"EXACT", "HIGH_CONFIDENCE"}
+        return self.status in AUTO_LINK_STATUSES
 
 
 def _alias_key(value: Any, aliases: Mapping[str, str] | None) -> str:
@@ -288,6 +375,20 @@ def _alias_key(value: Any, aliases: Mapping[str, str] | None) -> str:
     if not aliases:
         return normalized
     return normalize_team_name(aliases.get(normalized, aliases.get(str(value), normalized)))
+
+
+def team_names_equivalent(
+    left: Any,
+    right: Any,
+    aliases: Mapping[str, str] | None = None,
+) -> bool:
+    """Compare team names with the same cautious rules used by the matcher."""
+
+    left_key = _alias_key(left, aliases)
+    right_key = _alias_key(right, aliases)
+    if not left_key or not right_key:
+        return False
+    return left_key == right_key or _team_core(left_key) == _team_core(right_key)
 
 
 def _known_id(value: str | None, known: Mapping[str, str] | None) -> str | None:
@@ -313,9 +414,7 @@ class MatchMatcher:
         self.known_provider_ids = dict(known_provider_ids or {})
 
     def _team_equal(self, left: str, right: str) -> bool:
-        left_key = _alias_key(left, self.team_aliases)
-        right_key = _alias_key(right, self.team_aliases)
-        return left_key == right_key or _team_core(left_key) == _team_core(right_key)
+        return team_names_equivalent(left, right, self.team_aliases)
 
     def _competition_equal(self, left: str, right: str) -> bool:
         normalized_left = normalize_competition_name(left)
@@ -336,20 +435,30 @@ class MatchMatcher:
         fotmob: MatchIdentity,
     ) -> MatchCandidate:
         reasons: list[str] = []
-        if tipico.home_team_id and fotmob.home_team_id and tipico.home_team_id == fotmob.home_team_id:
-            home_exact = True
-            reasons.append("home_provider_id")
-        else:
-            home_exact = self._team_equal(tipico.home_team, fotmob.home_team)
-            if home_exact:
-                reasons.append("home_name_or_alias")
-        if tipico.away_team_id and fotmob.away_team_id and tipico.away_team_id == fotmob.away_team_id:
-            away_exact = True
-            reasons.append("away_provider_id")
-        else:
-            away_exact = self._team_equal(tipico.away_team, fotmob.away_team)
-            if away_exact:
-                reasons.append("away_name_or_alias")
+        if any(
+            not normalize_team_name(value)
+            for value in (
+                tipico.home_team,
+                tipico.away_team,
+                fotmob.home_team,
+                fotmob.away_team,
+            )
+        ):
+            return MatchCandidate(
+                fotmob.provider_match_id or "",
+                0.0,
+                "UNMATCHED",
+                ["missing_team_name"],
+            )
+        # Team IDs belong to provider-specific namespaces just like match
+        # IDs. Never compare a raw Tipico team ID directly with a FotMob team
+        # ID; only the centralized names/aliases are safe at this stage.
+        home_exact = self._team_equal(tipico.home_team, fotmob.home_team)
+        if home_exact:
+            reasons.append("home_name_or_alias")
+        away_exact = self._team_equal(tipico.away_team, fotmob.away_team)
+        if away_exact:
+            reasons.append("away_name_or_alias")
 
         # A reverse fixture is never accepted as the same event, even when a
         # stale/incorrect provider ID happens to look like a team ID match.
@@ -430,19 +539,11 @@ class MatchMatcher:
         scored: list[MatchCandidate] = []
         for candidate in candidates:
             identity = MatchIdentity.from_fotmob_match(candidate)
-            known_for_tipico = self.known_provider_ids.get(identity.provider_match_id or "")
-            if known_for_tipico and known_for_tipico == tipico.provider_match_id:
-                scored.append(
-                    MatchCandidate(
-                        identity.provider_match_id or "",
-                        1.0,
-                        "EXACT",
-                        ["known_provider_match_id"],
-                        0.0,
-                    )
-                )
-            else:
-                scored.append(self.score_candidate(tipico, identity))
+            # A persisted provider ID is a fast-path link, not evidence that a
+            # newly supplied candidate still represents the same event.  The
+            # candidate must pass the normal competition/team/kickoff checks;
+            # Tipico and FotMob IDs are provider-specific namespaces.
+            scored.append(self.score_candidate(tipico, identity))
         scored.sort(key=lambda item: (-item.score, item.provider_match_id))
         viable = [item for item in scored if item.score > 0]
         if not viable:

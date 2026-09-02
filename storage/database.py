@@ -802,6 +802,39 @@ CREATE TABLE IF NOT EXISTS competition_provider_links (
 CREATE INDEX IF NOT EXISTS idx_competition_provider_links_lookup
     ON competition_provider_links(provider, provider_competition_id, tipico_country);
 
+-- Durable, explicit Tipico-to-provider event identity.  This relation is
+-- intentionally additive to the older match_provider_links table: the
+-- latter remains compatible with V0.5.3, while this table keeps the full
+-- explainable matching evidence required by the live/HT paths.
+CREATE TABLE IF NOT EXISTS provider_event_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    tipico_event_id TEXT NOT NULL,
+    fotmob_match_id TEXT,
+    tipico_competition_id TEXT,
+    fotmob_league_id TEXT,
+    tipico_home_team TEXT,
+    tipico_away_team TEXT,
+    fotmob_home_team TEXT,
+    fotmob_away_team TEXT,
+    tipico_kickoff TEXT,
+    fotmob_kickoff TEXT,
+    match_confidence REAL NOT NULL DEFAULT 0,
+    match_method TEXT NOT NULL,
+    match_status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_verified_at TEXT,
+    reason TEXT,
+    UNIQUE (provider, tipico_event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_event_links_lookup
+    ON provider_event_links(provider, tipico_event_id, match_status);
+
+CREATE INDEX IF NOT EXISTS idx_provider_event_links_provider_match
+    ON provider_event_links(provider, fotmob_match_id);
+
 CREATE TABLE IF NOT EXISTS fotmob_fixture_index_runs (
     provider TEXT NOT NULL DEFAULT 'FOTMOB',
     run_date TEXT NOT NULL,
@@ -1273,7 +1306,60 @@ class Database:
 
     def upsert_event(self, event: LiveEvent, observed_at: str) -> None:
         with self._lock, self.connection:
+            previous = self._prior_event_state_locked(str(event.event_id))
+            if previous is not None and not self._accept_live_event_after_state(
+                previous,
+                event,
+                now=datetime.now(timezone.utc),
+                grace_hours=6.0,
+            ):
+                return
             self._upsert_event_locked(event, observed_at)
+            if _state_is_finished(event.status, event.period) or _state_is_no_longer_live(
+                event.status, event.period
+            ):
+                self._close_current_odds_locked(str(event.event_id), observed_at)
+
+    def persist_event_observation(
+        self,
+        event: LiveEvent,
+        observed_at: str,
+        *,
+        record_history: bool = False,
+        now: datetime | None = None,
+        stale_prematch_grace_hours: float = 6.0,
+    ) -> bool:
+        """Persist one observation only after the central state gate accepts it.
+
+        All non-feed writers (upcoming, selected-event details and collector
+        detail workers) use this method.  That prevents a stale response from
+        reopening a finished/terminal event or reviving an old pre-match row.
+        The return value indicates acceptance, not whether a value changed.
+        """
+
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        event_id = str(event.event_id)
+        with self.transaction(immediate=True):
+            previous = self._prior_event_state_locked(event_id)
+            if not self._accept_live_event_after_state(
+                previous,
+                event,
+                now=moment,
+                grace_hours=stale_prematch_grace_hours,
+            ):
+                return False
+            self._upsert_event_locked(event, observed_at)
+            state = state_from_event(event, observed_at)
+            if record_history:
+                self._record_event_state_if_changed_locked(state)
+            self._upsert_current_event_state_locked(state)
+            if _state_is_finished(state.status, state.period) or _state_is_no_longer_live(
+                state.status, state.period
+            ):
+                self._close_current_odds_locked(event_id, observed_at)
+        return True
 
     def _upsert_event_locked(self, event: LiveEvent, observed_at: str) -> None:
         """Upsert event metadata without starting or committing a transaction."""
@@ -1822,7 +1908,12 @@ class Database:
         if previous is None:
             return True
         if _state_is_finished(previous["status"], previous["period"]):
-            return False
+            # A terminal event may still receive its authoritative detail
+            # response (for example the FINAL snapshot queued directly from
+            # the live feed).  Accept another terminal/finished observation
+            # so that final score/result persistence can complete, but never
+            # allow a terminal event to regress to live or pre-match data.
+            return _state_is_finished(event.status, event.period)
         if _state_is_no_longer_live(previous["status"], previous["period"]):
             if _credible_live_event(event):
                 return True
@@ -1838,6 +1929,38 @@ class Database:
             if _status_token(event.status) in PREMATCH_EVENT_STATUSES:
                 return False
         return True
+
+    def _prior_event_state_locked(self, event_id: str) -> sqlite3.Row | None:
+        """Read the strongest persisted predecessor for the central gate.
+
+        Older databases can contain an ``events`` or ``event_states`` row
+        without a corresponding ``current_event_state`` row.  Falling back to
+        those records keeps terminal protection effective during migration and
+        after partial legacy writes as well.
+        """
+
+        resolved_id = str(event_id)
+        current = self.connection.execute(
+            "SELECT * FROM current_event_state WHERE event_id = ?",
+            (resolved_id,),
+        ).fetchone()
+        if current is not None:
+            return current
+        historical = self.connection.execute(
+            """
+            SELECT * FROM event_states
+            WHERE event_id = ?
+            ORDER BY observed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (resolved_id,),
+        ).fetchone()
+        if historical is not None:
+            return historical
+        return self.connection.execute(
+            "SELECT * FROM events WHERE event_id = ?",
+            (resolved_id,),
+        ).fetchone()
 
     def _mark_event_no_longer_live_locked(
         self,
@@ -1960,6 +2083,10 @@ class Database:
                         sorted(candidate_ids),
                     ).fetchall()
                 }
+                for event_id in sorted(candidate_ids - set(current_rows)):
+                    previous = self._prior_event_state_locked(event_id)
+                    if previous is not None:
+                        current_rows[event_id] = previous
             else:
                 current_rows = {}
             accepted_ids: set[str] = set()
@@ -3756,6 +3883,7 @@ class Database:
             "paper_worker_runs",
             "matches",
             "match_provider_links",
+            "provider_event_links",
             "teams",
             "team_provider_aliases",
             "competition_provider_aliases",

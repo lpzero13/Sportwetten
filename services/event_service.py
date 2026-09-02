@@ -48,13 +48,35 @@ def _has_provider_error(payload: dict[str, Any], live: dict[str, Any]) -> bool:
     return False
 
 
+def _feed_item_id(item: Any) -> str | None:
+    """Extract an event id from both compact and expanded soccer indexes."""
+
+    if item is None:
+        return None
+    if isinstance(item, dict):
+        for key in ("id", "eventId", "event_id", "matchId", "match_id"):
+            value = item.get(key)
+            if value not in (None, ""):
+                return str(value)
+        return None
+    value = str(item).strip()
+    return value or None
+
+
 def is_plausible_live_feed(
     payload: dict[str, Any],
     parsed_events: list[LiveEvent],
     *,
     persisted_active_count: int = 0,
+    previous_active_count: int = 0,
 ) -> tuple[bool, str | None]:
-    """Validate the feed globally before it can trigger reconciliation."""
+    """Validate the feed globally before it can trigger reconciliation.
+
+    ``persisted_active_count`` protects the first poll after a restart.  The
+    in-memory count is equally important afterwards: an empty but otherwise
+    well-shaped provider response must never turn every currently observed
+    event into ``NO_LONGER_LIVE``.
+    """
 
     live = payload.get("LIVE") if isinstance(payload, dict) else None
     if not isinstance(live, dict):
@@ -71,11 +93,16 @@ def is_plausible_live_feed(
     if not isinstance(soccer_items, (list, tuple)):
         return False, "LIVE.eventsBySport.soccer is missing or not a list"
 
-    soccer_ids = {str(item) for item in soccer_items if item is not None}
+    soccer_ids = {
+        item_id
+        for item in soccer_items
+        if (item_id := _feed_item_id(item)) is not None
+    }
     event_ids = {str(key) for key in events}
     for item in events.values():
-        if isinstance(item, dict) and item.get("id") is not None:
-            event_ids.add(str(item["id"]))
+        item_id = _feed_item_id(item)
+        if item_id is not None:
+            event_ids.add(item_id)
     if soccer_ids and not soccer_ids.issubset(event_ids):
         return False, "soccer index references missing event objects"
     if events and not soccer_ids:
@@ -86,8 +113,18 @@ def is_plausible_live_feed(
         return False, "soccer event could not be parsed completely"
     # A structurally valid empty feed is safe only when no previously active
     # event would be globally terminalized by that emptiness.
-    if persisted_active_count > 0 and not parsed_events:
-        return False, "empty feed while persisted active events exist"
+    active_reference = max(int(persisted_active_count), int(previous_active_count))
+    if active_reference > 0 and not parsed_events:
+        return False, "empty feed while previously active events exist"
+    # A non-empty response can still be a truncated provider payload.  Keep
+    # the threshold deliberately conservative so normal match completion and
+    # staggered league updates remain valid, while a collapse of a sizeable
+    # live universe cannot silently reconcile hundreds of events away.
+    if active_reference >= 20 and len(parsed_events) < max(1, active_reference // 10):
+        return False, (
+            "implausible live event-count collapse "
+            f"({len(parsed_events)} parsed vs {active_reference} previously active)"
+        )
     return True, None
 
 
@@ -269,6 +306,9 @@ class EventService:
             response.payload,
             parsed_events,
             persisted_active_count=len(persisted_active_ids),
+            previous_active_count=(
+                len(self._events) if self._startup_reconciliation_done else 0
+            ),
         )
         if not plausible:
             self.plausibility_error_count += 1

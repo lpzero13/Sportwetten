@@ -84,8 +84,8 @@ class UpcomingService:
 
         for event in events:
             observed_at = response.metrics.response_received_at
-            self.repository.save_observation(event, observed_at)
-            self._events[event.event_id] = event
+            if self.repository.save_observation(event, observed_at):
+                self._events[event.event_id] = event
         self.last_success_at = response.metrics.response_received_at
         self.last_error = None
         return UpcomingRefreshResult(True, self.events, response.metrics)

@@ -142,32 +142,42 @@ def is_no_data_result(fetched: FotMobFetchResult | None) -> bool:
 
 
 def _row_to_index(row: Any) -> FotMobMatchIndexRecord:
+    keys = set(row.keys()) if hasattr(row, "keys") else set()
+
+    def value(*names: str, default: Any = None) -> Any:
+        for name in names:
+            if name in keys:
+                return row[name]
+        return default
+
+    country_name = value("country_name")
+    country = value("country", default=country_name)
     return FotMobMatchIndexRecord(
-        provider_match_id=str(row["fotmob_match_id"]),
-        league_id=str(row["league_id"]),
-        season_id=str(row["season_id"]),
-        season_label=str(row["season_label"]),
-        kickoff_at=row["kickoff_at"],
-        home_team_id=row["home_team_id"],
-        home_team_name=str(row["home_team_name"]),
-        away_team_id=row["away_team_id"],
-        away_team_name=str(row["away_team_name"]),
-        round_name=row["round"],
-        match_status=row["match_status"],
-        league_name=row["league_name"],
-        country=row["country_name"] or row["country"],
-        country_code=row["country_code"] if "country_code" in row.keys() else None,
-        country_name=row["country_name"] if "country_name" in row.keys() else None,
-        first_seen_at=row["first_seen_at"],
-        provider=str(row["provider"]),
-        source_type=str(row["source_type"] or "FRESH_INDEX"),
-        source_context=row["source_context"],
-        stats_period=row["stats_period"],
-        captured_live=bool(row["captured_live"]),
-        is_next_day=bool(row["is_next_day"]) if "is_next_day" in row.keys() else False,
+        provider_match_id=str(value("fotmob_match_id")),
+        league_id=str(value("league_id")),
+        season_id=str(value("season_id")),
+        season_label=str(value("season_label")),
+        kickoff_at=value("kickoff_at", "kickoff_at_utc"),
+        home_team_id=value("home_team_id"),
+        home_team_name=str(value("home_team_name", default="")),
+        away_team_id=value("away_team_id"),
+        away_team_name=str(value("away_team_name", default="")),
+        round_name=value("round"),
+        match_status=value("match_status"),
+        league_name=value("league_name"),
+        country=country,
+        country_code=value("country_code"),
+        country_name=country_name,
+        first_seen_at=value("first_seen_at"),
+        provider=str(value("provider", default="FOTMOB")),
+        source_type=str(value("source_type", default="FRESH_INDEX") or "FRESH_INDEX"),
+        source_context=value("source_context"),
+        stats_period=value("stats_period"),
+        captured_live=bool(value("captured_live", default=0)),
+        is_next_day=bool(value("is_next_day", default=0)),
         field_provenance=(
-            json.loads(str(row["field_provenance_json"]))
-            if row["field_provenance_json"]
+            json.loads(str(value("field_provenance_json")))
+            if value("field_provenance_json")
             else {}
         ),
     )
@@ -225,6 +235,8 @@ class FotMobHistoryPipeline:
             settings.parquet_compression,
         )
         self._archive_lock = threading.RLock()
+        self._daily_index_cache: dict[str, tuple[float, tuple[FotMobMatchIndexRecord, ...], str | None]] = {}
+        self._daily_index_cache_lock = threading.RLock()
         known_stable_rps = self.store.known_stable_max_rps(
             confirmations=int(
                 getattr(self.settings, "fotmob_performance_stable_confirmations", 2)
@@ -957,6 +969,110 @@ class FotMobHistoryPipeline:
                 safe="",
             ),
         )
+
+    def load_daily_fixture_index(
+        self,
+        observation_date: date | str,
+        *,
+        allow_network: bool = False,
+        force: bool = False,
+        cache_ttl_seconds: float = 300.0,
+    ) -> tuple[list[FotMobMatchIndexRecord], str | None]:
+        """Return one all-league daily fixture index with a short RAM cache.
+
+        The durable ``fotmob_daily_index`` remains the warm cache across
+        restarts.  A network refresh is opt-in at this boundary and fetches
+        only the compact daily feed; no ``matchDetails`` request is made for
+        identification.
+        """
+
+        day_value = self._coerce_date(observation_date)
+        day = day_value.isoformat()
+        now_monotonic = time.monotonic()
+        with self._daily_index_cache_lock:
+            cached = self._daily_index_cache.get(day)
+            if (
+                cached is not None
+                and not force
+                and now_monotonic - cached[0] < max(0.0, float(cache_ttl_seconds))
+            ):
+                return list(cached[1]), cached[2]
+
+        durable_rows = self.store.daily_index(
+            start_date=day,
+            end_date=day,
+            limit=20000,
+            order_by="kickoff_at_utc",
+            ascending=True,
+        )
+        durable_records = tuple(_row_to_index(row) for row in durable_rows)
+        if durable_records and not (allow_network and force):
+            with self._daily_index_cache_lock:
+                self._daily_index_cache[day] = (now_monotonic, durable_records, None)
+            return list(durable_records), None
+        if not allow_network:
+            with self._daily_index_cache_lock:
+                self._daily_index_cache[day] = (now_monotonic, durable_records, None)
+            return list(durable_records), None
+
+        endpoint = self._daily_feed_endpoint(day_value)
+        payload, error = self._fetch_json(endpoint)
+        if payload is None:
+            # Never discard a known-good catalog because the refresh was
+            # transiently unavailable.
+            message = error or "FotMob-Tagesfeed konnte nicht geladen werden"
+            with self._daily_index_cache_lock:
+                self._daily_index_cache[day] = (now_monotonic, durable_records, message)
+            return list(durable_records), message
+
+        fetched_at = _now()
+        records = tuple(
+            extract_daily_match_index(
+                payload,
+                observation_date=day_value,
+                first_seen_at=fetched_at,
+            )
+        )
+        self.store.upsert_match_index(records)
+        self.store.upsert_seasons(
+            FotMobSeasonRef(
+                provider=record.provider,
+                league_id=record.league_id,
+                season_id=record.season_id,
+                season_label=record.season_label,
+                league_name=record.league_name,
+                country=record.country_name or record.country,
+                discovered_at=fetched_at,
+            )
+            for record in records
+        )
+        self.store.upsert_daily_index(
+            records,
+            observation_date=day,
+            source_endpoint=endpoint,
+            payload_hash=_payload_hash(payload),
+            fetched_at=fetched_at,
+        )
+        summary = summarize_daily_feed(payload)
+        self.store.record_daily_load_run(
+            day,
+            "ALL",
+            season_id="DAILY_FEED",
+            status="COMPLETE",
+            fixture_count=len(records),
+            selected_count=len(records),
+            feed_group_count=summary["feed_group_count"],
+            feed_entry_count=summary["feed_entry_count"],
+            feed_unique_count=summary["feed_unique_count"],
+            next_day_count=summary["next_day_count"],
+            duplicates_removed_count=summary["duplicates_removed_count"],
+            payload_hash=_payload_hash(payload),
+            source_endpoint=endpoint,
+            fetched_at=fetched_at,
+        )
+        with self._daily_index_cache_lock:
+            self._daily_index_cache[day] = (time.monotonic(), records, None)
+        return list(records), None
 
     def _all_leagues_date_range(
         self,

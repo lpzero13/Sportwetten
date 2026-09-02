@@ -8,6 +8,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from .history_models import FotMobMatchIndexRecord, FotMobSeasonRef
+from .matching import country_name_for_code
 
 
 _MISSING = object()
@@ -482,7 +483,11 @@ def extract_daily_match_index(
             continue
         country_code = _text(_first(group, "ccode", "countryCode", "country"))
         country_code = country_code.upper() if country_code else None
-        country_name = country_names.get(country_code or "", country_code)
+        country_name = (
+            country_names.get(country_code or "")
+            or country_name_for_code(country_code)
+            or country_code
+        )
         raw_name = _first(group, "localizedName", "name", "leagueName", "title")
         league_name = _text(None if raw_name is _MISSING else raw_name)
         league_name = league_names.get(str(group_id), league_name)

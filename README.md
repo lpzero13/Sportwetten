@@ -418,6 +418,27 @@ Poller gestartet wird. Der technische Laufstatus des All-Leagues-Ausbaus wird
 in `outputs/V055_STATUS.md`, der Fünf-Tage-Nachweis in
 `outputs/V0551_FIVE_DAY_CANARY_REPORT.md` dokumentiert.
 
+### Release Correctness und Provider-Linking (V0.5.9)
+
+V0.5.9 schützt jeden Tipico-Livepoll vor strukturell verdächtigen Leer- oder
+Teilfeeds, zentralisiert die Terminal-/Quotenabsicherung und lässt legitime
+zukünftige Reschedules sowie glaubwürdige Live-Recovery weiterhin zu. Die
+zusätzliche Tabelle `provider_event_links` hält Tipico- und FotMob-Identität,
+Wettbewerb, Länder-/Teamnamen, Kickoff, Confidence, Methode und Status fest.
+`EXACT`, `HIGH_CONFIDENCE` und `MANUAL` sind die einzigen automatisch
+verwendbaren Linkstatus; `AMBIGUOUS`, `UNMATCHED` und `INVALIDATED` lösen keinen
+automatischen Detailabruf aus.
+
+Die Zuordnung nutzt den gecachten FotMob-Tagesindex inklusive angrenzender
+UTC-Tage, grenzt zuerst auf Wettbewerb/Land ein und prüft anschließend
+Heimteam, Auswärtsteam und Kickoff. Das Livepanel bleibt beim bestätigten
+Link und speichert seine ungefähr zehnsekündigen Detailantworten weiterhin nur
+im RAM. Halbzeit-Enrichment schreibt nur verwertbare
+`Periods.FirstHalf`-Daten; fehlt die Struktur oder sind keine Werte nutzbar,
+bleibt der maschinenlesbare Zustand `NO_HALFTIME` und es werden keine
+Nullwerte oder leeren HT-Snapshots erzeugt. Der Implementierungs- und
+Validierungsstand steht in `V059_STATUS.md`.
+
 ### Paper Trading
 
 Paper Trading arbeitet vollständig ohne Wettschein und ohne Wettabgabe. Im
@@ -578,7 +599,8 @@ und `paper_worker_runs` sowie die optionalen V0.5-Tabellen `matches`,
 `fotmob_snapshot_outbox`, `fotmob_seasons`, `fotmob_match_index`,
 `fotmob_history_samples`, `fotmob_historical_archive_index` und
 `fotmob_daily_index`, `fotmob_daily_load_runs`, `fotmob_performance_profile`,
-`fotmob_coverage_catalog`, `tipico_market_capability` und `match_data_quality`.
+`fotmob_coverage_catalog`, `tipico_market_capability`, `provider_event_links`
+und `match_data_quality`.
 `current_event_state`, `current_canonical_outcomes` und
 `current_strategy_evaluations` sind ersetzbare Betriebsdaten. `snapshots` ist
 die kurze SQLite-Staging-/Indexschicht; die historische Zeile wird als flache

@@ -17,12 +17,12 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from .matching import MatchIdentity, MatchMatchResult, MatchMatcher
+from .matching import AUTO_LINK_STATUSES, MatchIdentity, MatchMatchResult, MatchMatcher
 from .models import FotMobFetchResult, FotMobMatch, FotMobStats
 from .storage import internal_match_id_for_tipico
 
 
-ACCEPTED_LINK_STATUSES = frozenset({"EXACT", "HIGH_CONFIDENCE", "MANUALLY_CONFIRMED"})
+ACCEPTED_LINK_STATUSES = AUTO_LINK_STATUSES
 TERMINAL_LIVE_STATUSES = frozenset({"NO_DATA", "FINISHED"})
 LIVE_STAT_KEYS = (
     "xg",
@@ -675,6 +675,27 @@ class FotMobLiveService:
         store = getattr(self.fotmob_service, "store", None)
         if store is None:
             return None
+        rich_link = getattr(self.fotmob_service, "provider_event_link_for_event", None)
+        if callable(rich_link):
+            try:
+                row = rich_link(event)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                row = None
+            if row is not None:
+                status = str(_row_value(row, "match_status") or "").upper()
+                # ``FotMobService`` falls back to the V0.5.3 legacy relation
+                # on an older database.  Accept its provider_match_id shape
+                # here as well; a missing rich row must not disable a valid
+                # migrated/live link.
+                provider_id = _row_value(row, "fotmob_match_id") or _row_value(
+                    row, "provider_match_id"
+                )
+                if status in ACCEPTED_LINK_STATUSES and provider_id not in (None, ""):
+                    return str(provider_id), row
+                # A rich row is authoritative, including an explicit
+                # AMBIGUOUS/UNMATCHED/INVALIDATED decision.  Do not revive a
+                # stale V0.5.3 legacy link behind it.
+                return None
         try:
             row = store.link_for_internal(internal_match_id_for_tipico(event_id), "FOTMOB")
         except TypeError:
@@ -688,6 +709,19 @@ class FotMobLiveService:
         if status not in ACCEPTED_LINK_STATUSES or provider_id in (None, ""):
             return None
         return str(provider_id), row
+
+    def auto_link_for_event(self, event: Any) -> Any | None:
+        """Resolve the selected event from the cached daily index on demand."""
+
+        resolver = getattr(self.fotmob_service, "resolver", None)
+        resolve = getattr(resolver, "resolve", None)
+        if not callable(resolve):
+            return None
+        try:
+            result = resolve(event)
+        except Exception:  # provider/resolver boundary must not break the UI
+            return None
+        return result
 
     def provider_match_id_for_event(self, event: Any) -> str | None:
         linked = self._link_for_event(event)
@@ -783,6 +817,18 @@ class FotMobLiveService:
                     ),
                 )
 
+            persist_link = getattr(self.fotmob_service, "persist_manual_link", None)
+            if callable(persist_link):
+                try:
+                    # The link/evidence is durable, while the fetched live
+                    # payload remains exclusively in this service's RAM
+                    # cache.  Older lightweight adapters simply do not expose
+                    # this optional persistence hook.
+                    persist_link(event, match, reason="manual_live_confirmation")
+                except Exception:
+                    # A temporary persistence problem must not discard a
+                    # validated, user-requested live view.
+                    pass
             self._manual_links[event_id] = (normalized_id, "MANUALLY_CONFIRMED")
             entry = self._cache.setdefault(
                 normalized_id,
@@ -1015,17 +1061,51 @@ class FotMobLiveService:
         return self.fetch_for_event(event, force=force, allow_network=allow_network)
 
     def debug_for_event(self, event: Any) -> dict[str, Any]:
+        linked = self._link_for_event(event)
+        link_row = linked[1] if linked else None
+        if link_row is None:
+            store = getattr(self.fotmob_service, "store", None)
+            lookup = getattr(store, "provider_event_link_for_tipico_event", None)
+            if callable(lookup):
+                try:
+                    link_row = lookup(_event_id(event) or "")
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    link_row = None
         result = self.cached_for_event(event)
         if result is None:
+            link_status = _row_value(link_row, "match_status")
             return {
                 "tipico_event_id": _event_id(event),
-                "fotmob_match_id": None,
-                "status": "NO_MATCH",
+                "fotmob_match_id": linked[0] if linked else (
+                    _row_value(link_row, "fotmob_match_id")
+                    or _row_value(link_row, "provider_match_id")
+                ),
+                "status": link_status or ("LINKED_NOT_FETCHED" if linked else "NO_MATCH"),
+                "link_status": link_status,
+                "match_method": _row_value(link_row, "match_method"),
+                "match_confidence": _row_value(link_row, "match_confidence"),
+                "tipico_home_team": _row_value(link_row, "tipico_home_team"),
+                "tipico_away_team": _row_value(link_row, "tipico_away_team"),
+                "fotmob_home_team": _row_value(link_row, "fotmob_home_team"),
+                "fotmob_away_team": _row_value(link_row, "fotmob_away_team"),
+                "tipico_kickoff": _row_value(link_row, "tipico_kickoff"),
+                "fotmob_kickoff": _row_value(link_row, "fotmob_kickoff"),
+                "fotmob_league_id": _row_value(link_row, "fotmob_league_id"),
             }
         return {
             "tipico_event_id": _event_id(event),
             "fotmob_match_id": result.provider_match_id,
             "status": result.status,
+            "link_status": _row_value(link_row, "match_status"),
+            "match_method": _row_value(link_row, "match_method"),
+            "match_confidence": _row_value(link_row, "match_confidence"),
+            "tipico_home_team": _row_value(link_row, "tipico_home_team"),
+            "tipico_away_team": _row_value(link_row, "tipico_away_team"),
+            "fotmob_home_team": _row_value(link_row, "fotmob_home_team"),
+            "fotmob_away_team": _row_value(link_row, "fotmob_away_team"),
+            "tipico_kickoff": _row_value(link_row, "tipico_kickoff"),
+            "fotmob_kickoff": _row_value(link_row, "fotmob_kickoff"),
+            "fotmob_league_id": _row_value(link_row, "fotmob_league_id"),
             "availability_status": result.availability_status,
             "consecutive_no_data_count": result.consecutive_no_data_count,
             "successful_payloads": result.successful_payloads,

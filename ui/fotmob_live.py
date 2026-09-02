@@ -166,12 +166,25 @@ def render_fotmob_live_panel(service: FotMobLiveService, event: Any | None) -> N
         st.session_state[auto_key] = False
 
     provider_id = service.provider_match_id_for_event(event)
+    auto_link_result = None
+    if provider_id is None:
+        # The resolver uses the cached/persisted daily fixture index and only
+        # falls back to one controlled daily-feed request.  It never performs
+        # matchDetails merely to identify the selected event.
+        auto_link_result = service.auto_link_for_event(event)
+        provider_id = service.provider_match_id_for_event(event)
+        auto_status = getattr(getattr(auto_link_result, "match_result", None), "status", None)
+        if provider_id is not None:
+            st.success(f"FotMob-Match {provider_id} automatisch aus dem Tagesindex zugeordnet.")
+        elif auto_status in {"AMBIGUOUS", "UNMATCHED"}:
+            st.caption(f"Automatisches Matching: {auto_status} · kein Detailabruf ausgelöst.")
     manual_live_result: FotMobLiveResult | None = None
     if provider_id is None and service.manual_use_allowed:
         st.caption(
             "Für dieses Spiel wurde noch keine FotMob-Zuordnung gefunden. "
             "Du kannst die Match-ID aus der FotMob-URL einmalig für dieses "
-            "Spiel prüfen; die Zuordnung bleibt nur in dieser Sitzung im RAM."
+            "Spiel prüfen. Die bestätigte Zuordnung wird gespeichert; die "
+            "Live-Statistiken bleiben ausschließlich im RAM."
         )
         manual_id = st.text_input(
             "FotMob Match-ID (optional)",

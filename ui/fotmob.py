@@ -87,18 +87,30 @@ def render_fotmob_tab(service: FotMobService, event: Any) -> None:
     # explicit discovery/confirmation buttons below still create the normal
     # persistent link through FotMobService when the user asks for it.
     internal_match_id = internal_match_id_for_tipico(str(event.event_id))
-    link = service.store.link_for_internal(internal_match_id)
+    link = service.provider_event_link_for_event(event)
+    if link is None:
+        link = service.store.link_for_internal(internal_match_id)
+
+    def link_value(name: str, legacy_name: str | None = None) -> Any:
+        if link is None:
+            return None
+        keys = set(link.keys()) if hasattr(link, "keys") else set()
+        if name in keys:
+            return link[name]
+        return link[legacy_name] if legacy_name and legacy_name in keys else None
+
+    provider_id = link_value("fotmob_match_id", "provider_match_id")
     current = service.store.current_state(internal_match_id)
     quality = service.store.quality(internal_match_id)
 
     status_columns = st.columns(4)
     status_columns[0].metric("Feature", "AN" if service.enabled else "AUS")
-    status_columns[1].metric("Matching", link["match_status"] if link else "—")
+    status_columns[1].metric("Matching", link_value("match_status") or "—")
     status_columns[2].metric(
         "Confidence",
-        f"{float(link['match_confidence']):.2f}" if link else "—",
+        f"{float(link_value('match_confidence') or 0):.2f}" if link else "—",
     )
-    status_columns[3].metric("FotMob-ID", link["provider_match_id"] if link else "—")
+    status_columns[3].metric("FotMob-ID", provider_id or "—")
 
     can_load = service.enabled and service.manual_use_allowed
     if not service.enabled:
@@ -117,7 +129,7 @@ def render_fotmob_tab(service: FotMobService, event: Any) -> None:
     if can_load:
         provider_id = st.text_input(
             "FotMob Match-ID",
-            value=str(link["provider_match_id"]) if link else "",
+            value=str(provider_id) if provider_id else "",
             key=f"fotmob-provider-id-{event.event_id}",
             help="Die numerische ID aus der FotMob-Match-URL, z. B. aus dem Fragment #5881143.",
         )
@@ -134,7 +146,7 @@ def render_fotmob_tab(service: FotMobService, event: Any) -> None:
 
         candidate = st.session_state.get("fotmob_last_candidate")
         if candidate is not None and (
-            link is None or link["match_status"] not in {"MANUALLY_CONFIRMED", "EXACT", "HIGH_CONFIDENCE"}
+            link is None or link_value("match_status") not in {"MANUAL", "MANUALLY_CONFIRMED", "EXACT", "HIGH_CONFIDENCE"}
         ):
             st.warning(
                 f"Kandidat: {candidate.home_team} – {candidate.away_team} · "
@@ -155,7 +167,9 @@ def render_fotmob_tab(service: FotMobService, event: Any) -> None:
 
     # A successful load updates Current State in the same interaction.  Read
     # the row again so the tab does not show one stale render cycle.
-    link = service.store.link_for_internal(internal_match_id)
+    link = service.provider_event_link_for_event(event)
+    if link is None:
+        link = service.store.link_for_internal(internal_match_id)
     current = service.store.current_state(internal_match_id)
     quality = service.store.quality(internal_match_id)
 
@@ -183,7 +197,13 @@ def render_fotmob_tab(service: FotMobService, event: Any) -> None:
     if first_half_rows:
         st.dataframe(first_half_rows, hide_index=True, width="stretch")
     else:
-        st.info("Noch keine FirstHalf-Statistiken gespeichert.")
+        if quality is not None and not bool(quality["fotmob_ht_stats_available"]):
+            st.info(
+                "NO_HALFTIME: FotMob hat für dieses Spiel keine verwertbaren "
+                "FirstHalf-Statistiken geliefert. Es werden keine Nullwerte ergänzt."
+            )
+        else:
+            st.info("Noch keine FirstHalf-Statistiken gespeichert.")
     st.caption(
         f"Provider: {current['provider'] or 'FOTMOB'} · FotMob-ID: {current['provider_match_id']} · "
         f"Tipico-ID: {current['tipico_event_id'] or event.event_id} · "
@@ -288,6 +308,34 @@ def render_fotmob_debug(service: FotMobService) -> None:
             "Matching-Status": metrics["matching_status"],
         }
     )
+    provider_links = service.store.provider_event_links(limit=500)
+    if provider_links:
+        st.caption("Persistente Tipico↔FotMob-Links")
+        st.dataframe(
+            [
+                {
+                    "Tipico Event": row["tipico_event_id"],
+                    "FotMob-ID": row["fotmob_match_id"] or "—",
+                    "Status": row["match_status"],
+                    "Methode": row["match_method"],
+                    "Confidence": row["match_confidence"],
+                    "Tipico-Spiel": (
+                        f"{row['tipico_home_team'] or '—'} – "
+                        f"{row['tipico_away_team'] or '—'}"
+                    ),
+                    "FotMob-Spiel": (
+                        f"{row['fotmob_home_team'] or '—'} – "
+                        f"{row['fotmob_away_team'] or '—'}"
+                    ),
+                    "Kickoff Tipico": row["tipico_kickoff"] or "—",
+                    "Kickoff FotMob": row["fotmob_kickoff"] or "—",
+                    "FotMob Liga-ID": row["fotmob_league_id"] or "—",
+                }
+                for row in provider_links
+            ],
+            hide_index=True,
+            width="stretch",
+        )
     st.subheader("FotMob Storage / Data Quality")
     st.write(
         {

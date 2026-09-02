@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import streamlit as st
 
+from fotmob.matching import AUTO_LINK_STATUSES
 from fotmob.service import FotMobService
 from services.halftime_scanner import HalftimeScanItem, HalftimeScannerService
 
@@ -95,7 +96,7 @@ def render_halftime_scanner(
         # the Tipico ranking below is not recalculated from these stats.
         for event in events:
             resolved = fotmob_service.resolver.resolve(event)
-            if resolved.match_result.status not in {"EXACT", "HIGH_CONFIDENCE", "MANUALLY_CONFIRMED"}:
+            if resolved.match_result.status not in AUTO_LINK_STATUSES:
                 continue
             result = fotmob_service.refresh_for_tipico_event(event, snapshot_type="HALFTIME")
             if not result.success and result.error:

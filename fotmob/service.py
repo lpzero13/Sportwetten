@@ -13,10 +13,17 @@ from config import Settings
 from .canonical import FotMobCanonicalArchive, ht_snapshot_row
 from .client import FotMobClient
 from .history_models import FotMobMatchIndexRecord
-from .history_pipeline import FotMobHistoryPipeline
-from .matching import MatchIdentity, MatchMatchResult, MatchMatcher, normalize_name
+from .history_pipeline import FotMobHistoryPipeline, has_halftime_data
+from .matching import (
+    AUTO_LINK_STATUSES,
+    MatchIdentity,
+    MatchMatchResult,
+    MatchMatcher,
+    normalize_name,
+    team_names_equivalent,
+)
 from .models import FOTMOB_SNAPSHOT_TYPES, FotMobFetchResult, FotMobMatch, FotMobSnapshot
-from .storage import FotMobParquetArchive, FotMobStore
+from .storage import FotMobParquetArchive, FotMobStore, internal_match_id_for_tipico
 
 
 @dataclass(slots=True)
@@ -29,6 +36,7 @@ class FotMobRefreshResult:
     snapshot_created: bool = False
     result_consistency: str | None = None
     ht_consistency: str | None = None
+    ht_stats_available: bool | None = None
     error: str | None = None
 
 
@@ -169,6 +177,7 @@ class FotMobService:
             getattr(settings, "fotmob_archive_path", settings.archive_path / "fotmob"),
             settings.parquet_compression,
         )
+        self._matcher_cache: MatchMatcher | None = None
         # The UI uses this same rate-limited client for explicit date-range
         # loads.  No network call is made during construction.
         self.history_pipeline = FotMobHistoryPipeline(
@@ -188,17 +197,18 @@ class FotMobService:
         self.last_result: FotMobRefreshResult | None = None
 
     def _matcher(self) -> MatchMatcher:
-        known_provider_ids = {
-            str(row["provider_match_id"]): str(row["tipico_event_id"])
-            for row in self.store.links(limit=1000)
-            if row["provider_match_id"] and row["tipico_event_id"]
-        }
-        return MatchMatcher(
+        if self._matcher_cache is not None:
+            return self._matcher_cache
+        # Existing links are handled by provider_event_link_for_event as a
+        # direct fast path.  They are deliberately not injected as a score
+        # override: a newly supplied candidate must still pass names,
+        # competition/country and kickoff validation.
+        self._matcher_cache = MatchMatcher(
             tolerance_minutes=self.settings.fotmob_matching_tolerance_minutes,
             team_aliases=self.store.team_alias_map(None),
             competition_aliases=self.store.competition_alias_map(None),
-            known_provider_ids=known_provider_ids,
         )
+        return self._matcher_cache
 
     def _tipico_result(self, internal_match_id: str) -> Any:
         row = self.store.match_row(internal_match_id)
@@ -218,7 +228,7 @@ class FotMobService:
         ht_consistency: str,
     ) -> list[str]:
         flags: list[str] = []
-        if not match.ht_stats_available:
+        if not has_halftime_data(match):
             flags.append("FOTMOB_HT_STATS_UNAVAILABLE")
         if not match.stats.has_any_value():
             flags.append("FOTMOB_STATS_UNAVAILABLE")
@@ -243,6 +253,7 @@ class FotMobService:
         stats_period: str | None = None,
         tipico_event_id: str | None = None,
     ) -> FotMobRefreshResult:
+        halftime_data_available = has_halftime_data(match)
         self.store.upsert_fotmob_match(internal_match_id, match, observed_at=observed_at)
         tipico_result = self._tipico_result(internal_match_id)
         result_consistency = compare_results(tipico_result, match)
@@ -269,7 +280,7 @@ class FotMobService:
             internal_match_id=internal_match_id,
             fotmob_matched=True,
             fotmob_ht_available=match.ht_score_home is not None and match.ht_score_away is not None,
-            fotmob_ht_stats_available=match.ht_stats_available,
+            fotmob_ht_stats_available=halftime_data_available,
             tipico_ht_available=(
                 _field(tipico_result, "ht_home") is not None
                 and _field(tipico_result, "ht_away") is not None
@@ -291,6 +302,12 @@ class FotMobService:
         for current_type in snapshot_types:
             if current_type not in FOTMOB_SNAPSHOT_TYPES:
                 raise ValueError(f"Unsupported FotMob snapshot type: {current_type}")
+            # A HALFTIME slot is a feature snapshot, not a marker that a
+            # detail request happened.  Keep the explicit NO_HALFTIME outcome
+            # in Current State/quality, but never create an empty slot or
+            # canonical row that downstream ML could mistake for valid data.
+            if current_type == "HALFTIME" and not halftime_data_available:
+                continue
             snapshot = FotMobSnapshot(
                 internal_match_id=internal_match_id,
                 match=match,
@@ -348,6 +365,12 @@ class FotMobService:
             snapshot_created=created,
             result_consistency=result_consistency,
             ht_consistency=ht_consistency,
+            ht_stats_available=halftime_data_available,
+            error=(
+                "NO_HALFTIME: FotMob FirstHalf-Statistiken nicht vorhanden"
+                if snapshot_type == "HALFTIME" and not halftime_data_available
+                else None
+            ),
         )
         self.last_result = result
         self.last_error = None
@@ -397,6 +420,143 @@ class FotMobService:
     def ensure_tipico_event(self, event: Any, *, observed_at: str | None = None) -> str:
         return self.store.upsert_tipico_event(event, observed_at=observed_at)
 
+    def provider_event_link_for_event(self, event: Any) -> Any | None:
+        """Return the durable rich link, with a legacy compatibility fallback."""
+
+        event_id = str(getattr(event, "event_id", ""))
+        if not event_id:
+            return None
+        row = self.store.provider_event_link_for_tipico_event(event_id)
+        if row is not None:
+            status = str(row["match_status"] or "").upper()
+            if status in AUTO_LINK_STATUSES:
+                mismatch_reason: str | None = None
+                stored_competition = row["tipico_competition_id"]
+                current_competition = getattr(event, "competition_id", None)
+                if (
+                    stored_competition not in (None, "")
+                    and current_competition not in (None, "")
+                    and str(stored_competition) != str(current_competition)
+                ):
+                    mismatch_reason = "tipico_competition_changed"
+                for stored_name, current_name, label in (
+                    (row["tipico_home_team"], getattr(event, "home_team", None), "home_team"),
+                    (row["tipico_away_team"], getattr(event, "away_team", None), "away_team"),
+                ):
+                    if (
+                        stored_name not in (None, "")
+                        and current_name not in (None, "")
+                        and not team_names_equivalent(stored_name, current_name)
+                    ):
+                        mismatch_reason = f"tipico_{label}_changed"
+                        break
+                stored_kickoff = _parse_time(row["tipico_kickoff"])
+                current_kickoff = _parse_time(getattr(event, "kickoff_time", None))
+                tolerance = max(1, int(self.settings.fotmob_matching_tolerance_minutes))
+                if (
+                    mismatch_reason is None
+                    and stored_kickoff is not None
+                    and current_kickoff is not None
+                    and abs((stored_kickoff - current_kickoff).total_seconds()) / 60 > tolerance
+                ):
+                    mismatch_reason = "tipico_kickoff_changed"
+                if mismatch_reason is not None:
+                    self.store.upsert_provider_event_link(
+                        tipico_event_id=event_id,
+                        fotmob_match_id=row["fotmob_match_id"],
+                        tipico_competition_id=current_competition,
+                        tipico_home_team=getattr(event, "home_team", None),
+                        tipico_away_team=getattr(event, "away_team", None),
+                        tipico_kickoff=getattr(event, "kickoff_time", None),
+                        match_confidence=float(row["match_confidence"] or 0.0),
+                        match_method="REVALIDATION_INVALIDATED",
+                        match_status="INVALIDATED",
+                        reason=mismatch_reason,
+                        last_verified_at=_iso_now(),
+                    )
+                    return self.store.provider_event_link_for_tipico_event(event_id)
+            return row
+        internal_id = internal_match_id_for_tipico(event_id)
+        return self.store.link_for_internal(internal_id, "FOTMOB")
+
+    @staticmethod
+    def _match_method(result: MatchMatchResult, *, source: str) -> str:
+        if result.status in {"MANUAL", "MANUALLY_CONFIRMED"}:
+            return f"{source}_MANUAL"
+        if result.status in {"INVALIDATED", "REJECTED"}:
+            return f"{source}_INVALIDATED"
+        if result.status == "EXACT":
+            return f"{source}_EXACT"
+        if result.status == "HIGH_CONFIDENCE":
+            return f"{source}_HIGH_CONFIDENCE"
+        if result.status == "AMBIGUOUS":
+            return f"{source}_AMBIGUOUS"
+        return f"{source}_UNMATCHED"
+
+    def _persist_provider_event_link(
+        self,
+        event: Any,
+        result: MatchMatchResult,
+        *,
+        selected: FotMobMatch | None = None,
+        source: str = "DAILY_INDEX",
+        status: str | None = None,
+        verified: bool = False,
+    ) -> None:
+        """Write full matching evidence without requiring provider details."""
+
+        self.store.upsert_provider_event_link(
+            tipico_event_id=str(event.event_id),
+            fotmob_match_id=selected.provider_match_id if selected is not None else result.provider_match_id,
+            tipico_competition_id=(
+                str(event.competition_id)
+                if getattr(event, "competition_id", None) is not None
+                else None
+            ),
+            fotmob_league_id=(
+                str(selected.competition_id)
+                if selected is not None and selected.competition_id is not None
+                else None
+            ),
+            tipico_home_team=getattr(event, "home_team", None),
+            tipico_away_team=getattr(event, "away_team", None),
+            fotmob_home_team=selected.home_team if selected is not None else None,
+            fotmob_away_team=selected.away_team if selected is not None else None,
+            tipico_kickoff=getattr(event, "kickoff_time", None),
+            fotmob_kickoff=selected.kickoff_at if selected is not None else None,
+            match_confidence=result.confidence,
+            match_method=self._match_method(result, source=source),
+            match_status=status or result.status,
+            reason=";".join(result.reasons),
+            last_verified_at=_iso_now() if verified else None,
+        )
+
+    def _persist_competition_mapping(
+        self,
+        event: Any,
+        match: FotMobMatch,
+        result: MatchMatchResult,
+    ) -> None:
+        if (
+            getattr(event, "competition_id", None) is None
+            or match.competition_id is None
+            or not getattr(event, "competition_name", None)
+        ):
+            return
+        self.store.upsert_competition_provider_link(
+            internal_competition_id=str(event.competition_id),
+            provider="FOTMOB",
+            provider_competition_id=str(match.competition_id),
+            tipico_competition_name=str(event.competition_name),
+            tipico_country=getattr(event, "competition_country", None),
+            provider_competition_name=match.competition_name,
+            provider_country=match.competition_country,
+            confidence=result.confidence,
+            match_status=result.status,
+            source="AUTO_DAILY_INDEX",
+            verified_at=_iso_now(),
+        )
+
     def has_current_state_for_tipico_event(self, event_id: str) -> bool:
         """Return whether a persisted FotMob state is available for a Tipico event."""
 
@@ -405,6 +565,33 @@ class FotMobService:
             row is not None
             and self.store.current_state(str(row["internal_match_id"])) is not None
         )
+
+    def ml_ht_readiness_for_event(self, event: Any) -> dict[str, Any]:
+        """Expose the machine-readable HT prerequisite without inferring data."""
+
+        link = self.provider_event_link_for_event(event)
+        internal_id = internal_match_id_for_tipico(str(getattr(event, "event_id", "")))
+        quality = self.store.quality(internal_id)
+        link_status = str(link["match_status"]).upper() if link is not None else None
+        provider_match_id = (
+            link["fotmob_match_id"]
+            if link is not None and "fotmob_match_id" in link.keys()
+            else link["provider_match_id"]
+            if link is not None and "provider_match_id" in link.keys()
+            else None
+        )
+        ht_available = bool(
+            quality is not None and quality["fotmob_ht_stats_available"]
+        )
+        link_accepted = link_status in AUTO_LINK_STATUSES
+        return {
+            "tipico_event_id": str(getattr(event, "event_id", "")),
+            "fotmob_match_id": str(provider_match_id) if provider_match_id else None,
+            "link_status": link_status,
+            "link_confidence": float(link["match_confidence"] or 0.0) if link else 0.0,
+            "ht_stats_available": ht_available,
+            "enhanced_ml_allowed": bool(link_accepted and ht_available),
+        }
 
     def match_tipico_event(
         self,
@@ -416,8 +603,15 @@ class FotMobService:
         tipico_identity = MatchIdentity.from_tipico_event(event)
         result = self._matcher().match(tipico_identity, candidate_list)
         candidate_map = {item.provider_match_id: item for item in candidate_list}
+        selected = candidate_map.get(result.provider_match_id) if result.provider_match_id else None
+        self._persist_provider_event_link(
+            event,
+            result,
+            selected=selected if result.auto_linkable else None,
+            source="DAILY_INDEX",
+            verified=result.auto_linkable,
+        )
         if result.auto_linkable and result.provider_match_id:
-            selected = candidate_map.get(result.provider_match_id)
             self.store.upsert_link(
                 internal_match_id=internal_match_id,
                 provider="FOTMOB",
@@ -428,11 +622,7 @@ class FotMobService:
             )
             if selected is not None:
                 self._persist_verified_aliases(event, selected)
-                self._persist_match(
-                    internal_match_id,
-                    selected,
-                    observed_at=_iso_now(),
-                )
+                self._persist_competition_mapping(event, selected, result)
         return result
 
     def _persist_verified_aliases(self, event: Any, match: FotMobMatch) -> None:
@@ -482,9 +672,40 @@ class FotMobService:
                 country=match.competition_country,
                 verified=True,
             )
+        # Alias maps are read once per service instance and invalidated only
+        # after a genuinely verified relation adds new evidence.
+        self._matcher_cache = None
 
     def confirm_manual(self, event: Any, match: FotMobMatch, *, reason: str = "manual_confirmation") -> str:
+        # Manual confirmation stores identity/evidence only.  The following
+        # live detail request, if any, remains in FotMobLiveService's RAM-only
+        # cache and is not turned into a persisted statistics snapshot.
+        return self.persist_manual_link(event, match, reason=reason)
+
+    def persist_manual_link(
+        self,
+        event: Any,
+        match: FotMobMatch,
+        *,
+        reason: str = "manual_confirmation",
+    ) -> str:
+        """Persist only an explicit provider link, never live statistics."""
+
         internal_match_id = self.ensure_tipico_event(event)
+        manual_result = MatchMatchResult(
+            status="MANUAL",
+            confidence=1.0,
+            provider_match_id=match.provider_match_id,
+            reasons=[reason],
+        )
+        self._persist_provider_event_link(
+            event,
+            manual_result,
+            selected=match,
+            source="MANUAL",
+            status="MANUAL",
+            verified=True,
+        )
         self.store.upsert_link(
             internal_match_id=internal_match_id,
             provider="FOTMOB",
@@ -495,11 +716,23 @@ class FotMobService:
             verified_at=_iso_now(),
         )
         self._persist_verified_aliases(event, match)
-        self._persist_match(internal_match_id, match, observed_at=_iso_now())
         return internal_match_id
 
     def reject_match(self, event: Any, provider_match_id: str, *, reason: str = "manual_rejection") -> str:
         internal_match_id = self.ensure_tipico_event(event)
+        rejected = MatchMatchResult(
+            status="INVALIDATED",
+            confidence=0.0,
+            provider_match_id=str(provider_match_id),
+            reasons=[reason],
+        )
+        self._persist_provider_event_link(
+            event,
+            rejected,
+            source="MANUAL",
+            status="INVALIDATED",
+            verified=True,
+        )
         self.store.upsert_link(
             internal_match_id=internal_match_id,
             provider="FOTMOB",
@@ -583,10 +816,28 @@ class FotMobService:
                     f"(decision={self.provider_decision}, automated_usage={self.automated_usage})."
                 ),
             )
-        link = self.store.link_for_internal(internal_match_id)
-        if link is None or link["match_status"] in {"REJECTED", "UNMATCHED", "AMBIGUOUS"}:
+        match_row = self.store.match_row(internal_match_id)
+        tipico_event_id = match_row["tipico_event_id"] if match_row is not None else None
+        link = (
+            self.store.provider_event_link_for_tipico_event(str(tipico_event_id))
+            if tipico_event_id
+            else None
+        )
+        if link is None:
+            link = self.store.link_for_internal(internal_match_id)
+        if link is None:
             return FotMobRefreshResult(False, internal_match_id=internal_match_id, error="Kein bestätigter FotMob-Link vorhanden.")
-        fetched = self.client.fetch_match_details(str(link["provider_match_id"]))
+        status = str(link["match_status"]).upper()
+        if status not in AUTO_LINK_STATUSES:
+            return FotMobRefreshResult(False, internal_match_id=internal_match_id, error="Kein bestätigter FotMob-Link vorhanden.")
+        provider_match_id = (
+            link["fotmob_match_id"]
+            if "fotmob_match_id" in link.keys()
+            else link["provider_match_id"]
+        )
+        if not provider_match_id:
+            return FotMobRefreshResult(False, internal_match_id=internal_match_id, error="Kein bestätigter FotMob-Link vorhanden.")
+        fetched = self.client.fetch_match_details(str(provider_match_id))
         if not isinstance(fetched, FotMobFetchResult):
             fetched = FotMobFetchResult(success=True, match=fetched)
         if not fetched.success or fetched.match is None:
@@ -631,6 +882,28 @@ class FotMobService:
                     f"automated_usage={self.automated_usage})."
                 ),
             )
+        link = self.provider_event_link_for_event(event)
+        link_status = str(link["match_status"]).upper() if link is not None else ""
+        link_id = (
+            link["fotmob_match_id"]
+            if link is not None and "fotmob_match_id" in link.keys()
+            else link["provider_match_id"]
+            if link is not None and "provider_match_id" in link.keys()
+            else None
+        )
+        if link_status not in AUTO_LINK_STATUSES or not link_id:
+            resolved = self.resolver.resolve(event)
+            resolved_status = str(resolved.match_result.status).upper()
+            if resolved_status not in AUTO_LINK_STATUSES:
+                return FotMobRefreshResult(
+                    False,
+                    internal_match_id=internal_match_id,
+                    match_result=resolved.match_result,
+                    error=(
+                        "Kein sicherer FotMob-Link für die Halbzeit-Anreicherung: "
+                        f"{resolved_status}"
+                    ),
+                )
         if snapshot_type == "HALFTIME":
             current = self.store.current_state(internal_match_id)
             observed = _parse_time(str(current["observed_at"])) if current is not None else None
@@ -638,12 +911,22 @@ class FotMobService:
                 age = (datetime.now(timezone.utc) - observed).total_seconds()
                 has_first_half = bool(current["ht_stats_json"])
                 is_live_ht = bool(current["captured_live"]) and current["source_context"] == "LIVE_HT"
-                if 0 <= age < self.settings.fotmob_poll_seconds and is_live_ht and has_first_half:
+                if 0 <= age < self.settings.fotmob_poll_seconds and is_live_ht:
+                    if has_first_half:
+                        return FotMobRefreshResult(
+                            True,
+                            internal_match_id=internal_match_id,
+                            result_consistency=current["result_consistency"],
+                            ht_consistency=current["ht_consistency"],
+                            ht_stats_available=True,
+                        )
                     return FotMobRefreshResult(
                         True,
                         internal_match_id=internal_match_id,
                         result_consistency=current["result_consistency"],
                         ht_consistency=current["ht_consistency"],
+                        ht_stats_available=False,
+                        error="NO_HALFTIME: FotMob FirstHalf-Statistiken nicht vorhanden",
                     )
         return self.refresh_link(
             internal_match_id,

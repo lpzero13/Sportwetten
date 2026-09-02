@@ -122,6 +122,35 @@ CREATE TABLE IF NOT EXISTS competition_provider_links (
 CREATE INDEX IF NOT EXISTS idx_competition_provider_links_lookup
     ON competition_provider_links(provider, provider_competition_id, tipico_country);
 
+CREATE TABLE IF NOT EXISTS provider_event_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    tipico_event_id TEXT NOT NULL,
+    fotmob_match_id TEXT,
+    tipico_competition_id TEXT,
+    fotmob_league_id TEXT,
+    tipico_home_team TEXT,
+    tipico_away_team TEXT,
+    fotmob_home_team TEXT,
+    fotmob_away_team TEXT,
+    tipico_kickoff TEXT,
+    fotmob_kickoff TEXT,
+    match_confidence REAL NOT NULL DEFAULT 0,
+    match_method TEXT NOT NULL,
+    match_status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_verified_at TEXT,
+    reason TEXT,
+    UNIQUE (provider, tipico_event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_event_links_lookup
+    ON provider_event_links(provider, tipico_event_id, match_status);
+
+CREATE INDEX IF NOT EXISTS idx_provider_event_links_provider_match
+    ON provider_event_links(provider, fotmob_match_id);
+
 CREATE TABLE IF NOT EXISTS fotmob_current_state (
     internal_match_id TEXT PRIMARY KEY,
     provider_match_id TEXT NOT NULL UNIQUE,
@@ -318,6 +347,10 @@ class FotMobStore:
                         database.connection.execute(
                             f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
                         )
+        # Migrate the V0.5.3 relation into the richer additive link layer.
+        # Nothing is deleted and the legacy table remains available to older
+        # integrations.
+        self.sync_legacy_provider_event_links()
 
     def _connection(self) -> sqlite3.Connection:
         return self.database.connection
@@ -384,6 +417,200 @@ class FotMobStore:
             return self._connection().execute(
                 "SELECT * FROM matches WHERE tipico_event_id = ?", (str(event_id),)
             ).fetchone()
+
+    @staticmethod
+    def _canonical_link_status(status: Any) -> str:
+        value = str(status or "UNMATCHED").strip().upper()
+        return {
+            "MANUALLY_CONFIRMED": "MANUAL",
+            "REJECTED": "INVALIDATED",
+        }.get(value, value)
+
+    def upsert_provider_event_link(
+        self,
+        *,
+        tipico_event_id: str,
+        fotmob_match_id: str | None,
+        tipico_competition_id: str | None = None,
+        fotmob_league_id: str | None = None,
+        tipico_home_team: str | None = None,
+        tipico_away_team: str | None = None,
+        fotmob_home_team: str | None = None,
+        fotmob_away_team: str | None = None,
+        tipico_kickoff: str | None = None,
+        fotmob_kickoff: str | None = None,
+        match_confidence: float = 0.0,
+        match_method: str = "UNKNOWN",
+        match_status: str = "UNMATCHED",
+        reason: str | None = None,
+        last_verified_at: str | None = None,
+        provider: str = "FOTMOB",
+    ) -> None:
+        """Persist one explainable Tipico/provider relation.
+
+        ``fotmob_match_id`` remains nullable for AMBIGUOUS/UNMATCHED rows;
+        retaining those decisions prevents the resolver from inventing a
+        provider request just because no positive link exists yet.
+        """
+
+        now = _now()
+        provider_name = str(provider).upper()
+        status = self._canonical_link_status(match_status)
+        provider_match_id = (
+            str(fotmob_match_id) if fotmob_match_id not in (None, "") else None
+        )
+        with self._lock, self._connection():
+            self._connection().execute(
+                """
+                INSERT INTO provider_event_links (
+                    provider, tipico_event_id, fotmob_match_id,
+                    tipico_competition_id, fotmob_league_id,
+                    tipico_home_team, tipico_away_team,
+                    fotmob_home_team, fotmob_away_team,
+                    tipico_kickoff, fotmob_kickoff, match_confidence,
+                    match_method, match_status, created_at, updated_at,
+                    last_verified_at, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, tipico_event_id) DO UPDATE SET
+                    fotmob_match_id = excluded.fotmob_match_id,
+                    tipico_competition_id = COALESCE(
+                        excluded.tipico_competition_id,
+                        provider_event_links.tipico_competition_id
+                    ),
+                    fotmob_league_id = COALESCE(
+                        excluded.fotmob_league_id,
+                        provider_event_links.fotmob_league_id
+                    ),
+                    tipico_home_team = COALESCE(
+                        excluded.tipico_home_team,
+                        provider_event_links.tipico_home_team
+                    ),
+                    tipico_away_team = COALESCE(
+                        excluded.tipico_away_team,
+                        provider_event_links.tipico_away_team
+                    ),
+                    fotmob_home_team = COALESCE(
+                        excluded.fotmob_home_team,
+                        provider_event_links.fotmob_home_team
+                    ),
+                    fotmob_away_team = COALESCE(
+                        excluded.fotmob_away_team,
+                        provider_event_links.fotmob_away_team
+                    ),
+                    tipico_kickoff = COALESCE(
+                        excluded.tipico_kickoff,
+                        provider_event_links.tipico_kickoff
+                    ),
+                    fotmob_kickoff = COALESCE(
+                        excluded.fotmob_kickoff,
+                        provider_event_links.fotmob_kickoff
+                    ),
+                    match_confidence = excluded.match_confidence,
+                    match_method = excluded.match_method,
+                    match_status = excluded.match_status,
+                    updated_at = excluded.updated_at,
+                    last_verified_at = COALESCE(
+                        excluded.last_verified_at,
+                        provider_event_links.last_verified_at
+                    ),
+                    reason = excluded.reason
+                """,
+                (
+                    provider_name,
+                    str(tipico_event_id),
+                    provider_match_id,
+                    tipico_competition_id,
+                    fotmob_league_id,
+                    tipico_home_team,
+                    tipico_away_team,
+                    fotmob_home_team,
+                    fotmob_away_team,
+                    tipico_kickoff,
+                    fotmob_kickoff,
+                    max(0.0, min(1.0, float(match_confidence))),
+                    str(match_method or "UNKNOWN"),
+                    status,
+                    now,
+                    now,
+                    last_verified_at,
+                    reason,
+                ),
+            )
+
+    def provider_event_link_for_tipico_event(
+        self,
+        tipico_event_id: str,
+        provider: str = "FOTMOB",
+    ) -> sqlite3.Row | None:
+        with self._lock:
+            return self._connection().execute(
+                """
+                SELECT * FROM provider_event_links
+                WHERE provider = ? AND tipico_event_id = ?
+                """,
+                (str(provider).upper(), str(tipico_event_id)),
+            ).fetchone()
+
+    def provider_event_links(
+        self,
+        provider: str = "FOTMOB",
+        *,
+        match_status: str | None = None,
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        clauses = ["provider = ?"]
+        params: list[Any] = [str(provider).upper()]
+        if match_status:
+            clauses.append("match_status = ?")
+            params.append(self._canonical_link_status(match_status))
+        params.append(max(1, int(limit)))
+        with self._lock:
+            return list(self._connection().execute(
+                f"""
+                SELECT * FROM provider_event_links
+                WHERE {' AND '.join(clauses)}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall())
+
+    def sync_legacy_provider_event_links(self) -> int:
+        """Backfill the new link view from already stored V0.5.3 links."""
+
+        with self._lock:
+            rows = self._connection().execute(
+                """
+                SELECT l.provider, l.provider_match_id, l.match_confidence,
+                       l.match_status, l.reason, l.created_at, l.verified_at,
+                       m.tipico_event_id, m.competition_id,
+                       m.home_team, m.away_team, m.kickoff_at
+                FROM match_provider_links l
+                JOIN matches m ON m.internal_match_id = l.internal_match_id
+                WHERE l.provider = 'FOTMOB' AND m.tipico_event_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM provider_event_links p
+                      WHERE p.provider = 'FOTMOB'
+                        AND p.tipico_event_id = m.tipico_event_id
+                  )
+                """
+            ).fetchall()
+        for row in rows:
+            self.upsert_provider_event_link(
+                tipico_event_id=str(row["tipico_event_id"]),
+                fotmob_match_id=row["provider_match_id"],
+                tipico_competition_id=row["competition_id"],
+                tipico_home_team=row["home_team"],
+                tipico_away_team=row["away_team"],
+                tipico_kickoff=row["kickoff_at"],
+                match_confidence=float(row["match_confidence"] or 0.0),
+                match_method="LEGACY_LINK_MIGRATION",
+                match_status=str(row["match_status"] or "UNMATCHED"),
+                reason=row["reason"],
+                last_verified_at=row["verified_at"],
+                provider=str(row["provider"]),
+            )
+        return len(rows)
 
     def upsert_fotmob_match(self, internal_match_id: str, match: FotMobMatch, *, observed_at: str | None = None) -> None:
         """Refresh provider metadata without replacing Tipico's identity."""
