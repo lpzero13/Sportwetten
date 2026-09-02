@@ -275,16 +275,17 @@ Originaldatei wurde dabei nicht verändert.
 ## Git-Zustand
 
 ```text
-branch                 = main
-initial/current commit = b4cac0d981b20706e8df32be31e8823a7956992a
-V0.5.8 commit          = keiner; Arbeitsbaum enthält die Änderungen
-remote                 = https://github.com/lpzero13/Sportwetten.git
-push                   = nicht ausgeführt
+branch                  = main
+base commit             = b4cac0d981b20706e8df32be31e8823a7956992a
+V0.5.8 implementation   = ceb375f8f35f72aa2dfb28c72a25cc5966c3023
+remote                  = https://github.com/lpzero13/Sportwetten.git
+GitHub push             = erfolgreich; V0.5.8-Implementation auf origin/main
+working tree            = clean nach dem anschließenden Status-Update
 ```
 
 Der Arbeitsbaum enthielt bereits uncommittete V0.5.7-Änderungen. Diese wurden
-bewahrt und nicht zurückgesetzt. Die V0.5.8-Änderungen sind darin enthalten;
-ein Commit oder GitHub-Push erfolgt erst auf ausdrücklichen Wunsch.
+bewahrt und gemeinsam mit V0.5.8 veröffentlicht; Datenbank-, Archiv- und
+Laufzeitdateien wurden nicht in den Commit aufgenommen.
 
 ## Offene Produktionsschritte
 
