@@ -92,6 +92,9 @@ COLLECTOR_CORE_REFRESH_SECONDS = 30
 COLLECTOR_HALFTIME_DELAYS_SECONDS = (0, 20, 60)
 COLLECTOR_STRATEGIC_MINUTES = (55, 60, 65, 70, 75, 80, 85, 90)
 COLLECTOR_RETRY_DELAYS_SECONDS = (1, 3, 10)
+STALE_PREMATCH_GRACE_HOURS = 6.0
+COLLECTION_METRICS_CACHE_TTL_SECONDS = 30.0
+COLLECTOR_SQL_TRACE_ENABLED = False
 MAX_LIVE_ODDS_AGE_SECONDS = 10
 DEFAULT_TOTAL_STAKE_EUR = 30
 SNAPSHOT_HT_STABLE_DELAY_SECONDS = 45
@@ -182,6 +185,23 @@ FOTMOB_NETWORK_MODE_VALUES = ("off", "manual", "worker")
 FOTMOB_ARCHIVE_ROOT = ""
 FOTMOB_HISTORY_LEAGUE_ID = "54"
 FOTMOB_HT_ENRICHMENT_ENABLED = True
+# V0.5.7: selected-match live display only.  These settings control the
+# volatile UI path and do not enable any historical or halftime worker.
+DEFAULT_FOTMOB_LIVE_REFRESH_SECONDS = 10
+FOTMOB_LIVE_CACHE_TTL_SECONDS = 8
+FOTMOB_LIVE_PENDING_MINUTE = 10
+FOTMOB_LIVE_NO_DATA_PAYLOAD_THRESHOLD = 3
+
+# V0.5.8 smart-universe policy.  The catalog is refreshed explicitly/infrequently;
+# the live feed itself remains the complete Tipico radar on every poll.
+SMART_UNIVERSE_ENABLED = True
+SMART_UNIVERSE_CACHE_TTL_SECONDS = 300.0
+SMART_UNIVERSE_DISCOVERY_PROBE_SECONDS = 900.0
+FOTMOB_COVERAGE_MIN_SAMPLE_SIZE = 5
+FOTMOB_COVERAGE_FULL_RATIO = 0.90
+FOTMOB_COVERAGE_NO_DATA_RATIO = 0.10
+TIPICO_MARKET_CAPABILITY_MIN_SAMPLE_SIZE = 5
+TIPICO_MARKET_CAPABILITY_MIN_RATIO = 0.50
 
 
 @dataclass(slots=True)
@@ -215,6 +235,9 @@ class Settings:
     collector_halftime_delays_seconds: tuple[int, ...] = COLLECTOR_HALFTIME_DELAYS_SECONDS
     collector_strategic_minutes: tuple[int, ...] = COLLECTOR_STRATEGIC_MINUTES
     collector_retry_delays_seconds: tuple[int, ...] = COLLECTOR_RETRY_DELAYS_SECONDS
+    stale_prematch_grace_hours: float = STALE_PREMATCH_GRACE_HOURS
+    collection_metrics_cache_ttl_seconds: float = COLLECTION_METRICS_CACHE_TTL_SECONDS
+    collector_sql_trace_enabled: bool = COLLECTOR_SQL_TRACE_ENABLED
     max_live_odds_age_seconds: int = MAX_LIVE_ODDS_AGE_SECONDS
     default_total_stake_eur: int = DEFAULT_TOTAL_STAKE_EUR
     snapshot_ht_stable_delay_seconds: int = SNAPSHOT_HT_STABLE_DELAY_SECONDS
@@ -283,6 +306,18 @@ class Settings:
     fotmob_archive_root: str = FOTMOB_ARCHIVE_ROOT
     fotmob_history_league_id: str = FOTMOB_HISTORY_LEAGUE_ID
     fotmob_ht_enrichment_enabled: bool = FOTMOB_HT_ENRICHMENT_ENABLED
+    fotmob_live_refresh_seconds: int = DEFAULT_FOTMOB_LIVE_REFRESH_SECONDS
+    fotmob_live_cache_ttl_seconds: int = FOTMOB_LIVE_CACHE_TTL_SECONDS
+    fotmob_live_pending_minute: int = FOTMOB_LIVE_PENDING_MINUTE
+    fotmob_live_no_data_payload_threshold: int = FOTMOB_LIVE_NO_DATA_PAYLOAD_THRESHOLD
+    smart_universe_enabled: bool = SMART_UNIVERSE_ENABLED
+    smart_universe_cache_ttl_seconds: float = SMART_UNIVERSE_CACHE_TTL_SECONDS
+    smart_universe_discovery_probe_seconds: float = SMART_UNIVERSE_DISCOVERY_PROBE_SECONDS
+    fotmob_coverage_min_sample_size: int = FOTMOB_COVERAGE_MIN_SAMPLE_SIZE
+    fotmob_coverage_full_ratio: float = FOTMOB_COVERAGE_FULL_RATIO
+    fotmob_coverage_no_data_ratio: float = FOTMOB_COVERAGE_NO_DATA_RATIO
+    tipico_market_capability_min_sample_size: int = TIPICO_MARKET_CAPABILITY_MIN_SAMPLE_SIZE
+    tipico_market_capability_min_ratio: float = TIPICO_MARKET_CAPABILITY_MIN_RATIO
 
     @property
     def database_path(self) -> Path:
@@ -392,6 +427,20 @@ class Settings:
             ),
             collector_retry_delays_seconds=_env_int_tuple(
                 "COLLECTOR_RETRY_DELAYS_SECONDS", COLLECTOR_RETRY_DELAYS_SECONDS
+            ),
+            stale_prematch_grace_hours=max(
+                0.0,
+                _env_float("STALE_PREMATCH_GRACE_HOURS", STALE_PREMATCH_GRACE_HOURS),
+            ),
+            collection_metrics_cache_ttl_seconds=max(
+                0.0,
+                _env_float(
+                    "COLLECTION_METRICS_CACHE_TTL_SECONDS",
+                    COLLECTION_METRICS_CACHE_TTL_SECONDS,
+                ),
+            ),
+            collector_sql_trace_enabled=_env_bool(
+                "COLLECTOR_SQL_TRACE_ENABLED", COLLECTOR_SQL_TRACE_ENABLED
             ),
             max_live_odds_age_seconds=_env_int(
                 "MAX_LIVE_ODDS_AGE_SECONDS", MAX_LIVE_ODDS_AGE_SECONDS
@@ -570,6 +619,77 @@ class Settings:
             or FOTMOB_HISTORY_LEAGUE_ID,
             fotmob_ht_enrichment_enabled=_env_bool(
                 "FOTMOB_HT_ENRICHMENT_ENABLED", FOTMOB_HT_ENRICHMENT_ENABLED
+            ),
+            fotmob_live_refresh_seconds=_env_int(
+                "FOTMOB_LIVE_REFRESH_SECONDS", DEFAULT_FOTMOB_LIVE_REFRESH_SECONDS
+            ),
+            fotmob_live_cache_ttl_seconds=_env_int(
+                "FOTMOB_LIVE_CACHE_TTL_SECONDS", FOTMOB_LIVE_CACHE_TTL_SECONDS
+            ),
+            fotmob_live_pending_minute=_env_nonnegative_int(
+                "FOTMOB_LIVE_PENDING_MINUTE", FOTMOB_LIVE_PENDING_MINUTE
+            ),
+            fotmob_live_no_data_payload_threshold=_env_int(
+                "FOTMOB_LIVE_NO_DATA_PAYLOAD_THRESHOLD",
+                FOTMOB_LIVE_NO_DATA_PAYLOAD_THRESHOLD,
+            ),
+            smart_universe_enabled=_env_bool(
+                "SMART_UNIVERSE_ENABLED", SMART_UNIVERSE_ENABLED
+            ),
+            smart_universe_cache_ttl_seconds=max(
+                0.0,
+                _env_float(
+                    "SMART_UNIVERSE_CACHE_TTL_SECONDS",
+                    SMART_UNIVERSE_CACHE_TTL_SECONDS,
+                ),
+            ),
+            smart_universe_discovery_probe_seconds=max(
+                0.0,
+                _env_float(
+                    "SMART_UNIVERSE_DISCOVERY_PROBE_SECONDS",
+                    SMART_UNIVERSE_DISCOVERY_PROBE_SECONDS,
+                ),
+            ),
+            fotmob_coverage_min_sample_size=max(
+                1,
+                _env_int(
+                    "FOTMOB_COVERAGE_MIN_SAMPLE_SIZE",
+                    FOTMOB_COVERAGE_MIN_SAMPLE_SIZE,
+                ),
+            ),
+            fotmob_coverage_full_ratio=min(
+                1.0,
+                max(
+                    0.0,
+                    _env_float("FOTMOB_COVERAGE_FULL_RATIO", FOTMOB_COVERAGE_FULL_RATIO),
+                ),
+            ),
+            fotmob_coverage_no_data_ratio=min(
+                1.0,
+                max(
+                    0.0,
+                    _env_float(
+                        "FOTMOB_COVERAGE_NO_DATA_RATIO",
+                        FOTMOB_COVERAGE_NO_DATA_RATIO,
+                    ),
+                ),
+            ),
+            tipico_market_capability_min_sample_size=max(
+                1,
+                _env_int(
+                    "TIPICO_MARKET_CAPABILITY_MIN_SAMPLE_SIZE",
+                    TIPICO_MARKET_CAPABILITY_MIN_SAMPLE_SIZE,
+                ),
+            ),
+            tipico_market_capability_min_ratio=min(
+                1.0,
+                max(
+                    0.0,
+                    _env_float(
+                        "TIPICO_MARKET_CAPABILITY_MIN_RATIO",
+                        TIPICO_MARKET_CAPABILITY_MIN_RATIO,
+                    ),
+                ),
             ),
         )
 

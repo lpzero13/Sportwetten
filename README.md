@@ -33,6 +33,8 @@ Der aktuelle Projektumfang umfasst:
 - automatische Geräteerkennung über Browser-User-Agent plus responsive Mobilansicht
 - optionales FotMob-Discovery, provider-neutrales Match-Matching und
   informatives Live-Enrichment ohne Einfluss auf Quoten, Strategie oder Paper Trading
+- V0.5.8: atomare Feed-Reconciliation, Coverage-Cache, Queue-Diagnostik und
+  capability-basierte Smart-Live-Universe-Priorisierung
 
 Nicht enthalten sind eigene ML-Wahrscheinlichkeiten, FotMob-Quoten,
 WebSocket/STOMP, Inhaltsfilter, automatische Optimierung und echte Wettabgabe.
@@ -118,11 +120,15 @@ als `competition_country` am Event und als `country_or_region` in
 `competitions` gespeichert.
 
 Mit **Quoten** wird genau ein Event geöffnet und mit **Analyse** dieselbe
-Detailansicht mit der normalisierten Auswertung. **FotMob** ist im
-Live-Überblick als Schaltfläche vorhanden und wird aktiv, sobald für dieses
-Event ein FotMob-Current-State gespeichert ist; dann öffnet sie direkt die
-FotMob-Ansicht. Erst beim Öffnen des Events wird der Tipico-Detail-Endpunkt abgerufen. Die Detailansicht enthält
-die Tabs Analyse, Alle Tipico Märkte, FotMob HT, Odds History und Raw / Debug.
+Detailansicht mit der normalisierten Auswertung. **FotMob Live** ist im
+Live-Überblick für ein ausgewähltes Event als Schaltfläche vorhanden. Wenn
+noch kein bestätigter Link existiert, kann dort eine numerische FotMob-Match-ID
+gezielt geprüft werden; diese einmalige Zuordnung bleibt für die laufende
+Sitzung im RAM. Das Panel ruft ausschließlich das ausgewählte Match ab,
+cached normalisierte Werte kurz im RAM und schreibt weder SQLite noch Parquet.
+Die Detailansicht enthält die Tabs Analyse, FotMob Live, FotMob HT, Alle Tipico
+Märkte, Odds History und Raw / Debug. Bei fehlenden Detailstatistiken zeigt
+FotMob Live einen klaren No-Data-Hinweis und beendet die weitere Aktualisierung.
 Auto Refresh ist
 standardmäßig deaktiviert und ruft bei Aktivierung nur dieses Event alle
 5 Sekunden ab.
@@ -154,6 +160,31 @@ Die zehn Slots sind pro Event hart idempotent.
 Die Seite **Data Collection** liest ausschließlich Current State, SQLite,
 Parquet-Metadaten und `data/collector_status.json`; sie startet keinen Collector
 und entscheidet nicht über die Datensammlung.
+
+### Production Collector Hardening (V0.5.8)
+
+Der erste gültige Livefeed nach einem Collector-Neustart wird gegen den
+persistierten `current_event_state` reconciliiert. Fehlende vorher aktive
+Events erhalten `NO_LONGER_LIVE`; ein finales Ergebnis wird dabei nicht
+erfunden. Feed-Plausibility-Gate, eine gemeinsame SQLite-Transaktion für den
+gesamten Feedbatch und idempotentes Schließen der aktuellen Quoten schützen
+vor partiellen Zuständen. `event_states`, Odds-History, Snapshots, Outbox,
+Raw-Daten und Parquet-Archive bleiben erhalten.
+
+Der Status schreibt die Tages-Coverage standardmäßig höchstens alle 30 Sekunden
+neu und zeigt das Cache-Alter transparent an. Zusätzlich werden `queue_due`,
+`queue_future`, `oldest_due_age_seconds` und die Verteilung nach Snapshot-Typ
+ausgegeben. WAL bleibt aktiv; der Collector wird nicht durch ein blindes
+Erhöhen der Workerzahl oder durch langsamere globale Polls optimiert.
+
+Der Smart-Live-Universe lässt alle Tipico-Spiele im globalen Feed sichtbar und
+klassifiziert nur die teuren Detailpfade. Bekannte Jugend-/Reserve-/Friendly-
+Wettbewerbe erhalten P4, unbekannte Liga-/Saison-Capabilities gehen über P2 in
+kontrollierte Discovery, und nur nachgewiesene FotMob-/Tipico-Abdeckung erhält
+P1. Frauenfußball wird nicht pauschal ausgeschlossen. Die Tabellen
+`fotmob_coverage_catalog` und `tipico_market_capability` sind additive
+Capability-Caches; historische Daten und das ausgewählte V0.5.7-FotMob-Live-
+Panel bleiben unverändert.
 
 ### FotMob-Enrichment (V0.5.3)
 
@@ -445,6 +476,9 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | SNAPSHOT_OUTBOX_BATCH_SIZE | 100 | maximale Exportbatchgröße |
 | SNAPSHOT_PRE_ENABLED ... SNAPSHOT_FINAL_ENABLED | true | einzelne historische Slots ein-/ausschalten |
 | COLLECTOR_RETRY_DELAYS_SECONDS | 1,3,10 | Retry-Verzögerungen |
+| STALE_PREMATCH_GRACE_HOURS | 6 | Grace Period, bevor vergangene Pre-Match-Zeilen stale werden |
+| COLLECTION_METRICS_CACHE_TTL_SECONDS | 30 | TTL für Tages-Coverage im Collector-Status |
+| COLLECTOR_SQL_TRACE_ENABLED | false | optionale SQL-/Commit-Messung für Benchmarks |
 | MAX_LIVE_ODDS_AGE_SECONDS | 10 | Freshness-Grenze für Live-Quoten |
 | DEFAULT_TOTAL_STAKE_EUR | 30 | Default-Einsatz für Szenarien |
 | FOTMOB_ENABLED | true | FotMob-Funktion; Netzwerk wird nur durch manuelle Läufe genutzt |
@@ -488,6 +522,14 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | FOTMOB_ARCHIVE_ROOT | leer | kanonischer FotMob-Parquet-Root, Proxmox: `/var/lib/wetten/archive/fotmob` |
 | FOTMOB_HISTORY_LEAGUE_ID | 54 | Legacy-Fallback für die alten expliziten Liga-/Season-CLI-Befehle; die Datumsauswahl lädt alle Ligen |
 | FOTMOB_HT_ENRICHMENT_ENABLED | true | separates Live-HZ-Enrichment; kein permanenter Historien-Poller |
+| SMART_UNIVERSE_ENABLED | true | Capability-basierte Detailpfad-Auswahl bei vollständigem Tipico-Radar |
+| SMART_UNIVERSE_CACHE_TTL_SECONDS | 300 | TTL des Smart-Universe-Catalogs |
+| SMART_UNIVERSE_DISCOVERY_PROBE_SECONDS | 900 | Mindestabstand kontrollierter P2-Probes je Wettbewerb |
+| FOTMOB_COVERAGE_MIN_SAMPLE_SIZE | 5 | Mindeststichprobe für FULL/NO_DATA |
+| FOTMOB_COVERAGE_FULL_RATIO | 0.90 | Detailabdeckung für FULL |
+| FOTMOB_COVERAGE_NO_DATA_RATIO | 0.10 | Detailabdeckung bis zu NO_DATA |
+| TIPICO_MARKET_CAPABILITY_MIN_SAMPLE_SIZE | 5 | Mindeststichprobe für Markt-Capability |
+| TIPICO_MARKET_CAPABILITY_MIN_RATIO | 0.50 | Mindestabdeckung der ZERO-/2+-Märkte |
 
 Die verifizierten Tipico-Endpunkte stehen in outputs/DISCOVERY.md. Die FotMob-
 Discovery, Abschlussvalidierung und Providerentscheidung stehen in
@@ -536,7 +578,7 @@ und `paper_worker_runs` sowie die optionalen V0.5-Tabellen `matches`,
 `fotmob_snapshot_outbox`, `fotmob_seasons`, `fotmob_match_index`,
 `fotmob_history_samples`, `fotmob_historical_archive_index` und
 `fotmob_daily_index`, `fotmob_daily_load_runs`, `fotmob_performance_profile`,
-`match_data_quality`.
+`fotmob_coverage_catalog`, `tipico_market_capability` und `match_data_quality`.
 `current_event_state`, `current_canonical_outcomes` und
 `current_strategy_evaluations` sind ersetzbare Betriebsdaten. `snapshots` ist
 die kurze SQLite-Staging-/Indexschicht; die historische Zeile wird als flache
@@ -567,6 +609,10 @@ und Liga-Metadaten, idempotente Wiederholung und das getrennte Tipico-
 Strategie-Parquet. Die V0.5.6-Tests prüfen den thread-sicheren Rate-Controller,
 Backoff/Ramp-up, persistierte Performance-Profile sowie den kontrollierten
 Drei-Tage-Probeablauf.
+Die V0.5.8-Tests prüfen Startup-Reconciliation nach frischem Service-Neustart,
+Plausibility-Gate, vollständigen Batch-Rollback, terminale Quoten, Stale-
+Pre-Match/Rescheduling, Coverage-Cache, Queue-Diagnostik und Smart-Universe-
+Prioritäten.
 
 Der reproduzierbare Live-Smoke-Test ruft den aktuellen Feed und genau ein Eventdetail ab:
 

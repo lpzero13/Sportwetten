@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from contextlib import nullcontext
 from typing import Any
 
 from config import Settings
 from models.event import LiveEvent
-from storage.database import Database
+from storage.database import ACTIVE_EVENT_STATUSES, Database
 from storage.raw_storage import RawStorage
 from storage.repositories import EventRepository
 from tipico.client import ApiResponse, RequestMetrics, TipicoApiError, TipicoClient
@@ -24,6 +26,69 @@ class EventRefreshResult:
     error: str | None = None
     raw_path: str | None = None
     changed_state_count: int = 0
+    history_state_count: int = 0
+    reconciled_event_ids: tuple[str, ...] = ()
+    ignored_event_ids: tuple[str, ...] = ()
+    network_ms: float = 0.0
+    parse_ms: float = 0.0
+    persistence_ms: float = 0.0
+    reconciliation_ms: float = 0.0
+    sql_metrics: dict[str, int] | None = None
+
+
+def _has_provider_error(payload: dict[str, Any], live: dict[str, Any]) -> bool:
+    for container in (payload, live):
+        for key in ("error", "errors", "errorCode", "providerError", "provider_error"):
+            value = container.get(key)
+            if value not in (None, "", [], {}, False, 0):
+                return True
+        status = str(container.get("status") or "").strip().casefold()
+        if status in {"error", "failed", "failure"}:
+            return True
+    return False
+
+
+def is_plausible_live_feed(
+    payload: dict[str, Any],
+    parsed_events: list[LiveEvent],
+    *,
+    persisted_active_count: int = 0,
+) -> tuple[bool, str | None]:
+    """Validate the feed globally before it can trigger reconciliation."""
+
+    live = payload.get("LIVE") if isinstance(payload, dict) else None
+    if not isinstance(live, dict):
+        return False, "expected LIVE object is missing"
+    if _has_provider_error(payload, live):
+        return False, "provider-error payload"
+    events = live.get("events")
+    events_by_sport = live.get("eventsBySport")
+    if not isinstance(events, dict):
+        return False, "LIVE.events is missing or not an object"
+    if not isinstance(events_by_sport, dict):
+        return False, "LIVE.eventsBySport is missing or not an object"
+    soccer_items = events_by_sport.get("soccer")
+    if not isinstance(soccer_items, (list, tuple)):
+        return False, "LIVE.eventsBySport.soccer is missing or not a list"
+
+    soccer_ids = {str(item) for item in soccer_items if item is not None}
+    event_ids = {str(key) for key in events}
+    for item in events.values():
+        if isinstance(item, dict) and item.get("id") is not None:
+            event_ids.add(str(item["id"]))
+    if soccer_ids and not soccer_ids.issubset(event_ids):
+        return False, "soccer index references missing event objects"
+    if events and not soccer_ids:
+        return False, "non-empty event map has no soccer index"
+
+    parsed_ids = {str(event.event_id) for event in parsed_events}
+    if soccer_ids and not soccer_ids.issubset(parsed_ids):
+        return False, "soccer event could not be parsed completely"
+    # A structurally valid empty feed is safe only when no previously active
+    # event would be globally terminalized by that emptiness.
+    if persisted_active_count > 0 and not parsed_events:
+        return False, "empty feed while persisted active events exist"
+    return True, None
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -64,6 +129,11 @@ class EventService:
         self.request_count = 0
         self.error_count = 0
         self.parse_error_count = 0
+        self.plausibility_error_count = 0
+        self.persistence_error_count = 0
+        self._startup_reconciliation_done = False
+        self.last_timing: dict[str, float] = {}
+        self.last_sql_metrics: dict[str, int] = {}
 
     @property
     def events(self) -> list[LiveEvent]:
@@ -129,23 +199,40 @@ class EventService:
     def refresh(self) -> EventRefreshResult:
         self.request_count += 1
         response: ApiResponse | None = None
+        raw_path: str | None = None
+        network_started = time.perf_counter()
         try:
             response = self.client.get_live_football_events()
             self.last_metrics = response.metrics
             observed_at = response.metrics.response_received_at
+            network_ms = (time.perf_counter() - network_started) * 1000.0
             raw_path = self._persist_raw(response, observed_at)
-            if not isinstance(response.payload.get("LIVE"), dict):
+            parse_started = time.perf_counter()
+            if not isinstance(response.payload, dict):
+                raise ValueError("Tipico live response root is not an object")
+            live = response.payload.get("LIVE")
+            if not isinstance(live, dict):
                 raise ValueError("Tipico live response did not contain LIVE")
+            if _has_provider_error(response.payload, live):
+                raise ValueError("Tipico live response contained a provider error")
             parsed_events = parse_live_feed(response.payload, logger=self.logger)
+            parse_ms = (time.perf_counter() - parse_started) * 1000.0
         except TipicoApiError as exc:
             self.error_count += 1
             self.last_error = str(exc)
             self.logger.error("Live feed request failed: %s", exc)
+            self.last_timing = {
+                "network_ms": (time.perf_counter() - network_started) * 1000.0,
+                "parse_ms": 0.0,
+                "persistence_ms": 0.0,
+                "reconciliation_ms": 0.0,
+            }
             return EventRefreshResult(
                 success=False,
                 events=self.events,
                 metrics=exc.metrics,
                 error=str(exc),
+                network_ms=self.last_timing["network_ms"],
             )
         except (TypeError, ValueError, KeyError) as exc:
             self.parse_error_count += 1
@@ -156,16 +243,58 @@ class EventService:
                     response.metrics.response_received_at,
                 )
             self.logger.exception("Live feed parse error")
+            self.last_timing = {
+                "network_ms": (time.perf_counter() - network_started) * 1000.0,
+                "parse_ms": 0.0,
+                "persistence_ms": 0.0,
+                "reconciliation_ms": 0.0,
+            }
             return EventRefreshResult(
                 success=False,
                 events=self.events,
                 metrics=self.last_metrics,
                 error=self.last_error,
+                network_ms=self.last_timing["network_ms"],
             )
 
-        previous_ids = set(self._events)
+        persisted_active_ids: list[str] = []
+        if not self._startup_reconciliation_done:
+            # This is deliberately after structure + parser validation.  A
+            # malformed/empty error response must never trigger a global read
+            # or reconciliation attempt.
+            persisted_active_ids = self.database.current_event_ids_with_statuses(
+                ACTIVE_EVENT_STATUSES
+            )
+        plausible, plausibility_reason = is_plausible_live_feed(
+            response.payload,
+            parsed_events,
+            persisted_active_count=len(persisted_active_ids),
+        )
+        if not plausible:
+            self.plausibility_error_count += 1
+            self.last_error = f"Live feed plausibility gate rejected response: {plausibility_reason}"
+            self._persist_debug_raw(response, response.metrics.response_received_at)
+            self.last_timing = {
+                "network_ms": network_ms,
+                "parse_ms": parse_ms,
+                "persistence_ms": 0.0,
+                "reconciliation_ms": 0.0,
+            }
+            return EventRefreshResult(
+                success=False,
+                events=self.events,
+                metrics=response.metrics,
+                error=self.last_error,
+                network_ms=network_ms,
+                parse_ms=parse_ms,
+            )
+
+        previous_ids = (
+            set(persisted_active_ids)
+            if not self._startup_reconciliation_done
+            else set(self._events)
+        )
         next_events: dict[str, LiveEvent] = {}
-        changed_state_count = 0
         for event in parsed_events:
             previous = self._events.get(event.event_id)
             if previous is None:
@@ -202,16 +331,78 @@ class EventService:
             event.last_seen_at = observed_at
             event.last_updated_at = observed_at
             next_events[event.event_id] = event
-            if self.repository.save_observation(event, observed_at):
-                changed_state_count += 1
 
-        for disappeared_id in previous_ids - set(next_events):
-            self.logger.info("Event left live feed: %s", disappeared_id)
-            self.database.mark_event_no_longer_live(disappeared_id, observed_at)
+        persistence_started = time.perf_counter()
+        sql_context = (
+            self.database.trace_sql()
+            if getattr(self.settings, "collector_sql_trace_enabled", False)
+            else nullcontext({})
+        )
+        try:
+            with sql_context as sql_metrics:
+                persisted = self.database.persist_live_feed_batch(
+                    next_events.values(),
+                    observed_at,
+                    disappeared_ids=previous_ids - set(next_events),
+                    now=datetime.now(timezone.utc),
+                    stale_prematch_grace_hours=getattr(
+                        self.settings,
+                        "stale_prematch_grace_hours",
+                        6.0,
+                    ),
+                )
+        except Exception as exc:
+            self.persistence_error_count += 1
+            self.last_error = f"Live feed persistence failed: {exc}"
+            self.last_timing = {
+                "network_ms": network_ms,
+                "parse_ms": parse_ms,
+                "persistence_ms": (time.perf_counter() - persistence_started) * 1000.0,
+                "reconciliation_ms": 0.0,
+            }
+            self.logger.exception("Live feed persistence failed")
+            return EventRefreshResult(
+                success=False,
+                events=self.events,
+                metrics=response.metrics,
+                error=self.last_error,
+                network_ms=network_ms,
+                parse_ms=parse_ms,
+                persistence_ms=self.last_timing["persistence_ms"],
+            )
+
+        persistence_ms = (time.perf_counter() - persistence_started) * 1000.0
+        reconciled_ids = tuple(str(value) for value in persisted.get("reconciled_event_ids", ()))
+        ignored_ids = tuple(str(value) for value in persisted.get("ignored_event_ids", ()))
+        if ignored_ids:
+            ignored_set = set(ignored_ids)
+            # A terminal/stale event may still be present in a provider
+            # response.  It must not leak back into the in-memory live
+            # universe after the database correctly rejected its reopen.
+            next_events = {
+                event_id: event
+                for event_id, event in next_events.items()
+                if event_id not in ignored_set
+            }
+        for disappeared_id in reconciled_ids:
+            self.logger.info("Event reconciled after leaving live feed: %s", disappeared_id)
 
         self._events = next_events
         self.last_success_at = observed_at
         self.last_error = None
+        self._startup_reconciliation_done = True
+        self.last_sql_metrics = {
+            str(key): int(value)
+            for key, value in (sql_metrics or {}).items()
+            if isinstance(value, int)
+        }
+        reconciliation_ms = float(persisted.get("reconciliation_ms") or 0.0)
+        self.last_timing = {
+            "network_ms": network_ms,
+            "parse_ms": parse_ms,
+            "persistence_ms": persistence_ms,
+            "reconciliation_ms": reconciliation_ms,
+        }
         self.logger.info(
             "Live feed normalized: %s soccer events in %s ms",
             len(next_events),
@@ -222,7 +413,15 @@ class EventService:
             events=self.events,
             metrics=response.metrics,
             raw_path=raw_path,
-            changed_state_count=changed_state_count,
+            changed_state_count=int(persisted.get("changed_state_count") or 0),
+            history_state_count=int(persisted.get("history_state_count") or 0),
+            reconciled_event_ids=reconciled_ids,
+            ignored_event_ids=ignored_ids,
+            network_ms=network_ms,
+            parse_ms=parse_ms,
+            persistence_ms=persistence_ms,
+            reconciliation_ms=reconciliation_ms,
+            sql_metrics=self.last_sql_metrics or None,
         )
 
     def filtered_events(self, search: str = "") -> list[LiveEvent]:

@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 
 from fotmob.service import FotMobRefreshResult, FotMobService
+from fotmob.storage import internal_match_id_for_tipico
 
 
 def _display(value: Any) -> str:
@@ -82,7 +83,10 @@ def render_fotmob_tab(service: FotMobService, event: Any) -> None:
         "kein Ranking und keinen Paper-Trade. "
         f"Entscheidung: {service.provider_decision} · Automatisierung: {service.automated_usage}."
     )
-    internal_match_id = service.ensure_tipico_event(event)
+    # Reading a selected live event must not create a catalog row.  The
+    # explicit discovery/confirmation buttons below still create the normal
+    # persistent link through FotMobService when the user asks for it.
+    internal_match_id = internal_match_id_for_tipico(str(event.event_id))
     link = service.store.link_for_internal(internal_match_id)
     current = service.store.current_state(internal_match_id)
     quality = service.store.quality(internal_match_id)

@@ -404,6 +404,27 @@ def _period_stats(node: Any) -> FotMobStats:
 def _parse_minute(value: Any) -> tuple[int | None, int | None]:
     if value is None:
         return None, None
+    if isinstance(value, Mapping):
+        # Current FotMob payloads expose the live clock as an object, e.g.
+        # ``{"short": "HT", "maxTime": 45, "addedTime": 0}``.
+        # Older payloads sent the minute as a scalar, so keep that path too.
+        nested = _first(
+            value,
+            "minute",
+            "currentMinute",
+            "matchMinute",
+            "time",
+            "maxTime",
+            "basePeriod",
+        )
+        if nested is not _MISSING and nested is not value:
+            minute, added = _parse_minute(nested)
+            added_value = _first(value, "addedTime", "added_time", "addedMinute")
+            if added_value is not _MISSING:
+                parsed_added = _integer(added_value)
+                if parsed_added is not None:
+                    added = parsed_added
+            return minute, added
     text = str(value).strip()
     match = _MINUTE_RE.search(text)
     if not match:
@@ -671,6 +692,16 @@ def parse_fotmob_payload(
     minute_value = _first(header, "minute", "matchMinute", "liveTime")
     if minute_value is _MISSING:
         minute_value = _first(general, "minute", "matchMinute", "liveTime")
+    # The current public endpoint places both the phase and the effective
+    # minute in ``header.status.liveTime``.  ``_text`` intentionally does not
+    # guess from arbitrary mappings, so promote the provider's explicit
+    # labels before parsing the clock.
+    live_time = _first(status_value if isinstance(status_value, Mapping) else None, "liveTime")
+    if isinstance(live_time, Mapping):
+        if period_value is _MISSING:
+            period_value = _first(live_time, "short", "shortKey", "longKey", "long")
+        if minute_value is _MISSING:
+            minute_value = live_time
     minute, added_time = _parse_minute(None if minute_value is _MISSING else minute_value)
 
     kickoff = _first(general, "matchTimeUTCDate", "matchTimeUTC", "startTime", "kickoff", "kickoffTime")

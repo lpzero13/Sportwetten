@@ -63,6 +63,37 @@ def normalize_team_name(value: Any) -> str:
     return aliases.get(normalized, normalized)
 
 
+_TEAM_DECORATIONS = frozenset(
+    {
+        "ac",
+        "afc",
+        "as",
+        "bsc",
+        "calcio",
+        "cf",
+        "club",
+        "fc",
+        "fk",
+        "sc",
+        "sk",
+        "ssc",
+        "sv",
+        "tsv",
+        "us",
+        "vfb",
+        "vfl",
+    }
+)
+
+
+def _team_core(value: Any) -> str:
+    """Remove harmless club-form decorations for cross-provider matching."""
+
+    tokens = normalize_team_name(value).split()
+    core = [token for token in tokens if token not in _TEAM_DECORATIONS]
+    return " ".join(core) or normalize_team_name(value)
+
+
 def normalize_competition_name(value: Any) -> str:
     return normalize_name(value)
 
@@ -73,13 +104,81 @@ def normalize_country(value: Any) -> str:
         "de": "deutschland",
         "germany": "deutschland",
         "ger": "deutschland",
+        "deu": "deutschland",
         "at": "osterreich",
         "austria": "osterreich",
         "aut": "osterreich",
         "ch": "schweiz",
         "switzerland": "schweiz",
+        "che": "schweiz",
         "gb": "england",
         "uk": "england",
+        "eng": "england",
+        "ita": "italien",
+        "italy": "italien",
+        "esp": "spanien",
+        "spain": "spanien",
+        "fra": "frankreich",
+        "france": "frankreich",
+        "ned": "niederlande",
+        "netherlands": "niederlande",
+        "nld": "niederlande",
+        "bel": "belgien",
+        "belgium": "belgien",
+        "prt": "portugal",
+        "por": "portugal",
+        "tur": "turkei",
+        "turkey": "turkei",
+        "grc": "griechenland",
+        "gre": "griechenland",
+        "den": "danemark",
+        "dnk": "danemark",
+        "sweden": "schweden",
+        "swe": "schweden",
+        "norway": "norwegen",
+        "nor": "norwegen",
+        "poland": "polen",
+        "pol": "polen",
+        "czech republic": "tschechien",
+        "czechia": "tschechien",
+        "cze": "tschechien",
+        "croatia": "kroatien",
+        "hrv": "kroatien",
+        "serbia": "serbien",
+        "srb": "serbien",
+        "romania": "rumanien",
+        "rou": "rumanien",
+        "hungary": "ungarn",
+        "hun": "ungarn",
+        "slovakia": "slowakei",
+        "svk": "slowakei",
+        "slovenia": "slowenien",
+        "svn": "slowenien",
+        "switzerland": "schweiz",
+        "ukraine": "ukraine",
+        "ukr": "ukraine",
+        "russia": "russland",
+        "rus": "russland",
+        "brazil": "brasilien",
+        "bra": "brasilien",
+        "argentina": "argentinien",
+        "arg": "argentinien",
+        "mexico": "mexiko",
+        "mex": "mexiko",
+        "usa": "usa",
+        "united states": "usa",
+        "canada": "kanada",
+        "can": "kanada",
+        "japan": "japan",
+        "jpn": "japan",
+        "south korea": "sudkorea",
+        "kor": "sudkorea",
+        "australia": "australien",
+        "aus": "australien",
+        "ireland": "irland",
+        "irl": "irland",
+        "scotland": "schottland",
+        "sco": "schottland",
     }
     return aliases.get(normalized, normalized)
 
@@ -214,7 +313,9 @@ class MatchMatcher:
         self.known_provider_ids = dict(known_provider_ids or {})
 
     def _team_equal(self, left: str, right: str) -> bool:
-        return _alias_key(left, self.team_aliases) == _alias_key(right, self.team_aliases)
+        left_key = _alias_key(left, self.team_aliases)
+        right_key = _alias_key(right, self.team_aliases)
+        return left_key == right_key or _team_core(left_key) == _team_core(right_key)
 
     def _competition_equal(self, left: str, right: str) -> bool:
         normalized_left = normalize_competition_name(left)

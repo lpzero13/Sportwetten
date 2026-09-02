@@ -189,6 +189,29 @@ def test_parser_handles_current_public_next_payload_shape() -> None:
     assert (match.events[0].score_home, match.events[0].score_away) == (1, 0)
 
 
+def test_parser_reads_current_live_time_from_header_status() -> None:
+    payload = sample_payload()
+    payload["header"]["status"] = {
+        "started": True,
+        "finished": False,
+        "ongoing": True,
+        "liveTime": {
+            "short": "HT",
+            "shortKey": "halftime_short",
+            "maxTime": 45,
+            "basePeriod": 45,
+            "addedTime": 0,
+        },
+    }
+
+    match = parse_fotmob_payload(payload)
+
+    assert match.status == "started"
+    assert match.period == "HT"
+    assert match.minute == 45
+    assert match.added_time == 0
+
+
 def test_matcher_requires_order_country_and_kickoff() -> None:
     tipico = MatchIdentity.from_tipico_event(tipico_event())
     matcher = MatchMatcher(tolerance_minutes=15)

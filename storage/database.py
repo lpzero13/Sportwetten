@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
+import time
 from collections.abc import Iterable, Mapping
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +18,105 @@ from models.event import LiveEvent
 from models.event_state import EventState
 from models.market import Market, Outcome
 from models.snapshot import Snapshot
+
+
+ACTIVE_EVENT_STATUSES = frozenset(
+    {
+        "running",
+        "live",
+        "break",
+        "half_time",
+        "halftime",
+        "extra_time",
+    }
+)
+FINISHED_EVENT_STATUSES = frozenset(
+    {"finished", "ended", "complete", "completed", "final"}
+)
+NO_LONGER_LIVE_STATUS = "NO_LONGER_LIVE"
+PREMATCH_EVENT_STATUSES = frozenset({"pre_match", "prematch"})
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _status_token(value: Any) -> str:
+    return str(value or "").strip().casefold().replace(" ", "_")
+
+
+def _row_state_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        row["status"],
+        row["period"],
+        row["display_time"],
+        row["section_number"],
+        row["score_home"],
+        row["score_away"],
+        row["ht_score_home"],
+        row["ht_score_away"],
+        row["red_cards_home"],
+        row["red_cards_away"],
+    )
+
+
+def _state_is_finished(status: Any, period: Any) -> bool:
+    return (
+        _status_token(status) in FINISHED_EVENT_STATUSES
+        or _status_token(period) in FINISHED_EVENT_STATUSES
+    )
+
+
+def _state_is_no_longer_live(status: Any, period: Any) -> bool:
+    return (
+        _status_token(status) == _status_token(NO_LONGER_LIVE_STATUS)
+        or _status_token(period) == _status_token(NO_LONGER_LIVE_STATUS)
+    )
+
+
+def _state_is_prematch(status: Any, period: Any) -> bool:
+    return _status_token(status) in PREMATCH_EVENT_STATUSES or _status_token(period) in PREMATCH_EVENT_STATUSES
+
+
+def _state_is_active(status: Any, period: Any) -> bool:
+    return (
+        _status_token(status) in ACTIVE_EVENT_STATUSES
+        or _status_token(period) in ACTIVE_EVENT_STATUSES
+    )
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _credible_live_event(event: LiveEvent) -> bool:
+    """Reject implausible recovery payloads without requiring every score field."""
+
+    status = _status_token(event.status)
+    period = _status_token(event.period)
+    if status not in ACTIVE_EVENT_STATUSES and period not in ACTIVE_EVENT_STATUSES:
+        return False
+    display = str(event.display_minute or "").strip().upper()
+    has_clock = display == "HZ" or bool(re.search(r"\d+", display))
+    if not has_clock and period not in ACTIVE_EVENT_STATUSES:
+        return False
+    for score in (
+        event.score_home,
+        event.score_away,
+        event.ht_score_home,
+        event.ht_score_away,
+    ):
+        if score is not None and int(score) < 0:
+            return False
+    return True
 
 
 SCHEMA = """
@@ -51,6 +153,12 @@ CREATE TABLE IF NOT EXISTS events (
     last_seen_at TEXT NOT NULL,
     last_updated_at TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_events_first_seen
+    ON events(first_seen_at, event_id);
+
+CREATE INDEX IF NOT EXISTS idx_events_last_seen
+    ON events(last_seen_at, event_id);
 
 CREATE TABLE IF NOT EXISTS event_states (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,6 +197,12 @@ CREATE TABLE IF NOT EXISTS current_event_state (
     red_cards_away INTEGER,
     raw_state_json TEXT NOT NULL DEFAULT '{}'
 );
+
+CREATE INDEX IF NOT EXISTS idx_current_event_state_status
+    ON current_event_state(status COLLATE NOCASE, event_id);
+
+CREATE INDEX IF NOT EXISTS idx_current_event_state_period
+    ON current_event_state(period COLLATE NOCASE, event_id);
 
 CREATE TABLE IF NOT EXISTS markets (
     market_id TEXT PRIMARY KEY,
@@ -156,6 +270,12 @@ CREATE TABLE IF NOT EXISTS competitions (
     last_seen_at TEXT NOT NULL,
     events_observed INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE INDEX IF NOT EXISTS idx_competitions_first_seen
+    ON competitions(first_seen_at, competition_id);
+
+CREATE INDEX IF NOT EXISTS idx_competitions_last_seen
+    ON competitions(last_seen_at, competition_id);
 
 CREATE TABLE IF NOT EXISTS snapshots (
     snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -516,6 +636,9 @@ CREATE INDEX IF NOT EXISTS idx_paper_trades_portfolio_status
 CREATE INDEX IF NOT EXISTS idx_paper_trades_event
     ON paper_trades(event_id, status);
 
+CREATE INDEX IF NOT EXISTS idx_paper_trades_created_at
+    ON paper_trades(created_at, paper_trade_id);
+
 CREATE TABLE IF NOT EXISTS paper_bankroll_transactions (
     transaction_id TEXT PRIMARY KEY,
     portfolio_id TEXT NOT NULL,
@@ -813,6 +936,44 @@ CREATE TABLE IF NOT EXISTS fotmob_performance_profile (
 
 CREATE INDEX IF NOT EXISTS idx_fotmob_performance_profile_lookup
     ON fotmob_performance_profile(phase, status, rps, workers, tested_at);
+
+-- V0.5.8: slowly changing capability catalogues used by the live collector.
+-- They are additive and contain no raw payloads or historical replacements.
+CREATE TABLE IF NOT EXISTS fotmob_coverage_catalog (
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    fotmob_league_id TEXT NOT NULL,
+    country TEXT,
+    league_name TEXT,
+    season_id TEXT NOT NULL DEFAULT '',
+    season_label TEXT,
+    observed_matches INTEGER NOT NULL DEFAULT 0,
+    detailed_matches INTEGER NOT NULL DEFAULT 0,
+    coverage_ratio REAL NOT NULL DEFAULT 0,
+    sample_size INTEGER NOT NULL DEFAULT 0,
+    last_checked TEXT NOT NULL,
+    status TEXT NOT NULL,
+    PRIMARY KEY (provider, fotmob_league_id, season_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_coverage_lookup
+    ON fotmob_coverage_catalog(provider, fotmob_league_id, status, last_checked);
+
+CREATE INDEX IF NOT EXISTS idx_fotmob_coverage_name
+    ON fotmob_coverage_catalog(provider, league_name, country, season_label);
+
+CREATE TABLE IF NOT EXISTS tipico_market_capability (
+    competition_id TEXT PRIMARY KEY,
+    competition_name TEXT NOT NULL,
+    competition_country TEXT,
+    observed_matches INTEGER NOT NULL DEFAULT 0,
+    matches_with_strategy_markets INTEGER NOT NULL DEFAULT 0,
+    coverage_ratio REAL NOT NULL DEFAULT 0,
+    last_checked TEXT NOT NULL,
+    status TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tipico_market_capability_status
+    ON tipico_market_capability(status, coverage_ratio, last_checked);
 """
 
 
@@ -1058,7 +1219,65 @@ class Database:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+    @contextmanager
+    def transaction(self, *, immediate: bool = True):
+        """Run a short explicit transaction while holding the DB lock.
+
+        The collector uses this boundary for one complete live-feed batch.
+        Callers inside the boundary must use ``*_locked`` methods and must not
+        perform network or filesystem I/O.
+        """
+
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            try:
+                yield self.connection
+            except Exception:
+                self.connection.rollback()
+                raise
+            else:
+                self.connection.commit()
+
+    @contextmanager
+    def trace_sql(self):
+        """Collect optional SQL/transaction counters for a benchmark window.
+
+        Tracing is opt-in and scoped to the context, so normal production
+        status writes do not pay the callback overhead.
+        """
+
+        metrics = {
+            "statements": 0,
+            "transactions": 0,
+            "commits": 0,
+            "rollbacks": 0,
+        }
+
+        def trace(statement: str) -> None:
+            normalized = statement.strip().upper()
+            metrics["statements"] += 1
+            if normalized.startswith("BEGIN"):
+                metrics["transactions"] += 1
+            elif normalized.startswith("COMMIT"):
+                metrics["commits"] += 1
+            elif normalized.startswith("ROLLBACK"):
+                metrics["rollbacks"] += 1
+
+        with self._lock:
+            previous = self.connection.set_trace_callback(trace)
+        try:
+            yield metrics
+        finally:
+            with self._lock:
+                self.connection.set_trace_callback(previous)
+
     def upsert_event(self, event: LiveEvent, observed_at: str) -> None:
+        with self._lock, self.connection:
+            self._upsert_event_locked(event, observed_at)
+
+    def _upsert_event_locked(self, event: LiveEvent, observed_at: str) -> None:
+        """Upsert event metadata without starting or committing a transaction."""
+
         values = (
             event.event_id,
             event.competition_id,
@@ -1092,69 +1311,68 @@ class Database:
             observed_at,
             event.last_updated_at or observed_at,
         )
-        with self._lock, self.connection:
-            self.connection.execute(
-                """
-                INSERT INTO events (
-                    event_id, competition_id, competition_name, competition_country, sport,
-                    home_team_id, home_team, away_team_id, away_team,
-                    kickoff_time, status, period, display_time,
-                    score_home, score_away, ht_score_home, ht_score_away,
-                    bet_markets_count, section_number, red_cards_home,
-                    red_cards_away, sport_radar_match_id, bet_genius_id,
-                    extra_time, penalties, break_before, clock_data_json,
-                    raw_data_json, first_seen_at, last_seen_at, last_updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(event_id) DO UPDATE SET
-                    competition_id = excluded.competition_id,
-                    competition_name = excluded.competition_name,
-                    competition_country = COALESCE(
-                        excluded.competition_country, events.competition_country
-                    ),
-                    sport = excluded.sport,
-                    home_team_id = excluded.home_team_id,
-                    home_team = excluded.home_team,
-                    away_team_id = excluded.away_team_id,
-                    away_team = excluded.away_team,
-                    kickoff_time = excluded.kickoff_time,
-                    status = excluded.status,
-                    period = excluded.period,
-                    display_time = excluded.display_time,
-                    score_home = excluded.score_home,
-                    score_away = excluded.score_away,
-                    ht_score_home = excluded.ht_score_home,
-                    ht_score_away = excluded.ht_score_away,
-                    bet_markets_count = excluded.bet_markets_count,
-                    section_number = excluded.section_number,
-                    red_cards_home = excluded.red_cards_home,
-                    red_cards_away = excluded.red_cards_away,
-                    sport_radar_match_id = excluded.sport_radar_match_id,
-                    bet_genius_id = excluded.bet_genius_id,
-                    extra_time = excluded.extra_time,
-                    penalties = excluded.penalties,
-                    break_before = excluded.break_before,
-                    clock_data_json = excluded.clock_data_json,
-                    raw_data_json = excluded.raw_data_json,
-                    last_seen_at = excluded.last_seen_at,
-                    last_updated_at = excluded.last_updated_at
-                """,
-                values,
+        self.connection.execute(
+            """
+            INSERT INTO events (
+                event_id, competition_id, competition_name, competition_country, sport,
+                home_team_id, home_team, away_team_id, away_team,
+                kickoff_time, status, period, display_time,
+                score_home, score_away, ht_score_home, ht_score_away,
+                bet_markets_count, section_number, red_cards_home,
+                red_cards_away, sport_radar_match_id, bet_genius_id,
+                extra_time, penalties, break_before, clock_data_json,
+                raw_data_json, first_seen_at, last_seen_at, last_updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                competition_id = excluded.competition_id,
+                competition_name = excluded.competition_name,
+                competition_country = COALESCE(
+                    excluded.competition_country, events.competition_country
+                ),
+                sport = excluded.sport,
+                home_team_id = excluded.home_team_id,
+                home_team = excluded.home_team,
+                away_team_id = excluded.away_team_id,
+                away_team = excluded.away_team,
+                kickoff_time = COALESCE(excluded.kickoff_time, events.kickoff_time),
+                status = excluded.status,
+                period = excluded.period,
+                display_time = excluded.display_time,
+                score_home = excluded.score_home,
+                score_away = excluded.score_away,
+                ht_score_home = excluded.ht_score_home,
+                ht_score_away = excluded.ht_score_away,
+                bet_markets_count = excluded.bet_markets_count,
+                section_number = excluded.section_number,
+                red_cards_home = excluded.red_cards_home,
+                red_cards_away = excluded.red_cards_away,
+                sport_radar_match_id = excluded.sport_radar_match_id,
+                bet_genius_id = excluded.bet_genius_id,
+                extra_time = excluded.extra_time,
+                penalties = excluded.penalties,
+                break_before = excluded.break_before,
+                clock_data_json = excluded.clock_data_json,
+                raw_data_json = excluded.raw_data_json,
+                last_seen_at = excluded.last_seen_at,
+                last_updated_at = excluded.last_updated_at
+            """,
+            values,
+        )
+        if event.competition_id:
+            groups = event.raw_data.get("groups") if isinstance(event.raw_data, dict) else None
+            region = (
+                str(groups[1])
+                if isinstance(groups, (list, tuple)) and len(groups) > 1 and groups[1]
+                else None
             )
-            if event.competition_id:
-                groups = event.raw_data.get("groups") if isinstance(event.raw_data, dict) else None
-                region = (
-                    str(groups[1])
-                    if isinstance(groups, (list, tuple)) and len(groups) > 1 and groups[1]
-                    else None
-                )
-                self._upsert_competition_in_transaction(
-                    str(event.competition_id),
-                    event.competition_name or str(event.competition_id),
-                    event.competition_country or region,
-                    event.first_seen_at or observed_at,
-                    observed_at,
-                )
+            self._upsert_competition_in_transaction(
+                str(event.competition_id),
+                event.competition_name or str(event.competition_id),
+                event.competition_country or region,
+                event.first_seen_at or observed_at,
+                observed_at,
+            )
 
     def _upsert_competition_in_transaction(
         self,
@@ -1220,50 +1438,53 @@ class Database:
     def upsert_current_event_state(self, state: EventState) -> bool:
         """Replace the volatile state for an event and report semantic changes."""
 
-        with self._lock:
-            previous = self.connection.execute(
-                """
-                SELECT status, period, display_time, section_number,
-                       score_home, score_away, ht_score_home, ht_score_away,
-                       red_cards_home, red_cards_away
-                FROM current_event_state
-                WHERE event_id = ?
-                """,
-                (str(state.event_id),),
-            ).fetchone()
-            changed = previous is None or tuple(previous) != state.relevant_key
-            with self.connection:
-                self.connection.execute(
-                    """
-                    INSERT INTO current_event_state (
-                        event_id, observed_at, status, period, display_time,
-                        section_number, score_home, score_away,
-                        ht_score_home, ht_score_away, red_cards_home,
-                        red_cards_away, raw_state_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(event_id) DO UPDATE SET
-                        observed_at = excluded.observed_at,
-                        status = excluded.status,
-                        period = excluded.period,
-                        display_time = excluded.display_time,
-                        section_number = excluded.section_number,
-                        score_home = excluded.score_home,
-                        score_away = excluded.score_away,
-                        ht_score_home = excluded.ht_score_home,
-                        ht_score_away = excluded.ht_score_away,
-                        red_cards_home = excluded.red_cards_home,
-                        red_cards_away = excluded.red_cards_away,
-                        raw_state_json = excluded.raw_state_json
-                    """,
-                    (
-                        state.event_id, state.observed_at, state.status,
-                        state.period, state.display_time, state.section_number,
-                        state.score_home, state.score_away, state.ht_score_home,
-                        state.ht_score_away, state.red_cards_home,
-                        state.red_cards_away, _json(state.raw_state or {}),
-                    ),
-                )
-            return changed
+        with self._lock, self.connection:
+            return self._upsert_current_event_state_locked(state)
+
+    def _upsert_current_event_state_locked(self, state: EventState) -> bool:
+        """Upsert current state while the caller owns the transaction."""
+
+        previous = self.connection.execute(
+            """
+            SELECT status, period, display_time, section_number,
+                   score_home, score_away, ht_score_home, ht_score_away,
+                   red_cards_home, red_cards_away
+            FROM current_event_state
+            WHERE event_id = ?
+            """,
+            (str(state.event_id),),
+        ).fetchone()
+        changed = previous is None or tuple(previous) != state.relevant_key
+        self.connection.execute(
+            """
+            INSERT INTO current_event_state (
+                event_id, observed_at, status, period, display_time,
+                score_home, score_away, ht_score_home, ht_score_away,
+                section_number, red_cards_home, red_cards_away, raw_state_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                observed_at = excluded.observed_at,
+                status = excluded.status,
+                period = excluded.period,
+                display_time = excluded.display_time,
+                section_number = excluded.section_number,
+                score_home = excluded.score_home,
+                score_away = excluded.score_away,
+                ht_score_home = excluded.ht_score_home,
+                ht_score_away = excluded.ht_score_away,
+                red_cards_home = excluded.red_cards_home,
+                red_cards_away = excluded.red_cards_away,
+                raw_state_json = excluded.raw_state_json
+            """,
+            (
+                state.event_id, state.observed_at, state.status,
+                state.period, state.display_time, state.score_home,
+                state.score_away, state.ht_score_home, state.ht_score_away,
+                state.section_number, state.red_cards_home,
+                state.red_cards_away, _json(state.raw_state or {}),
+            ),
+        )
+        return changed
 
     def current_event_state(self, event_id: str) -> sqlite3.Row | None:
         with self._lock:
@@ -1275,50 +1496,519 @@ class Database:
     def record_event_state_if_changed(self, state: EventState) -> bool:
         """Store a state only when it differs from the latest state."""
 
-        with self._lock:
+        with self._lock, self.connection:
+            return self._record_event_state_if_changed_locked(state)
+
+    def _record_event_state_if_changed_locked(self, state: EventState) -> bool:
+        """Append a real state transition while the caller owns the transaction."""
+
+        previous = self.connection.execute(
+            """
+            SELECT status, period, display_time, section_number,
+                   score_home, score_away, ht_score_home, ht_score_away,
+                   red_cards_home, red_cards_away
+            FROM event_states
+            WHERE event_id = ?
+            ORDER BY observed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (state.event_id,),
+        ).fetchone()
+        if previous is None:
             previous = self.connection.execute(
                 """
                 SELECT status, period, display_time, section_number,
                        score_home, score_away, ht_score_home, ht_score_away,
                        red_cards_home, red_cards_away
-                FROM event_states
+                FROM current_event_state
+                WHERE event_id = ?
+                """,
+                (state.event_id,),
+            ).fetchone()
+        if previous is not None and tuple(previous) == state.relevant_key:
+            return False
+        self.connection.execute(
+            """
+            INSERT INTO event_states (
+                event_id, observed_at, status, period, display_time,
+                section_number, score_home, score_away,
+                ht_score_home, ht_score_away, red_cards_home,
+                red_cards_away, raw_state_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                state.event_id,
+                state.observed_at,
+                state.status,
+                state.period,
+                state.display_time,
+                state.section_number,
+                state.score_home,
+                state.score_away,
+                state.ht_score_home,
+                state.ht_score_away,
+                state.red_cards_home,
+                state.red_cards_away,
+                _json(state.raw_state or {}),
+            ),
+        )
+        return True
+
+    def current_event_ids_with_statuses(
+        self,
+        statuses: Iterable[str] | None = None,
+    ) -> list[str]:
+        """Return IDs from the volatile state table, not from ``events``.
+
+        The current-state table is the operational source of truth after a
+        restart.  ``COLLATE NOCASE`` keeps legacy casing readable while still
+        allowing the dedicated status indexes to be used.
+        """
+
+        values = tuple(
+            sorted(
+                {
+                    _status_token(value)
+                    for value in (statuses or ACTIVE_EVENT_STATUSES)
+                    if _status_token(value)
+                }
+            )
+        )
+        if not values:
+            return []
+        placeholders = ", ".join("?" for _ in values)
+        with self._lock:
+            rows = self.connection.execute(
+                f"""
+                SELECT event_id
+                FROM current_event_state
+                WHERE status COLLATE NOCASE IN ({placeholders})
+                   OR period COLLATE NOCASE IN ({placeholders})
+                ORDER BY event_id
+                """,
+                [*values, *values],
+            ).fetchall()
+        return [str(row["event_id"]) for row in rows]
+
+    def stale_pre_match_event_ids(
+        self,
+        *,
+        now: datetime | None = None,
+        grace_hours: float = 6.0,
+    ) -> list[str]:
+        """Find only pre-match rows past the explicit stale grace cutoff."""
+
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        with self._lock:
+            return self._stale_pre_match_event_ids_locked(
+                now=moment,
+                grace_hours=grace_hours,
+            )
+
+    def _stale_pre_match_event_ids_locked(
+        self,
+        *,
+        now: datetime,
+        grace_hours: float,
+    ) -> list[str]:
+        cutoff = (
+            now.astimezone(timezone.utc)
+            - timedelta(hours=max(0.0, grace_hours))
+        ).isoformat()
+        values = tuple(sorted(PREMATCH_EVENT_STATUSES))
+        placeholders = ", ".join("?" for _ in values)
+        rows = self.connection.execute(
+            f"""
+            SELECT c.event_id
+            FROM current_event_state c
+            JOIN events e ON e.event_id = c.event_id
+            WHERE (
+                    c.status COLLATE NOCASE IN ({placeholders})
+                 OR c.period COLLATE NOCASE IN ({placeholders})
+            )
+              AND e.kickoff_time IS NOT NULL
+              AND e.kickoff_time <= ?
+            ORDER BY e.kickoff_time, c.event_id
+            """,
+            [*values, *values, cutoff],
+        ).fetchall()
+        return [str(row["event_id"]) for row in rows]
+
+    @staticmethod
+    def _event_state_from_row(row: Mapping[str, Any]) -> EventState:
+        row_keys = set(row.keys())
+        raw: dict[str, Any] = {}
+        raw_value = row["raw_state_json"] if "raw_state_json" in row_keys else None
+        if raw_value:
+            try:
+                parsed = json.loads(str(raw_value))
+                if isinstance(parsed, dict):
+                    raw = parsed
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw = {}
+        observed_at = next(
+            (
+                row[key]
+                for key in ("observed_at", "last_updated_at", "last_seen_at")
+                if key in row_keys and row[key]
+            ),
+            _now_iso(),
+        )
+        return EventState(
+            event_id=str(row["event_id"]),
+            observed_at=str(observed_at),
+            status=str(row["status"] or "UNKNOWN"),
+            period=str(row["period"] or "UNKNOWN"),
+            display_time=str(row["display_time"] or "—"),
+            section_number=row["section_number"],
+            score_home=row["score_home"],
+            score_away=row["score_away"],
+            ht_score_home=row["ht_score_home"],
+            ht_score_away=row["ht_score_away"],
+            red_cards_home=row["red_cards_home"],
+            red_cards_away=row["red_cards_away"],
+            raw_state=raw,
+        )
+
+    def _ensure_event_row_locked(
+        self,
+        event_id: str,
+        state: EventState,
+        observed_at: str,
+        fallback_event: LiveEvent | None = None,
+    ) -> bool:
+        """Reconstruct a missing durable event row before updating it."""
+
+        existing = self.connection.execute(
+            "SELECT 1 FROM events WHERE event_id = ?",
+            (str(event_id),),
+        ).fetchone()
+        if existing is not None:
+            return False
+        if fallback_event is not None:
+            self._upsert_event_locked(fallback_event, observed_at)
+            return True
+        event = LiveEvent(
+            event_id=str(event_id),
+            competition_id=None,
+            competition_name="Unbekannter Wettbewerb",
+            competition_country=None,
+            sport="soccer",
+            home_team="Unbekannt",
+            away_team="Unbekannt",
+            home_team_id=None,
+            away_team_id=None,
+            kickoff_time=None,
+            status=state.status,
+            period=state.period,
+            display_minute=state.display_time,
+            score_home=state.score_home,
+            score_away=state.score_away,
+            ht_score_home=state.ht_score_home,
+            ht_score_away=state.ht_score_away,
+            bet_markets_count=None,
+            first_seen_at=observed_at,
+            last_seen_at=observed_at,
+            last_updated_at=observed_at,
+            section_number=state.section_number,
+            red_cards_home=state.red_cards_home,
+            red_cards_away=state.red_cards_away,
+            raw_data={"reconstructed_from_state": True},
+        )
+        self._upsert_event_locked(event, observed_at)
+        return True
+
+    def _repair_event_from_state_locked(
+        self,
+        state: EventState,
+        observed_at: str,
+        *,
+        fallback_event: LiveEvent | None = None,
+    ) -> bool:
+        inserted = self._ensure_event_row_locked(
+            state.event_id,
+            state,
+            observed_at,
+            fallback_event=fallback_event,
+        )
+        existing = self.connection.execute(
+            """
+            SELECT status, period, display_time, score_home, score_away,
+                   ht_score_home, ht_score_away, section_number,
+                   red_cards_home, red_cards_away
+            FROM events WHERE event_id = ?
+            """,
+            (state.event_id,),
+        ).fetchone()
+        desired = (
+            state.status,
+            state.period,
+            state.display_time,
+            state.score_home,
+            state.score_away,
+            state.ht_score_home,
+            state.ht_score_away,
+            state.section_number,
+            state.red_cards_home,
+            state.red_cards_away,
+        )
+        if not inserted and existing is not None and tuple(existing) == desired:
+            # A repeated NO_LONGER_LIVE reconciliation must remain a no-op.
+            # In particular, do not rewrite timestamps or manufacture a new
+            # durable write when the event is already repaired.
+            return False
+        cursor = self.connection.execute(
+            """
+            UPDATE events
+            SET status = ?, period = ?, display_time = ?,
+                score_home = ?, score_away = ?, ht_score_home = ?, ht_score_away = ?,
+                section_number = ?, red_cards_home = ?, red_cards_away = ?,
+                last_seen_at = ?, last_updated_at = ?
+            WHERE event_id = ?
+            """,
+            (
+                state.status,
+                state.period,
+                state.display_time,
+                state.score_home,
+                state.score_away,
+                state.ht_score_home,
+                state.ht_score_away,
+                state.section_number,
+                state.red_cards_home,
+                state.red_cards_away,
+                observed_at,
+                observed_at,
+                state.event_id,
+            ),
+        )
+        return cursor.rowcount > 0 or inserted
+
+    def _close_current_odds_locked(self, event_id: str, observed_at: str) -> int:
+        """Close only currently open canonical outcomes; preserve all history."""
+
+        cursor = self.connection.execute(
+            """
+            UPDATE current_canonical_outcomes
+            SET status = 'stopped', available = 0, odds = NULL, updated_at = ?
+            WHERE event_id = ?
+              AND (
+                    COALESCE(available, 0) <> 0
+                 OR odds IS NOT NULL
+                 OR lower(COALESCE(status, '')) NOT IN
+                    ('stopped', 'paused', 'closed', 'unavailable', 'inactive')
+              )
+            """,
+            (observed_at, str(event_id)),
+        )
+        return max(0, int(cursor.rowcount))
+
+    def close_current_event_odds(self, event_id: str, observed_at: str) -> int:
+        """Public idempotent terminal-odds close used by diagnostics/tests."""
+
+        with self._lock, self.connection:
+            return self._close_current_odds_locked(str(event_id), observed_at)
+
+    @staticmethod
+    def _accept_live_event_after_state(
+        previous: Mapping[str, Any] | None,
+        event: LiveEvent,
+        *,
+        now: datetime,
+        grace_hours: float,
+    ) -> bool:
+        if previous is None:
+            return True
+        if _state_is_finished(previous["status"], previous["period"]):
+            return False
+        if _state_is_no_longer_live(previous["status"], previous["period"]):
+            if _credible_live_event(event):
+                return True
+            if _status_token(event.status) in PREMATCH_EVENT_STATUSES:
+                kickoff = _parse_timestamp(event.kickoff_time)
+                if kickoff is None:
+                    return False
+                cutoff = now.astimezone(timezone.utc) - timedelta(hours=max(0.0, grace_hours))
+                return kickoff > cutoff
+            return False
+        if _state_is_active(previous["status"], previous["period"]):
+            # A late/stale pre-match response must never regress a live match.
+            if _status_token(event.status) in PREMATCH_EVENT_STATUSES:
+                return False
+        return True
+
+    def _mark_event_no_longer_live_locked(
+        self,
+        event_id: str,
+        observed_at: str,
+        *,
+        fallback_event: LiveEvent | None = None,
+    ) -> bool:
+        resolved_id = str(event_id)
+        current = self.connection.execute(
+            "SELECT * FROM current_event_state WHERE event_id = ?",
+            (resolved_id,),
+        ).fetchone()
+        if current is None:
+            current = self.connection.execute(
+                """
+                SELECT * FROM event_states
                 WHERE event_id = ?
                 ORDER BY observed_at DESC, id DESC
                 LIMIT 1
                 """,
-                (state.event_id,),
+                (resolved_id,),
             ).fetchone()
-            if previous is not None:
-                previous_key = tuple(previous)
-                if previous_key == state.relevant_key:
-                    return False
-            with self.connection:
-                self.connection.execute(
-                    """
-                    INSERT INTO event_states (
-                        event_id, observed_at, status, period, display_time,
-                        section_number, score_home, score_away,
-                        ht_score_home, ht_score_away, red_cards_home,
-                        red_cards_away, raw_state_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        state.event_id,
-                        state.observed_at,
-                        state.status,
-                        state.period,
-                        state.display_time,
-                        state.section_number,
-                        state.score_home,
-                        state.score_away,
-                        state.ht_score_home,
-                        state.ht_score_away,
-                        state.red_cards_home,
-                        state.red_cards_away,
-                        _json(state.raw_state or {}),
-                    ),
-                )
-            return True
+        event_row = self.connection.execute(
+            "SELECT * FROM events WHERE event_id = ?",
+            (resolved_id,),
+        ).fetchone()
+        if current is None and event_row is None:
+            if fallback_event is None:
+                return False
+            current = self._event_state_from_row(
+                {
+                    "event_id": fallback_event.event_id,
+                    "observed_at": observed_at,
+                    "status": fallback_event.status,
+                    "period": fallback_event.period,
+                    "display_time": fallback_event.display_minute,
+                    "section_number": fallback_event.section_number,
+                    "score_home": fallback_event.score_home,
+                    "score_away": fallback_event.score_away,
+                    "ht_score_home": fallback_event.ht_score_home,
+                    "ht_score_away": fallback_event.ht_score_away,
+                    "red_cards_home": fallback_event.red_cards_home,
+                    "red_cards_away": fallback_event.red_cards_away,
+                    "raw_state_json": "{}",
+                }
+            )
+        source = current if current is not None else event_row
+        assert source is not None
+        previous_state = (
+            source
+            if isinstance(source, EventState)
+            else self._event_state_from_row(source)
+        )
+        if _state_is_finished(previous_state.status, previous_state.period):
+            repaired = self._repair_event_from_state_locked(
+                previous_state,
+                observed_at,
+                fallback_event=fallback_event,
+            )
+            closed = self._close_current_odds_locked(resolved_id, observed_at)
+            return repaired or closed > 0
+
+        state = EventState(
+            event_id=resolved_id,
+            observed_at=observed_at,
+            status=NO_LONGER_LIVE_STATUS,
+            period=NO_LONGER_LIVE_STATUS,
+            display_time="—",
+            section_number=previous_state.section_number,
+            score_home=previous_state.score_home,
+            score_away=previous_state.score_away,
+            ht_score_home=previous_state.ht_score_home,
+            ht_score_away=previous_state.ht_score_away,
+            red_cards_home=previous_state.red_cards_home,
+            red_cards_away=previous_state.red_cards_away,
+            raw_state={"reason": "event_missing_from_live_feed"},
+        )
+        history_changed = self._record_event_state_if_changed_locked(state)
+        current_changed = self._upsert_current_event_state_locked(state)
+        repaired = self._repair_event_from_state_locked(
+            state,
+            observed_at,
+            fallback_event=fallback_event,
+        )
+        closed = self._close_current_odds_locked(resolved_id, observed_at)
+        return history_changed or current_changed or repaired or closed > 0
+
+    def persist_live_feed_batch(
+        self,
+        events: Iterable[LiveEvent],
+        observed_at: str,
+        *,
+        disappeared_ids: Iterable[str] = (),
+        now: datetime | None = None,
+        stale_prematch_grace_hours: float = 6.0,
+    ) -> dict[str, Any]:
+        """Persist one validated feed and reconciliation as one transaction."""
+
+        event_list = list(events)
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        disappeared = {str(value) for value in disappeared_ids}
+        changed_states = 0
+        history_states = 0
+        reconciled: list[str] = []
+        ignored: list[str] = []
+        stale_ids: list[str] = []
+        reconciliation_started = time.perf_counter()
+        with self.transaction(immediate=True):
+            candidate_ids = set(disappeared)
+            candidate_ids.update(str(event.event_id) for event in event_list)
+            if candidate_ids:
+                placeholders = ", ".join("?" for _ in candidate_ids)
+                current_rows = {
+                    str(row["event_id"]): row
+                    for row in self.connection.execute(
+                        f"SELECT * FROM current_event_state WHERE event_id IN ({placeholders})",
+                        sorted(candidate_ids),
+                    ).fetchall()
+                }
+            else:
+                current_rows = {}
+            accepted_ids: set[str] = set()
+            for event in event_list:
+                event_id = str(event.event_id)
+                previous = current_rows.get(event_id)
+                if not self._accept_live_event_after_state(
+                    previous,
+                    event,
+                    now=moment,
+                    grace_hours=stale_prematch_grace_hours,
+                ):
+                    ignored.append(event_id)
+                    continue
+                self._upsert_event_locked(event, observed_at)
+                state = state_from_event(event, observed_at)
+                history_states += int(self._record_event_state_if_changed_locked(state))
+                changed = self._upsert_current_event_state_locked(state)
+                changed_states += int(changed)
+                accepted_ids.add(event_id)
+                if _state_is_finished(state.status, state.period) or _state_is_no_longer_live(
+                    state.status, state.period
+                ):
+                    self._close_current_odds_locked(event_id, observed_at)
+
+            reconciliation_started = time.perf_counter()
+            for event_id in sorted(disappeared - accepted_ids):
+                if self._mark_event_no_longer_live_locked(event_id, observed_at):
+                    reconciled.append(event_id)
+
+            stale_ids = self._stale_pre_match_event_ids_locked(
+                now=moment,
+                grace_hours=stale_prematch_grace_hours,
+            )
+            for event_id in stale_ids:
+                if event_id not in reconciled and self._mark_event_no_longer_live_locked(
+                    event_id,
+                    observed_at,
+                ):
+                    reconciled.append(event_id)
+
+        return {
+            "changed_state_count": changed_states,
+            "history_state_count": history_states,
+            "reconciled_event_ids": reconciled,
+            "ignored_event_ids": ignored,
+            "stale_pre_match_event_ids": stale_ids,
+            "reconciliation_ms": (time.perf_counter() - reconciliation_started) * 1000.0,
+        }
 
     def upsert_current_strategy_state(self, values: Mapping[str, Any]) -> dict[str, Any]:
         """Persist current analysis and append only meaningful strategy transitions."""
@@ -3082,6 +3772,8 @@ class Database:
             "fotmob_daily_index",
             "fotmob_daily_load_runs",
             "fotmob_performance_profile",
+            "fotmob_coverage_catalog",
+            "tipico_market_capability",
         }
         if table not in allowed:
             raise ValueError(f"Unsupported table: {table}")
@@ -3089,108 +3781,264 @@ class Database:
             row = self.connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
             return int(row["count"]) if row else 0
 
-    def collection_metrics_for_date(self, date_text: str | None = None) -> dict[str, Any]:
-        """Return collector coverage counts for one UTC calendar date."""
+    def upsert_fotmob_coverage_catalog_rows(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+    ) -> int:
+        """Persist the derived FotMob league/season capability catalogue.
 
-        day = date_text or datetime.now(timezone.utc).date().isoformat()
+        This is deliberately an additive upsert.  Rebuilding the catalogue
+        must never remove the underlying historical index or archive rows.
+        """
+
+        values = list(rows)
+        if not values:
+            return 0
+        with self._lock, self.connection:
+            for row in values:
+                self.connection.execute(
+                    """
+                    INSERT INTO fotmob_coverage_catalog (
+                        provider, fotmob_league_id, country, league_name,
+                        season_id, season_label, observed_matches,
+                        detailed_matches, coverage_ratio, sample_size,
+                        last_checked, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(provider, fotmob_league_id, season_id) DO UPDATE SET
+                        country = COALESCE(excluded.country, fotmob_coverage_catalog.country),
+                        league_name = COALESCE(excluded.league_name, fotmob_coverage_catalog.league_name),
+                        season_label = COALESCE(excluded.season_label, fotmob_coverage_catalog.season_label),
+                        observed_matches = excluded.observed_matches,
+                        detailed_matches = excluded.detailed_matches,
+                        coverage_ratio = excluded.coverage_ratio,
+                        sample_size = excluded.sample_size,
+                        last_checked = excluded.last_checked,
+                        status = excluded.status
+                    """,
+                    (
+                        str(row.get("provider") or "FOTMOB").upper(),
+                        str(row.get("fotmob_league_id") or "unknown"),
+                        row.get("country"),
+                        row.get("league_name"),
+                        str(row.get("season_id") or ""),
+                        row.get("season_label"),
+                        max(0, int(row.get("observed_matches") or 0)),
+                        max(0, int(row.get("detailed_matches") or 0)),
+                        max(0.0, min(1.0, float(row.get("coverage_ratio") or 0.0))),
+                        max(0, int(row.get("sample_size") or 0)),
+                        str(row.get("last_checked") or _now_iso()),
+                        str(row.get("status") or "DISCOVERY").upper(),
+                    ),
+                )
+        return len(values)
+
+    def fotmob_coverage_catalog_rows(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT * FROM fotmob_coverage_catalog
+                    WHERE provider = 'FOTMOB'
+                    ORDER BY fotmob_league_id, season_id
+                    """
+                ).fetchall()
+            )
+
+    def upsert_tipico_market_capability_rows(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+    ) -> int:
+        """Persist derived per-competition strategy-market capability."""
+
+        values = list(rows)
+        if not values:
+            return 0
+        with self._lock, self.connection:
+            for row in values:
+                competition_id = str(row.get("competition_id") or "").strip()
+                if not competition_id:
+                    continue
+                self.connection.execute(
+                    """
+                    INSERT INTO tipico_market_capability (
+                        competition_id, competition_name, competition_country,
+                        observed_matches, matches_with_strategy_markets,
+                        coverage_ratio, last_checked, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(competition_id) DO UPDATE SET
+                        competition_name = excluded.competition_name,
+                        competition_country = COALESCE(
+                            excluded.competition_country,
+                            tipico_market_capability.competition_country
+                        ),
+                        observed_matches = excluded.observed_matches,
+                        matches_with_strategy_markets = excluded.matches_with_strategy_markets,
+                        coverage_ratio = excluded.coverage_ratio,
+                        last_checked = excluded.last_checked,
+                        status = excluded.status
+                    """,
+                    (
+                        competition_id,
+                        str(row.get("competition_name") or competition_id),
+                        row.get("competition_country"),
+                        max(0, int(row.get("observed_matches") or 0)),
+                        max(0, int(row.get("matches_with_strategy_markets") or 0)),
+                        max(0.0, min(1.0, float(row.get("coverage_ratio") or 0.0))),
+                        str(row.get("last_checked") or _now_iso()),
+                        str(row.get("status") or "DISCOVERY").upper(),
+                    ),
+                )
+        return len(values)
+
+    def tipico_market_capability_rows(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT * FROM tipico_market_capability
+                    ORDER BY competition_id
+                    """
+                ).fetchall()
+            )
+
+    def competition_provider_link_rows(
+        self,
+        provider: str = "FOTMOB",
+    ) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT * FROM competition_provider_links
+                    WHERE provider = ?
+                    ORDER BY internal_competition_id
+                    """,
+                    (str(provider).upper(),),
+                ).fetchall()
+            )
+
+    def collection_metrics_for_date(self, date_text: str | None = None) -> dict[str, Any]:
+        """Return collector coverage counts for one UTC calendar date.
+
+        Date predicates use half-open timestamp ranges so SQLite can use the
+        observed/seen indexes.  The normal status path may call this method
+        often; the collector adds a TTL cache above it.
+        """
+
+        day = str(date_text or datetime.now(timezone.utc).date().isoformat())
+        try:
+            day_start_dt = datetime.fromisoformat(f"{day}T00:00:00+00:00")
+        except ValueError:
+            day_start_dt = datetime.now(timezone.utc).replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            day = day_start_dt.date().isoformat()
+        day_start = day_start_dt.astimezone(timezone.utc).isoformat()
+        next_day = (day_start_dt + timedelta(days=1)).astimezone(timezone.utc).isoformat()
+        standard_types = (
+            "PRE_KICKOFF", "HALFTIME", "HT_STABLE", "MINUTE_60", "MINUTE_70",
+            "MINUTE_80", "FIRST_H2_GOAL_REOPEN", "MINUTE_85", "MINUTE_90", "FINAL",
+        )
+        standard_placeholders = ", ".join("?" for _ in standard_types)
         with self._lock:
             event_row = self.connection.execute(
                 """
                 SELECT COUNT(DISTINCT event_id) AS count
                 FROM events
-                WHERE (substr(first_seen_at, 1, 10) = ? OR substr(last_seen_at, 1, 10) = ?)
-                  AND lower(sport) = 'soccer'
+                WHERE ((first_seen_at >= ? AND first_seen_at < ?)
+                    OR (last_seen_at >= ? AND last_seen_at < ?))
+                  AND sport = 'soccer' COLLATE NOCASE
                 """,
-                (day, day),
+                (day_start, next_day, day_start, next_day),
             ).fetchone()
             competition_row = self.connection.execute(
                 """
                 SELECT COUNT(*) AS count FROM competitions
-                WHERE (substr(first_seen_at, 1, 10) = ? OR substr(last_seen_at, 1, 10) = ?)
+                WHERE ((first_seen_at >= ? AND first_seen_at < ?)
+                    OR (last_seen_at >= ? AND last_seen_at < ?))
                 """,
-                (day, day),
+                (day_start, next_day, day_start, next_day),
             ).fetchone()
             snapshot_rows = self.connection.execute(
                 """
-                SELECT snapshot_type, COUNT(*) AS count
+                SELECT snapshot_type,
+                       COUNT(*) AS count,
+                       COUNT(DISTINCT CASE
+                           WHEN COALESCE(snapshot_quality, '') != 'FAILED'
+                           THEN event_id END) AS good_event_count
                 FROM snapshots
-                WHERE substr(observed_at, 1, 10) = ?
+                WHERE observed_at >= ? AND observed_at < ?
                 GROUP BY snapshot_type
                 """,
-                (day,),
+                (day_start, next_day),
             ).fetchall()
-            coverage_rows = self.connection.execute(
-                """
-                SELECT snapshot_type, COUNT(DISTINCT event_id) AS count
+            snapshot_totals = self.connection.execute(
+                f"""
+                SELECT
+                    COUNT(DISTINCT CASE
+                        WHEN snapshot_type IN ('PREMATCH', 'PRE_KICKOFF')
+                         AND COALESCE(snapshot_quality, '') != 'FAILED'
+                        THEN event_id END) AS prematch_events,
+                    COUNT(DISTINCT CASE
+                        WHEN snapshot_type IN ('MINUTE_60', 'MINUTE_70', 'MINUTE_80',
+                                                'MINUTE_85', 'MINUTE_90')
+                         AND COALESCE(snapshot_quality, '') != 'FAILED'
+                        THEN event_id END) AS core_events,
+                    SUM(CASE WHEN snapshot_type IN ({standard_placeholders}) THEN 1 ELSE 0 END)
+                        AS total_standard,
+                    SUM(CASE WHEN snapshot_quality = 'FAILED' THEN 1 ELSE 0 END)
+                        AS failed_snapshots,
+                    (
+                        SELECT COUNT(*)
+                        FROM snapshots s2
+                        JOIN match_results r ON r.event_id = s2.event_id
+                        WHERE r.finished_at >= ? AND r.finished_at < ?
+                          AND s2.snapshot_type IN ({standard_placeholders})
+                    ) AS finished_standard
                 FROM snapshots
-                WHERE substr(observed_at, 1, 10) = ?
-                  AND COALESCE(snapshot_quality, '') != 'FAILED'
-                GROUP BY snapshot_type
+                WHERE observed_at >= ? AND observed_at < ?
                 """,
-                (day,),
-            ).fetchall()
-            prematch_events = self.connection.execute(
-                """
-                SELECT COUNT(DISTINCT event_id) AS count
-                FROM snapshots
-                WHERE substr(observed_at, 1, 10) = ?
-                  AND snapshot_type IN ('PREMATCH', 'PRE_KICKOFF')
-                  AND COALESCE(snapshot_quality, '') != 'FAILED'
-                """,
-                (day,),
-            ).fetchone()
-            core_events = self.connection.execute(
-                """
-                SELECT COUNT(DISTINCT event_id) AS count
-                FROM snapshots
-                WHERE substr(observed_at, 1, 10) = ?
-                  AND snapshot_type IN ('MINUTE_60', 'MINUTE_70', 'MINUTE_80',
-                                        'MINUTE_85', 'MINUTE_90')
-                  AND COALESCE(snapshot_quality, '') != 'FAILED'
-                """,
-                (day,),
-            ).fetchone()
-            failed_snapshots = self.connection.execute(
-                """
-                SELECT COUNT(*) AS count FROM snapshots
-                WHERE substr(observed_at, 1, 10) = ?
-                  AND snapshot_quality = 'FAILED'
-                """,
-                (day,),
+                [*standard_types, day_start, next_day, *standard_types, day_start, next_day],
             ).fetchone()
             matches_today = self.connection.execute(
-                "SELECT COUNT(*) AS count FROM match_results WHERE substr(finished_at, 1, 10) = ?",
-                (day,),
+                """
+                SELECT COUNT(*) AS count FROM match_results
+                WHERE finished_at >= ? AND finished_at < ?
+                """,
+                (day_start, next_day),
             ).fetchone()
             paper_today = self.connection.execute(
-                "SELECT COUNT(*) AS count FROM paper_trades WHERE substr(created_at, 1, 10) = ?",
-                (day,),
-            ).fetchone()
-            standard_types = (
-                "PRE_KICKOFF", "HALFTIME", "HT_STABLE", "MINUTE_60", "MINUTE_70",
-                "MINUTE_80", "FIRST_H2_GOAL_REOPEN", "MINUTE_85", "MINUTE_90", "FINAL",
-            )
-            standard_placeholders = ", ".join("?" for _ in standard_types)
-            total_snapshots = self.connection.execute(
-                f"""
-                SELECT COUNT(*) AS count FROM snapshots
-                WHERE substr(observed_at, 1, 10) = ?
-                  AND snapshot_type IN ({standard_placeholders})
+                """
+                SELECT COUNT(*) AS count FROM paper_trades
+                WHERE created_at >= ? AND created_at < ?
                 """,
-                [day, *standard_types],
+                (day_start, next_day),
             ).fetchone()
-            finished_snapshot_total = self.connection.execute(
-                f"""
-                SELECT COUNT(*) AS count
-                FROM snapshots s JOIN match_results r ON r.event_id = s.event_id
-                WHERE substr(r.finished_at, 1, 10) = ?
-                  AND s.snapshot_type IN ({standard_placeholders})
-                """,
-                [day, *standard_types],
+            outbox = self.connection.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM snapshot_outbox WHERE exported = 0) AS pending,
+                    (SELECT MAX(exported_at) FROM snapshots) AS last_export
+                """
             ).fetchone()
 
-        snapshot_counts = {str(row["snapshot_type"]): int(row["count"]) for row in snapshot_rows}
-        coverage = {str(row["snapshot_type"]): int(row["count"]) for row in coverage_rows}
+        snapshot_counts = {
+            str(row["snapshot_type"]): int(row["count"] or 0)
+            for row in snapshot_rows
+        }
+        coverage = {
+            str(row["snapshot_type"]): int(row["good_event_count"] or 0)
+            for row in snapshot_rows
+        }
+        total_standard = int(snapshot_totals["total_standard"] or 0) if snapshot_totals else 0
+        failed_count = int(snapshot_totals["failed_snapshots"] or 0) if snapshot_totals else 0
+        prematch_count = int(snapshot_totals["prematch_events"] or 0) if snapshot_totals else 0
+        core_count = int(snapshot_totals["core_events"] or 0) if snapshot_totals else 0
+        finished_standard = int(snapshot_totals["finished_standard"] or 0) if snapshot_totals else 0
+        matches_count = int(matches_today["count"] or 0) if matches_today else 0
         return {
             "date": day,
             "football_events_seen": int(event_row["count"]) if event_row else 0,
@@ -3211,24 +4059,22 @@ class Database:
             ),
             "goal_triggers": snapshot_counts.get("FIRST_H2_GOAL_REOPEN", 0),
             "final_snapshots": snapshot_counts.get("FINAL", 0),
-            "failed_snapshots": int(failed_snapshots["count"]) if failed_snapshots else 0,
-            "events_with_prematch_snapshot": int(prematch_events["count"])
-            if prematch_events
-            else 0,
+            "failed_snapshots": failed_count,
+            "events_with_prematch_snapshot": prematch_count,
             "events_with_halftime_snapshot": coverage.get("HALFTIME", 0),
-            "events_with_final_result": int(matches_today["count"]) if matches_today else 0,
-            "events_with_core_live_tracking": int(core_events["count"]) if core_events else 0,
-            "snapshots_today": int(total_snapshots["count"]) if total_snapshots else 0,
-            "matches_today": int(matches_today["count"]) if matches_today else 0,
+            "events_with_final_result": matches_count,
+            "events_with_core_live_tracking": core_count,
+            "snapshots_today": total_standard,
+            "matches_today": matches_count,
             "paper_trades_today": int(paper_today["count"]) if paper_today else 0,
             "average_snapshots_per_finished_match": (
-                float(finished_snapshot_total["count"])
-                / float(matches_today["count"])
-                if matches_today and matches_today["count"]
+                float(finished_standard)
+                / float(matches_count)
+                if matches_count
                 else 0.0
             ),
-            "outbox_pending": self._scalar_count("snapshot_outbox", "exported = 0"),
-            "last_parquet_export": self._max_value("snapshots", "exported_at"),
+            "outbox_pending": int(outbox["pending"] or 0) if outbox else 0,
+            "last_parquet_export": outbox["last_export"] if outbox else None,
         }
 
     def _scalar_count(self, table: str, clause: str = "1 = 1") -> int:
@@ -3300,27 +4146,13 @@ class Database:
             )
 
     def mark_event_no_longer_live(self, event_id: str, observed_at: str) -> bool:
-        """Keep historical data and add one state transition for a disappeared event."""
+        """Atomically reconcile one disappeared event without losing history."""
 
-        latest = self.current_event_state(event_id) or self.latest_event_state(event_id)
-        if latest is None or str(latest["status"]).upper() in {"FINISHED", "NO_LONGER_LIVE"}:
-            return False
-        state = EventState(
-            event_id=event_id,
-            observed_at=observed_at,
-            status="NO_LONGER_LIVE",
-            period="NO_LONGER_LIVE",
-            display_time="—",
-            section_number=latest["section_number"],
-            score_home=latest["score_home"],
-            score_away=latest["score_away"],
-            ht_score_home=latest["ht_score_home"],
-            ht_score_away=latest["ht_score_away"],
-            red_cards_home=latest["red_cards_home"],
-            red_cards_away=latest["red_cards_away"],
-            raw_state={"reason": "event_missing_from_live_feed"},
-        )
-        return self.upsert_current_event_state(state)
+        with self._lock, self.connection:
+            return self._mark_event_no_longer_live_locked(
+                str(event_id),
+                observed_at,
+            )
 
 
 def state_from_event(event: LiveEvent, observed_at: str) -> EventState:

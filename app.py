@@ -9,6 +9,8 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from config import Settings, configure_logging
+from fotmob.client import FotMobClient
+from fotmob.live import FotMobLiveService
 from fotmob.service import FotMobService
 from intelligence.service import MarketIntelligenceService
 from paper.service import PaperTradingService
@@ -30,6 +32,7 @@ from ui.time_format import current_munich_time, format_local_datetime, parse_dat
 from ui.upcoming import render_upcoming
 from ui.paper_trading import render_paper_trading
 from ui.fotmob import render_fotmob_debug, render_fotmob_tab
+from ui.fotmob_live import render_fotmob_live_panel
 
 
 @st.cache_resource(show_spinner=False)
@@ -42,6 +45,7 @@ def get_runtime(root_dir: str) -> tuple[
     MarketIntelligenceService,
     PaperTradingService,
     FotMobService,
+    FotMobLiveService,
 ]:
     settings = Settings.from_env(Path(root_dir))
     logger = configure_logging(settings)
@@ -82,6 +86,28 @@ def get_runtime(root_dir: str) -> tuple[
     )
     paper_service = PaperTradingService(database, settings, logger=logger)
     fotmob_service = FotMobService(settings, database, logger=logger)
+    # The live panel deliberately gets its own no-retry client.  Historical
+    # backfill and halftime enrichment keep their existing adaptive client;
+    # one UI refresh must never fan out into a retry burst.
+    fotmob_live_client = FotMobClient(
+        base_url=settings.fotmob_base_url,
+        api_base_url=settings.fotmob_api_base_url,
+        match_details_path=settings.fotmob_match_details_path,
+        timeout_seconds=settings.fotmob_timeout_seconds,
+        max_retries=0,
+        min_request_interval_seconds=0.0,
+        rate_mode="FIXED",
+        connection_pool_size=1,
+        logger=logger,
+    )
+    fotmob_live_service = FotMobLiveService(
+        fotmob_service,
+        client=fotmob_live_client,
+        cache_ttl_seconds=settings.fotmob_live_cache_ttl_seconds,
+        refresh_seconds=settings.fotmob_live_refresh_seconds,
+        pending_minute=settings.fotmob_live_pending_minute,
+        no_data_payload_threshold=settings.fotmob_live_no_data_payload_threshold,
+    )
     return (
         settings,
         event_service,
@@ -91,6 +117,7 @@ def get_runtime(root_dir: str) -> tuple[
         intelligence_service,
         paper_service,
         fotmob_service,
+        fotmob_live_service,
     )
 
 
@@ -123,6 +150,7 @@ def _load_selected_detail(
     database: Database,
     intelligence_service: MarketIntelligenceService,
     fotmob_service: FotMobService,
+    fotmob_live_service: FotMobLiveService,
 ) -> None:
     selected_id = st.session_state.get("selected_event_id")
     if not selected_id:
@@ -228,6 +256,7 @@ def _load_selected_detail(
             "analysis": "Analyse",
             "quotes": "Quoten",
             "fotmob": "FotMob",
+            "fotmob_live": "FotMob Live",
         }
         st.caption(
             "Ansicht geöffnet über: "
@@ -235,16 +264,37 @@ def _load_selected_detail(
         )
 
     if opening_intent == "quotes":
-        quotes_tab, analysis_tab, fotmob_tab, history_tab, raw_tab = st.tabs(
-            ["Alle Tipico Märkte", "Analyse", "FotMob HT", "Odds History", "Debug"]
+        quotes_tab, analysis_tab, fotmob_live_tab, fotmob_tab, history_tab, raw_tab = st.tabs(
+            [
+                "Alle Tipico Märkte",
+                "Analyse",
+                "FotMob Live",
+                "FotMob HT",
+                "Odds History",
+                "Debug",
+            ]
         )
-    elif opening_intent == "fotmob":
-        fotmob_tab, analysis_tab, quotes_tab, history_tab, raw_tab = st.tabs(
-            ["FotMob HT", "Analyse", "Alle Tipico Märkte", "Odds History", "Debug"]
+    elif opening_intent == "fotmob_live":
+        fotmob_live_tab, analysis_tab, fotmob_tab, quotes_tab, history_tab, raw_tab = st.tabs(
+            [
+                "FotMob Live",
+                "Analyse",
+                "FotMob HT",
+                "Alle Tipico Märkte",
+                "Odds History",
+                "Debug",
+            ]
         )
     else:
-        analysis_tab, fotmob_tab, quotes_tab, history_tab, raw_tab = st.tabs(
-            ["Analyse", "FotMob HT", "Alle Tipico Märkte", "Odds History", "Debug"]
+        analysis_tab, fotmob_live_tab, fotmob_tab, quotes_tab, history_tab, raw_tab = st.tabs(
+            [
+                "Analyse",
+                "FotMob Live",
+                "FotMob HT",
+                "Alle Tipico Märkte",
+                "Odds History",
+                "Debug",
+            ]
         )
 
     with analysis_tab:
@@ -262,6 +312,11 @@ def _load_selected_detail(
         from ui.market_view import render_markets
 
         render_markets(details)
+    with fotmob_live_tab:
+        render_fotmob_live_panel(
+            fotmob_live_service,
+            overview_event or details.event,
+        )
     with fotmob_tab:
         render_fotmob_tab(fotmob_service, details.event)
     with history_tab:
@@ -355,6 +410,7 @@ def main() -> None:
         intelligence_service,
         paper_service,
         fotmob_service,
+        fotmob_live_service,
     ) = get_runtime(str(root_dir))
 
     st.sidebar.title("Tipico Live Observer")
@@ -460,12 +516,14 @@ def main() -> None:
         database,
         intelligence_service,
         fotmob_service,
+        fotmob_live_service,
     )
 
     selected = render_live_overview(
         events,
         selected_event_id=st.session_state.get("selected_event_id"),
         fotmob_service=fotmob_service,
+        fotmob_live_service=fotmob_live_service,
     )
     if selected:
         st.session_state.selected_event_id = selected

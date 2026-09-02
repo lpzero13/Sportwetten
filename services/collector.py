@@ -34,6 +34,13 @@ from storage.repositories import MarketRepository
 from tipico.client import ApiResponse, RequestMetrics, TipicoApiError, TipicoClient
 from tipico.parser import parse_event_details, parse_upcoming_feed
 from services.event_service import EventService, EventRefreshResult
+from services.live_universe import (
+    LiveUniverse,
+    LiveUniverseDecision,
+    P2_DISCOVERY,
+    P3_MINIMAL,
+    P4_IGNORE,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checkers
     from fotmob.service import FotMobService
@@ -249,6 +256,16 @@ class Collector:
         # Optional enrichment is injected so Tipico collection remains fully
         # usable when FotMob is disabled, unavailable or policy-blocked.
         self.fotmob_service = fotmob_service
+        self.live_universe: LiveUniverse | None = None
+        if getattr(settings, "smart_universe_enabled", True):
+            try:
+                self.live_universe = LiveUniverse(
+                    database,
+                    settings,
+                    logger=self.logger,
+                )
+            except Exception as exc:  # policy is optional; feed collection is not
+                self.logger.warning("Smart live-universe disabled: %s", exc)
 
         self.feed_stats = RequestStats()
         self.prematch_stats = RequestStats()
@@ -272,10 +289,135 @@ class Collector:
         self._executor: ThreadPoolExecutor | None = None
         self._running = False
         self._last_archive_export_at: float | None = None
+        self._last_feed_result: EventRefreshResult | None = None
+        self._collection_metrics_cache: dict[str, Any] | None = None
+        self._collection_metrics_cache_at: float | None = None
+        self._collection_metrics_cache_day: str | None = None
+        self._collection_metrics_last_refresh: str | None = None
+        self._collection_metrics_runtime_ms = 0.0
+        self._archive_size_cache: int | None = None
+        self._archive_size_cache_at: float | None = None
+        self._universe_detail_requests_avoided = 0
+        self._fotmob_detail_requests_avoided = 0
+        self._last_universe_decisions: dict[str, LiveUniverseDecision] = {}
 
     @property
     def queue_depth(self) -> int:
         return len(self._queue) + len(self._futures)
+
+    def _queue_diagnostics(self) -> dict[str, Any]:
+        """Expose scheduled work separately from active work and real lateness."""
+
+        now = time.monotonic()
+        due_jobs = [item for item in self._queue if item[0] <= now]
+        future_jobs = [item for item in self._queue if item[0] > now]
+        all_jobs = [item[2] for item in self._queue]
+        all_jobs.extend(self._futures.values())
+        key_values = [job.key for job in all_jobs]
+        counts = Counter(job.snapshot_type for job in all_jobs)
+        oldest_due_age = (
+            max(0.0, now - min(item[0] for item in due_jobs))
+            if due_jobs
+            else 0.0
+        )
+        next_due = (
+            max(0.0, self._queue[0][0] - now)
+            if self._queue
+            else None
+        )
+        return {
+            "queue_depth": self.queue_depth,
+            "queue_due": len(due_jobs),
+            "queue_future": len(future_jobs),
+            "oldest_due_age_seconds": oldest_due_age,
+            "queue_by_snapshot_type": dict(sorted(counts.items())),
+            "queue_duplicate_keys": max(0, len(key_values) - len(set(key_values))),
+            "pending_key_count": len(self._pending_keys),
+            "next_due_in_seconds": next_due,
+        }
+
+    def _universe_decision(self, event: LiveEvent) -> LiveUniverseDecision | None:
+        if self.live_universe is None:
+            return None
+        try:
+            decision = self.live_universe.decide(event)
+        except Exception as exc:  # never make a capability read stop polling
+            self.logger.warning(
+                "Smart live-universe decision failed: event=%s reason=%s",
+                event.event_id,
+                exc,
+            )
+            return None
+        self._last_universe_decisions[event.event_id] = decision
+        return decision
+
+    def _invalidate_collection_metrics_cache(self) -> None:
+        self._collection_metrics_cache = None
+        self._collection_metrics_cache_at = None
+        self._collection_metrics_cache_day = None
+
+    def _archive_size(self, *, force_refresh: bool = False) -> tuple[int, float | None, bool]:
+        """Avoid recursively stat'ing the whole archive on every status write."""
+
+        now = time.monotonic()
+        age = (
+            max(0.0, now - self._archive_size_cache_at)
+            if self._archive_size_cache_at is not None
+            else None
+        )
+        ttl = max(
+            1.0,
+            float(getattr(self.settings, "collection_metrics_cache_ttl_seconds", 30.0)),
+        )
+        cached = (
+            not force_refresh
+            and self._archive_size_cache is not None
+            and age is not None
+            and age < ttl
+        )
+        if not cached:
+            self._archive_size_cache = int(self.archive.total_size_bytes)
+            self._archive_size_cache_at = time.monotonic()
+            age = 0.0
+        return int(self._archive_size_cache or 0), age, cached
+
+    def _collection_metrics(self, *, force_refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+        now = time.monotonic()
+        day = datetime.now(timezone.utc).date().isoformat()
+        ttl = max(
+            0.0,
+            float(getattr(self.settings, "collection_metrics_cache_ttl_seconds", 30.0)),
+        )
+        age = (
+            max(0.0, now - self._collection_metrics_cache_at)
+            if self._collection_metrics_cache_at is not None
+            else None
+        )
+        cached = (
+            not force_refresh
+            and self._collection_metrics_cache is not None
+            and self._collection_metrics_cache_day == day
+            and age is not None
+            and age < ttl
+        )
+        if not cached:
+            started = time.perf_counter()
+            metrics = self.database.collection_metrics_for_date(day)
+            self._collection_metrics_runtime_ms = (time.perf_counter() - started) * 1000.0
+            self._collection_metrics_cache = dict(metrics)
+            self._collection_metrics_cache_day = str(metrics.get("date") or day)
+            self._collection_metrics_cache_at = time.monotonic()
+            self._collection_metrics_last_refresh = _now_iso()
+            age = 0.0
+        else:
+            metrics = dict(self._collection_metrics_cache)
+            age = max(0.0, time.monotonic() - float(self._collection_metrics_cache_at))
+        return metrics, {
+            "collection_metrics_age_seconds": age,
+            "collection_metrics_cached": cached,
+            "collection_metrics_last_refresh": self._collection_metrics_last_refresh,
+            "collection_metrics_runtime_ms": self._collection_metrics_runtime_ms,
+        }
 
     def _record_error(self, message: str) -> None:
         self.errors.append(f"{_now_iso()} {message}")
@@ -324,6 +466,7 @@ class Collector:
     def _poll_feed(self) -> EventRefreshResult:
         previous_events = dict(self._observed_events)
         result = self.event_service.refresh()
+        self._last_feed_result = result
         self._last_feed_poll_at = time.monotonic()
         self.feed_stats.record(
             result.metrics,
@@ -337,6 +480,12 @@ class Collector:
 
         current_events = {event.event_id: event for event in result.events}
         for event_id, event in current_events.items():
+            decision = self._universe_decision(event)
+            if decision is not None and decision.priority in {P3_MINIMAL, P4_IGNORE}:
+                # Keep the complete feed in the radar and in current state;
+                # only expensive detail scheduling is skipped.
+                self._universe_detail_requests_avoided += 1
+                continue
             previous = previous_events.get(event_id)
             state = self._event_states.setdefault(event_id, CollectorEventState())
             observed_at = result.metrics.response_received_at if result.metrics else _now_iso()
@@ -428,6 +577,18 @@ class Collector:
         service = self.fotmob_service
         if service is None or not getattr(service, "automated_worker_allowed", False):
             return
+        decision = self._universe_decision(event)
+        if decision is not None and not decision.fotmob_probe_allowed:
+            self._fotmob_detail_requests_avoided += 1
+            return
+        if (
+            decision is not None
+            and decision.priority == P2_DISCOVERY
+            and self.live_universe is not None
+            and not self.live_universe.discovery_probe_due(event)
+        ):
+            self._fotmob_detail_requests_avoided += 1
+            return
         try:
             resolved = self._resolve_fotmob_link(event)
             if resolved is None:
@@ -515,11 +676,16 @@ class Collector:
             # Keep the pre-match event/competition metadata available even
             # before the first detail snapshot is due.
             self.event_service.repository.save_observation(event, observed_at)
-            self._resolve_fotmob_link(event)
+            decision = self._universe_decision(event)
+            if decision is None or decision.priority not in {P3_MINIMAL, P4_IGNORE}:
+                self._resolve_fotmob_link(event)
             if not event.kickoff_time or event.status.strip().lower() not in {
                 "pre_match",
                 "prematch",
             }:
+                continue
+            if decision is not None and decision.priority in {P3_MINIMAL, P4_IGNORE}:
+                self._universe_detail_requests_avoided += 1
                 continue
             try:
                 kickoff = datetime.fromisoformat(event.kickoff_time.replace("Z", "+00:00"))
@@ -774,6 +940,7 @@ class Collector:
         created = created_outbox
         if created:
             self.snapshot_counts[job.snapshot_type] += 1
+            self._invalidate_collection_metrics_cache()
         if job.snapshot_type == "FINAL":
             self._persist_match_result(details.event, observed_at, snapshot)
         if job.snapshot_type == "HALFTIME" and self.settings.raw_at_halftime:
@@ -1029,6 +1196,8 @@ class Collector:
             batch_size=self.settings.snapshot_outbox_batch_size,
         )
         self._last_archive_export_at = now
+        self._archive_size_cache = None
+        self._archive_size_cache_at = None
         if int(result.get("errors") or 0):
             self._record_error(f"Parquet export reported {result['errors']} error(s)")
         service = self.fotmob_service
@@ -1042,15 +1211,40 @@ class Collector:
             except Exception as exc:  # optional sink must not stop collection
                 self._record_error(f"FotMob Parquet export failed: {exc}")
 
-    def status(self) -> dict:
-        started = self._started_at
-        return {
+    def status(self, *, force_refresh: bool = False) -> dict:
+        status_started = time.perf_counter()
+        queue = self._queue_diagnostics()
+        coverage, coverage_meta = self._collection_metrics(force_refresh=force_refresh)
+        archive_size, archive_age, archive_cached = self._archive_size(
+            force_refresh=force_refresh
+        )
+        universe_summary: dict[str, Any]
+        if self.live_universe is None:
+            universe_summary = {
+                "enabled": False,
+                "total_live_events": len(self._observed_events),
+            }
+        else:
+            universe_summary = self.live_universe.summary(self._observed_events.values())
+            universe_summary.update(
+                {
+                    "tipico_detail_requests_avoided": self._universe_detail_requests_avoided,
+                    "fotmob_detail_requests_avoided": self._fotmob_detail_requests_avoided,
+                }
+            )
+
+        result = {
             "status": "RUNNING" if self._running else "COMPLETED",
-            "started_at": started,
+            "started_at": self._started_at,
             "finished_at": self._finished_at,
             "updated_at": _now_iso(),
-            "queue_depth": self.queue_depth,
+            "queue_depth": queue["queue_depth"],
+            "queue_due": queue["queue_due"],
+            "queue_future": queue["queue_future"],
+            "oldest_due_age_seconds": queue["oldest_due_age_seconds"],
+            "queue_by_snapshot_type": queue["queue_by_snapshot_type"],
             "active_detail_requests": len(self._futures),
+            "queue": queue,
             "snapshot_counts": dict(self.snapshot_counts),
             "retries": self.retries,
             "reopens_detected": self.reopens_detected,
@@ -1060,13 +1254,57 @@ class Collector:
             "detail": self.detail_stats.summary(),
             "archive": {
                 "path": str(self.archive.snapshot_root),
-                "size_bytes": self.archive.total_size_bytes,
+                "size_bytes": archive_size,
+                "size_age_seconds": archive_age,
+                "size_cached": archive_cached,
                 "last_export_at": self.archive.last_export_at,
                 "last_error": self.archive.last_error,
                 "pending": self.database.count_rows("snapshot_outbox"),
             },
-            "coverage": self.database.collection_metrics_for_date(),
+            "coverage": coverage,
+            "collection_metrics_age_seconds": coverage_meta["collection_metrics_age_seconds"],
+            "collection_metrics_cached": coverage_meta["collection_metrics_cached"],
+            "collection_metrics_last_refresh": coverage_meta["collection_metrics_last_refresh"],
+            "event_service": {
+                "startup_reconciliation_done": bool(
+                    getattr(self.event_service, "_startup_reconciliation_done", False)
+                ),
+                "plausibility_errors": int(
+                    getattr(self.event_service, "plausibility_error_count", 0)
+                ),
+                "persistence_errors": int(
+                    getattr(self.event_service, "persistence_error_count", 0)
+                ),
+                "last_timing_ms": dict(getattr(self.event_service, "last_timing", {})),
+                "last_sql_metrics": dict(getattr(self.event_service, "last_sql_metrics", {})),
+            },
+            "smart_live_universe": universe_summary,
+            "timings_ms": {
+                "feed_network": (
+                    self._last_feed_result.network_ms
+                    if self._last_feed_result is not None
+                    else 0.0
+                ),
+                "feed_parse": (
+                    self._last_feed_result.parse_ms
+                    if self._last_feed_result is not None
+                    else 0.0
+                ),
+                "event_persistence": (
+                    self._last_feed_result.persistence_ms
+                    if self._last_feed_result is not None
+                    else 0.0
+                ),
+                "reconciliation": (
+                    self._last_feed_result.reconciliation_ms
+                    if self._last_feed_result is not None
+                    else 0.0
+                ),
+                "collection_metrics": coverage_meta["collection_metrics_runtime_ms"],
+            },
         }
+        result["status_runtime_ms"] = (time.perf_counter() - status_started) * 1000.0
+        return result
 
     def _write_status(self, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -1076,7 +1314,7 @@ class Collector:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(
-            json.dumps(self.status(), ensure_ascii=False, indent=2) + "\n",
+            json.dumps(self.status(force_refresh=force), ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
         temporary.replace(path)
@@ -1136,7 +1374,7 @@ class Collector:
                 self._executor.shutdown(wait=True)
                 self._executor = None
             self._write_status(force=True)
-        return self.status()
+        return self.status(force_refresh=True)
 
     def run_forever(
         self,
@@ -1179,4 +1417,4 @@ class Collector:
                 self._executor.shutdown(wait=True)
                 self._executor = None
             self._write_status(force=True)
-        return self.status()
+        return self.status(force_refresh=True)

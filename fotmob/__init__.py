@@ -22,6 +22,14 @@ from .canonical import (
     CANONICAL_SHOTS_SCHEMA_VERSION,
     FotMobCanonicalArchive,
 )
+from .live import (
+    ACCEPTED_LINK_STATUSES,
+    FotMobLiveData,
+    FotMobManualBindingResult,
+    FotMobLiveResult,
+    FotMobLiveService,
+    normalize_live_match,
+)
 
 __all__ = [
     "FOTMOB_SNAPSHOT_TYPES",
@@ -37,4 +45,10 @@ __all__ = [
     "CANONICAL_PERIOD_STATS_SCHEMA_VERSION",
     "CANONICAL_SHOTS_SCHEMA_VERSION",
     "FotMobCanonicalArchive",
+    "ACCEPTED_LINK_STATUSES",
+    "FotMobLiveData",
+    "FotMobManualBindingResult",
+    "FotMobLiveResult",
+    "FotMobLiveService",
+    "normalize_live_match",
 ]

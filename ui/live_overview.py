@@ -18,11 +18,13 @@ def _select_event(event_id: str, intent: str) -> None:
 
 
 def _fotmob_data_available(service: Any, event_id: str) -> bool:
-    """Check for already persisted FotMob current data without a network call."""
+    """Check for a confirmed link without starting a provider request."""
 
     if service is None:
         return False
     try:
+        if hasattr(service, "has_confirmed_link_for_tipico_event"):
+            return bool(service.has_confirmed_link_for_tipico_event(event_id))
         return bool(service.has_current_state_for_tipico_event(event_id))
     except (AttributeError, KeyError, TypeError):
         # The live overview must remain usable if the optional provider store
@@ -35,6 +37,7 @@ def render_live_overview(
     *,
     selected_event_id: str | None = None,
     fotmob_service: Any | None = None,
+    fotmob_live_service: Any | None = None,
 ) -> str | None:
     """Render every supplied event grouped by Tipico competition."""
 
@@ -95,20 +98,34 @@ def render_live_overview(
                     args=(event.event_id, "analysis"),
                 ):
                     selected = event.event_id
-                fotmob_available = _fotmob_data_available(fotmob_service, event.event_id)
+                link_service = fotmob_live_service or fotmob_service
+                fotmob_available = _fotmob_data_available(link_service, event.event_id)
+                fotmob_live_usable = bool(
+                    fotmob_live_service is not None
+                    and getattr(fotmob_live_service, "enabled", False)
+                    and getattr(fotmob_live_service, "manual_use_allowed", False)
+                )
                 if columns[6].button(
-                    "FotMob",
+                    "FotMob Live",
                     key=f"fotmob-event-{event.event_id}",
                     width="stretch",
                     type="secondary",
-                    disabled=not fotmob_available,
+                    # Open the selected-match panel even without a persisted
+                    # link; the panel can then validate an explicitly
+                    # supplied FotMob ID without scanning other events.
+                    disabled=not (fotmob_available or fotmob_live_usable),
                     help=(
-                        "Öffnet die gespeicherten FotMob-Daten."
+                        "Öffnet die flüchtigen FotMob-Live-Daten für dieses Spiel."
                         if fotmob_available
-                        else "Für dieses Event sind noch keine FotMob-Daten gespeichert."
+                        else (
+                            "Für dieses Event ist noch keine bestätigte Zuordnung vorhanden. "
+                            "Im Livepanel kann eine FotMob-Match-ID gezielt geprüft werden."
+                            if fotmob_live_usable
+                            else "FotMob-Live-Daten sind aktuell nicht verfügbar."
+                        )
                     ),
                     on_click=_select_event,
-                    args=(event.event_id, "fotmob"),
+                    args=(event.event_id, "fotmob_live"),
                 ):
                     selected = event.event_id
     return selected
