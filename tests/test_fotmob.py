@@ -332,7 +332,13 @@ def test_provider_policy_disables_automatic_worker_but_keeps_explicit_service_ca
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "data" / "tipico.db")
-    settings = Settings(root_dir=tmp_path, fotmob_enabled=True)
+    settings = Settings(
+        root_dir=tmp_path,
+        fotmob_enabled=True,
+        fotmob_network_mode="manual",
+        fotmob_provider_decision="LIMITED_USE",
+        fotmob_automated_usage="UNCLEAR",
+    )
     service = FotMobService(settings, database, client=FakeFotMobClient(None, fail=True))
     assert service.provider_decision == "LIMITED_USE"
     assert service.automated_usage == "UNCLEAR"

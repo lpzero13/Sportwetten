@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
@@ -78,6 +79,35 @@ def render_data_collection(
         )
     else:
         st.caption(f"Collector-Status: {status_label}")
+
+    runtime_warnings = status.get("runtime_warnings", [])
+    if runtime_warnings:
+        st.warning("Runtime-Warnungen: " + " · ".join(str(item) for item in runtime_warnings))
+    matrix = status.get("feature_runtime_matrix", [])
+    if matrix:
+        with st.expander("Feature Runtime Matrix", expanded=bool(runtime_warnings)):
+            st.dataframe(
+                [
+                    {
+                        "Feature": item.get("feature"),
+                        "Konfiguriert": "AN" if item.get("configured_enabled") else "AUS",
+                        "Effektiv": "AN" if item.get("effective_enabled") else "AUS",
+                        "Blocking Gate": item.get("blocking_gate") or "—",
+                        "Grund": item.get("reason") or "—",
+                    }
+                    for item in matrix
+                    if isinstance(item, dict)
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+    identity = status.get("runtime", {}) or {}
+    if identity:
+        st.caption(
+            f"Version {identity.get('app_version', status.get('app_version', '—'))} · "
+            f"Commit {str(identity.get('git_commit', status.get('git_commit', '—')))[:12]} · "
+            f"Config {str(identity.get('config_fingerprint', status.get('config_fingerprint', '—')))[:19]}"
+        )
 
     columns = st.columns(4)
     columns[0].metric("Events heute", coverage["football_events_seen"])
@@ -170,7 +200,10 @@ def render_data_collection(
     db_size = database.database_size_bytes
     parquet_size = archive.total_size_bytes
     raw_size = _directory_size_bytes(settings.raw_storage_path)
-    today = str(coverage["date"])
+    today = str(
+        coverage.get("date")
+        or datetime.now(timezone.utc).date().isoformat()
+    )
     archive_today = archive.size_for_date(today)
     raw_today = _directory_size_bytes(settings.raw_storage_path / today)
     growth_today = archive_today + raw_today

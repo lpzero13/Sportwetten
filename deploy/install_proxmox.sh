@@ -29,7 +29,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y python3 python3-venv python3-pip ca-certificates git
+apt-get install -y python3 python3-venv python3-pip ca-certificates git logrotate
 
 if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
     groupadd --system "$SERVICE_GROUP"
@@ -62,6 +62,15 @@ chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$INSTALL_DIR/data" "$INSTALL_DIR/logs
 chmod -R g+rwX "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
 chown -R "$SERVICE_USER":"$SERVICE_GROUP" /var/lib/wetten
 chmod -R g+rwX /var/lib/wetten
+
+# Older installations used /var/log/wetten/tipico.log.  Keep that path
+# readable/rotatable as well, so an existing deployment cannot remain stuck
+# behind the historical `Permission denied` error after the upgrade.
+install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 /var/log/wetten
+if [[ -e /var/log/wetten/tipico.log ]]; then
+    chown "$SERVICE_USER":"$SERVICE_GROUP" /var/log/wetten/tipico.log
+    chmod 0640 /var/log/wetten/tipico.log
+fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
     install -D -m 0640 -o root -g "$SERVICE_GROUP" \
@@ -105,16 +114,30 @@ sed \
     "$INSTALL_DIR/deploy/wetten-fotmob.service" \
     > /etc/systemd/system/wetten-fotmob.service
 
-# Reconcile the V0.5.4 manual FotMob flags even when an older env file already
-# exists.  The helper keeps a timestamped backup and never enables the worker.
+# Reconcile the V0.5.9.1 production FotMob flags even when an older env file
+# already exists.  The helper keeps a timestamped backup and keeps the
+# standalone worker disabled because the collector owns the integrated path.
 TIPICO_SKIP_SERVICE_RESTART=1 bash "$INSTALL_DIR/deploy/activate_fotmob.sh" "$ENV_FILE"
+
+# Rotate the application log as the same service user that owns the log
+# directory.  This avoids the historical `Permission denied` failure when
+# logrotate runs with its default user switching rules.
+sed \
+    -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
+    -e "s|__SERVICE_USER__|$SERVICE_USER|g" \
+    -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
+    "$INSTALL_DIR/deploy/wetten.logrotate" \
+    > /etc/logrotate.d/wetten
+chown root:root /etc/logrotate.d/wetten
+chmod 0644 /etc/logrotate.d/wetten
 
 # V0.3 service names are retired in favour of the explicit V0.4 names.
 systemctl disable --now tipico-observer.service tipico-collector.service 2>/dev/null || true
 
 systemctl daemon-reload
-# The V0.5.4 date-range import is started from the dashboard.  Keep the
-# legacy/polling FotMob service disabled; no permanent FotMob worker is needed.
+# The integrated collector owns the FotMob production path.  Keep the
+# standalone/polling FotMob service disabled; a second worker would duplicate
+# provider requests and create conflicting state.
 systemctl disable --now wetten-fotmob.service 2>/dev/null || true
 systemctl enable wetten-ui.service wetten-collector.service wetten-paper.service wetten-cleanup.timer
 systemctl restart wetten-ui.service

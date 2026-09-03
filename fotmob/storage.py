@@ -1181,6 +1181,16 @@ class FotMobStore:
                 "ht_stats": conn.execute(
                     "SELECT COUNT(*) AS n FROM match_data_quality WHERE fotmob_ht_stats_available = 1 AND substr(updated_at, 1, 10) = ?", (day,)
                 ).fetchone(),
+                "enhanced_ml_allowed_count": conn.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM match_data_quality
+                    WHERE fotmob_matched = 1
+                      AND fotmob_ht_stats_available = 1
+                      AND substr(updated_at, 1, 10) = ?
+                    """,
+                    (day,),
+                ).fetchone(),
                 "xg_available": conn.execute(
                     "SELECT COUNT(*) AS n FROM fotmob_current_state WHERE xg_home IS NOT NULL AND xg_away IS NOT NULL AND substr(updated_at, 1, 10) = ?", (day,)
                 ).fetchone(),

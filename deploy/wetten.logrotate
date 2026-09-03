@@ -1,0 +1,14 @@
+# Installed by deploy/install_proxmox.sh.  The service user owns both the
+# parent directory and the file, so rotation does not require access-control
+# exceptions or a privileged write to the application log.
+__INSTALL_DIR__/logs/tipico.log /var/log/wetten/tipico.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su __SERVICE_USER__ __SERVICE_GROUP__
+    create 0640 __SERVICE_USER__ __SERVICE_GROUP__
+}

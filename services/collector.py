@@ -33,6 +33,13 @@ from storage.raw_storage import RawStorage
 from storage.repositories import MarketRepository
 from tipico.client import ApiResponse, RequestMetrics, TipicoApiError, TipicoClient
 from tipico.parser import parse_event_details, parse_upcoming_feed
+from runtime_status import (
+    config_fingerprint,
+    feature_health,
+    feature_runtime_matrix,
+    runtime_identity,
+    runtime_warnings,
+)
 from services.event_service import EventService, EventRefreshResult
 from services.live_universe import (
     LiveUniverse,
@@ -61,6 +68,18 @@ FINISHED_STATUSES = {"finished", "ended", "complete", "completed", "final"}
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _iso_age_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds())
 
 
 def _parse_minute(value: str | None) -> int | None:
@@ -273,6 +292,8 @@ class Collector:
         self.snapshot_counts: Counter[str] = Counter()
         self.retries = 0
         self.reopens_detected = 0
+        self.halftime_disappearance_count = 0
+        self.halftime_recovery_count = 0
         self.errors: deque[str] = deque(maxlen=50)
         self._event_states: dict[str, CollectorEventState] = {}
         self._observed_events: dict[str, LiveEvent] = {}
@@ -301,6 +322,17 @@ class Collector:
         self._fotmob_detail_requests_avoided = 0
         self._last_universe_decisions: dict[str, LiveUniverseDecision] = {}
         self._fotmob_link_resolution_results: dict[str, Any] = {}
+        self._halftime_missing_events: dict[str, str] = {}
+        self._runtime_identity = runtime_identity(settings.root_dir)
+        self._config_fingerprint = config_fingerprint(settings)
+        startup_matrix = feature_runtime_matrix(
+            self.settings,
+            fotmob_service=self.fotmob_service,
+            database=self.database,
+        )
+        self._startup_runtime_warnings = runtime_warnings(startup_matrix)
+        for warning in self._startup_runtime_warnings:
+            self.logger.warning("Runtime-Gate beim Collectorstart: %s", warning)
 
     @property
     def queue_depth(self) -> int:
@@ -480,9 +512,21 @@ class Collector:
             return result
 
         current_events = {event.event_id: event for event in result.events}
+        # A valid provider response may temporarily omit a match exactly at
+        # the halftime transition.  Count the observation and keep the ID in
+        # memory so a later reappearance is visible, without inventing a
+        # grace window that could hide a genuine end-of-live transition.
+        for event_id in result.reconciled_event_ids:
+            previous = previous_events.get(str(event_id))
+            if previous is not None and _is_halftime(previous):
+                self.halftime_disappearance_count += 1
+                self._halftime_missing_events[str(event_id)] = _now_iso()
         for event_id, event in current_events.items():
             decision = self._universe_decision(event)
             previous = previous_events.get(event_id)
+            if event_id in self._halftime_missing_events:
+                self.halftime_recovery_count += 1
+                self._halftime_missing_events.pop(event_id, None)
             if decision is not None and decision.priority in {P3_MINIMAL, P4_IGNORE}:
                 # Keep the complete feed in the radar and in current state;
                 # only expensive detail scheduling is skipped.
@@ -1258,6 +1302,137 @@ class Collector:
         archive_size, archive_age, archive_cached = self._archive_size(
             force_refresh=force_refresh
         )
+        matrix = feature_runtime_matrix(
+            self.settings,
+            fotmob_service=self.fotmob_service,
+            database=self.database,
+        )
+        health = feature_health(matrix)
+        warnings = runtime_warnings(matrix)
+        fotmob_runtime: dict[str, Any] = {}
+        if self.fotmob_service is not None:
+            fotmob_runtime.update(
+                getattr(self.fotmob_service, "runtime_metrics", lambda: {})()
+            )
+            fotmob_runtime.update(
+                getattr(
+                    getattr(self.fotmob_service, "history_pipeline", None),
+                    "runtime_metrics",
+                    lambda: {},
+                )()
+            )
+            try:
+                fotmob_runtime["enhanced_ml_allowed_count"] = int(
+                    self.fotmob_service.store.metrics_for_date().get(
+                        "enhanced_ml_allowed_count",
+                        0,
+                    )
+                    or 0
+                )
+            except (AttributeError, TypeError, ValueError):
+                fotmob_runtime["enhanced_ml_allowed_count"] = 0
+        outbox = (
+            self.database.snapshot_outbox_status()
+            if hasattr(self.database, "snapshot_outbox_status")
+            else {
+                "pending": self.database.count_rows("snapshot_outbox"),
+                "oldest_created_at": None,
+                "last_export_at": None,
+                "last_error": None,
+            }
+        )
+        last_success = {
+            "last_fotmob_daily_index_success": fotmob_runtime.get(
+                "last_fotmob_daily_index_success"
+            ),
+            "last_auto_link_success": fotmob_runtime.get("last_auto_link_success"),
+            "last_fotmob_detail_success": fotmob_runtime.get(
+                "last_fotmob_detail_success"
+            ),
+            "last_ht_enrichment_success": fotmob_runtime.get(
+                "last_ht_enrichment_success"
+            ),
+            "last_archive_export_success": fotmob_runtime.get(
+                "last_archive_export_success"
+            ),
+        }
+        health_aliases = {
+            "fotmob_daily_index": "last_fotmob_daily_index_success",
+            "fotmob_auto_link": "last_auto_link_success",
+            "fotmob_selected_live": "last_fotmob_detail_success",
+            "fotmob_ht_enrichment": "last_ht_enrichment_success",
+            "archive_export": "last_archive_export_success",
+        }
+        for feature, timestamp_key in health_aliases.items():
+            if feature in health and last_success[timestamp_key]:
+                health[feature]["last_success_at"] = last_success[timestamp_key]
+        effective_config = {
+            "fotmob_enabled": bool(
+                getattr(
+                    self.fotmob_service,
+                    "enabled",
+                    getattr(self.settings, "fotmob_enabled", False),
+                )
+            ),
+            "fotmob_network_mode": str(
+                getattr(self.settings, "fotmob_network_mode", "off")
+            ),
+            "fotmob_automatic_link_effective": bool(
+                next(
+                    (
+                        item["effective_enabled"]
+                        for item in matrix
+                        if item["feature"] == "fotmob_auto_link"
+                    ),
+                    False,
+                )
+            ),
+            "fotmob_ht_enrichment_effective": bool(
+                next(
+                    (
+                        item["effective_enabled"]
+                        for item in matrix
+                        if item["feature"] == "fotmob_ht_enrichment"
+                    ),
+                    False,
+                )
+            ),
+            "fotmob_live_effective": bool(
+                next(
+                    (
+                        item["effective_enabled"]
+                        for item in matrix
+                        if item["feature"] == "fotmob_selected_live"
+                    ),
+                    False,
+                )
+            ),
+        }
+        fotmob_status = {
+            "enabled": bool(getattr(self.settings, "fotmob_enabled", False)),
+            "network_mode": str(getattr(self.settings, "fotmob_network_mode", "off")),
+            "provider_decision": str(
+                getattr(self.settings, "fotmob_provider_decision", "")
+            ),
+            "automated_usage": str(
+                getattr(self.settings, "fotmob_automated_usage", "")
+            ),
+            "automated_worker_allowed": bool(
+                getattr(
+                    self.fotmob_service,
+                    "automated_worker_allowed",
+                    next(
+                        (
+                            item["effective_enabled"]
+                            for item in matrix
+                            if item["feature"] == "fotmob_auto_link"
+                        ),
+                        False,
+                    ),
+                )
+            ),
+            **fotmob_runtime,
+        }
         universe_summary: dict[str, Any]
         if self.live_universe is None:
             universe_summary = {
@@ -1273,8 +1448,21 @@ class Collector:
                 }
             )
 
+        base_status = "RUNNING" if self._running else "COMPLETED"
         result = {
-            "status": "RUNNING" if self._running else "COMPLETED",
+            "status": f"{base_status}_DEGRADED" if warnings else base_status,
+            "app_version": self._runtime_identity["app_version"],
+            "git_commit": self._runtime_identity["git_commit"],
+            "git_branch": self._runtime_identity["git_branch"],
+            "working_tree_dirty": self._runtime_identity["working_tree_dirty"],
+            "build_time": self._runtime_identity["build_time"],
+            "deploy_time": self._runtime_identity["deploy_time"],
+            "config_fingerprint": self._config_fingerprint,
+            "runtime": dict(self._runtime_identity) | {
+                "config_fingerprint": self._config_fingerprint,
+                "effective_config": effective_config,
+            },
+            "effective_config": effective_config,
             "started_at": self._started_at,
             "finished_at": self._finished_at,
             "updated_at": _now_iso(),
@@ -1288,7 +1476,31 @@ class Collector:
             "snapshot_counts": dict(self.snapshot_counts),
             "retries": self.retries,
             "reopens_detected": self.reopens_detected,
+            "halftime_disappearance_count": self.halftime_disappearance_count,
+            "halftime_recovery_count": self.halftime_recovery_count,
+            "halftime_missing_events": len(self._halftime_missing_events),
             "errors": list(self.errors),
+            "startup_runtime_warnings": list(self._startup_runtime_warnings),
+            "runtime_warnings": warnings,
+            "feature_runtime_matrix": matrix,
+            "feature_health": health,
+            "last_success": last_success,
+            **last_success,
+            "deployment_consistency": {
+                "integrated_collector_owns_fotmob": True,
+                "separate_fotmob_worker_expected": False,
+                "separate_fotmob_worker_effective": False,
+                "fotmob_enabled": bool(getattr(self.settings, "fotmob_enabled", False)),
+                "fotmob_network_mode": str(getattr(self.settings, "fotmob_network_mode", "off")),
+                "fotmob_provider_decision": str(getattr(self.settings, "fotmob_provider_decision", "")),
+                "fotmob_automated_usage": str(getattr(self.settings, "fotmob_automated_usage", "")),
+            },
+            "validation_canary": {
+                "UNIT": "NOT_RUN",
+                "INTEGRATION": "NOT_RUN",
+                "LOCAL_PROVIDER": "NOT_RUN",
+                "CT110_LIVE_CANARY": "PENDING",
+            },
             "feed": self.feed_stats.summary(),
             "prematch": self.prematch_stats.summary(),
             "detail": self.detail_stats.summary(),
@@ -1299,8 +1511,16 @@ class Collector:
                 "size_cached": archive_cached,
                 "last_export_at": self.archive.last_export_at,
                 "last_error": self.archive.last_error,
-                "pending": self.database.count_rows("snapshot_outbox"),
+                "pending": int(outbox.get("pending") or 0),
+                "oldest_outbox_age_seconds": _iso_age_seconds(outbox.get("oldest_created_at")),
+                "last_export_at_db": outbox.get("last_export_at"),
+                "last_export_error": outbox.get("last_error"),
             },
+            "outbox_pending": int(outbox.get("pending") or 0),
+            "oldest_outbox_age_seconds": _iso_age_seconds(outbox.get("oldest_created_at")),
+            "last_export_at": self.archive.last_export_at or outbox.get("last_export_at"),
+            "last_export_error": self.archive.last_error or outbox.get("last_error"),
+            "fotmob": fotmob_status,
             "coverage": coverage,
             "collection_metrics_age_seconds": coverage_meta["collection_metrics_age_seconds"],
             "collection_metrics_cached": coverage_meta["collection_metrics_cached"],

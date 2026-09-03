@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -24,6 +25,13 @@ from .matching import (
 )
 from .models import FOTMOB_SNAPSHOT_TYPES, FotMobFetchResult, FotMobMatch, FotMobSnapshot
 from .storage import FotMobParquetArchive, FotMobStore, internal_match_id_for_tipico
+from runtime_status import (
+    config_fingerprint,
+    feature_health,
+    feature_runtime_matrix,
+    runtime_identity,
+    runtime_warnings,
+)
 
 
 @dataclass(slots=True)
@@ -138,10 +146,36 @@ class FotMobService:
         )
         self.automated_worker_allowed = (
             self.enabled
+            and bool(getattr(settings, "fotmob_history_enabled", True))
             and self.network_mode == "worker"
             and self.provider_decision == "PRODUCTION_READY"
             and self.automated_usage == "ACCEPTABLE_FOR_PROJECT"
         )
+        self._runtime_metrics_lock = threading.RLock()
+        self._runtime_metrics: dict[str, int] = {
+            "link_attempts": 0,
+            "links_exact": 0,
+            "links_high_confidence": 0,
+            "links_ambiguous": 0,
+            "links_unmatched": 0,
+            "detail_requests": 0,
+            "detail_errors": 0,
+            "ht_attempts": 0,
+            "ht_success": 0,
+            "ht_no_data": 0,
+            "ht_errors": 0,
+        }
+        self._last_runtime_success: dict[str, str | None] = {
+            "last_auto_link_success": None,
+            "last_fotmob_detail_success": None,
+            "last_ht_enrichment_success": None,
+            "last_archive_export_success": None,
+        }
+        self._last_runtime_error: dict[str, str | None] = {
+            "last_fotmob_detail_error": None,
+            "last_ht_enrichment_error": None,
+            "last_archive_export_error": None,
+        }
         self.logger = logger or logging.getLogger("tipico.fotmob")
         self.store = FotMobStore(database, settings.archive_path)
         self.client = client or FotMobClient(
@@ -195,6 +229,68 @@ class FotMobService:
         self.resolver.seed_default_competition_links()
         self.last_error: str | None = None
         self.last_result: FotMobRefreshResult | None = None
+
+    def _increment_runtime(self, key: str, amount: int = 1) -> None:
+        with self._runtime_metrics_lock:
+            self._runtime_metrics[key] = self._runtime_metrics.get(key, 0) + amount
+
+    def _mark_runtime_success(self, key: str) -> None:
+        with self._runtime_metrics_lock:
+            self._last_runtime_success[key] = _iso_now()
+            error_key = {
+                "last_fotmob_detail_success": "last_fotmob_detail_error",
+                "last_ht_enrichment_success": "last_ht_enrichment_error",
+                "last_archive_export_success": "last_archive_export_error",
+            }.get(key)
+            if error_key:
+                self._last_runtime_error[error_key] = None
+
+    def _mark_runtime_error(self, key: str, error: str | None) -> None:
+        with self._runtime_metrics_lock:
+            self._last_runtime_error[key] = str(error) if error else "unknown error"
+
+    def record_link_resolution(self, result: Any) -> None:
+        """Record one resolver outcome, including safe non-link decisions."""
+
+        match_result = getattr(result, "match_result", result)
+        status = str(getattr(match_result, "status", "UNMATCHED") or "UNMATCHED").upper()
+        self._increment_runtime("link_attempts")
+        counter = {
+            "EXACT": "links_exact",
+            "HIGH_CONFIDENCE": "links_high_confidence",
+            "AMBIGUOUS": "links_ambiguous",
+        }.get(status, "links_unmatched")
+        self._increment_runtime(counter)
+        if status in AUTO_LINK_STATUSES:
+            self._mark_runtime_success("last_auto_link_success")
+
+    def _record_detail_started(self) -> None:
+        self._increment_runtime("detail_requests")
+
+    def _record_detail_result(self, *, success: bool, error: str | None = None) -> None:
+        if success:
+            self._mark_runtime_success("last_fotmob_detail_success")
+        else:
+            self._increment_runtime("detail_errors")
+            self._mark_runtime_error("last_fotmob_detail_error", error)
+
+    def _record_ht_result(self, result: FotMobRefreshResult) -> FotMobRefreshResult:
+        if result.success and result.ht_stats_available is True:
+            self._increment_runtime("ht_success")
+            self._mark_runtime_success("last_ht_enrichment_success")
+        elif result.success and result.ht_stats_available is False:
+            self._increment_runtime("ht_no_data")
+        else:
+            self._increment_runtime("ht_errors")
+            self._mark_runtime_error("last_ht_enrichment_error", result.error)
+        return result
+
+    def runtime_metrics(self) -> dict[str, Any]:
+        with self._runtime_metrics_lock:
+            result: dict[str, Any] = dict(self._runtime_metrics)
+            result.update(self._last_runtime_success)
+            result.update(self._last_runtime_error)
+            return result
 
     def _matcher(self) -> MatchMatcher:
         if self._matcher_cache is not None:
@@ -584,11 +680,20 @@ class FotMobService:
             quality is not None and quality["fotmob_ht_stats_available"]
         )
         link_accepted = link_status in AUTO_LINK_STATUSES
+        if not link_accepted:
+            ht_status = "NO_LINK"
+        elif quality is None:
+            ht_status = "NOT_OBSERVED"
+        elif ht_available:
+            ht_status = "AVAILABLE"
+        else:
+            ht_status = "NO_HALFTIME"
         return {
             "tipico_event_id": str(getattr(event, "event_id", "")),
             "fotmob_match_id": str(provider_match_id) if provider_match_id else None,
             "link_status": link_status,
             "link_confidence": float(link["match_confidence"] or 0.0) if link else 0.0,
+            "fotmob_ht_status": ht_status,
             "ht_stats_available": ht_available,
             "enhanced_ml_allowed": bool(link_accepted and ht_available),
         }
@@ -597,11 +702,15 @@ class FotMobService:
         self,
         event: Any,
         candidates: Iterable[FotMobMatch],
+        *,
+        _record_metrics: bool = True,
     ) -> MatchMatchResult:
         internal_match_id = self.ensure_tipico_event(event)
         candidate_list = list(candidates)
         tipico_identity = MatchIdentity.from_tipico_event(event)
         result = self._matcher().match(tipico_identity, candidate_list)
+        if _record_metrics:
+            self.record_link_resolution(result)
         candidate_map = {item.provider_match_id: item for item in candidate_list}
         selected = candidate_map.get(result.provider_match_id) if result.provider_match_id else None
         self._persist_provider_event_link(
@@ -768,15 +877,18 @@ class FotMobService:
                     f"automated_usage={self.automated_usage})."
                 ),
             )
+        self._record_detail_started()
         fetched = self.client.fetch_match_details(str(provider_match_id))
         if not isinstance(fetched, FotMobFetchResult):
             fetched = FotMobFetchResult(success=True, match=fetched)
         if not fetched.success or fetched.match is None:
             error = fetched.error or "FotMob-Match konnte nicht gelesen werden."
+            self._record_detail_result(success=False, error=error)
             self.last_error = error
             result = FotMobRefreshResult(False, internal_match_id=internal_match_id, error=error)
             self.last_result = result
             return result
+        self._record_detail_result(success=True)
         match_result = self.match_tipico_event(event, [fetched.match])
         if not match_result.auto_linkable:
             return FotMobRefreshResult(
@@ -837,15 +949,18 @@ class FotMobService:
         )
         if not provider_match_id:
             return FotMobRefreshResult(False, internal_match_id=internal_match_id, error="Kein bestätigter FotMob-Link vorhanden.")
+        self._record_detail_started()
         fetched = self.client.fetch_match_details(str(provider_match_id))
         if not isinstance(fetched, FotMobFetchResult):
             fetched = FotMobFetchResult(success=True, match=fetched)
         if not fetched.success or fetched.match is None:
             error = fetched.error or "FotMob-Abruf fehlgeschlagen."
+            self._record_detail_result(success=False, error=error)
             self.last_error = error
             result = FotMobRefreshResult(False, internal_match_id=internal_match_id, error=error)
             self.last_result = result
             return result
+        self._record_detail_result(success=True)
         return self._persist_match(
             internal_match_id,
             fetched.match,
@@ -882,6 +997,13 @@ class FotMobService:
                     f"automated_usage={self.automated_usage})."
                 ),
             )
+        ht_attempt = snapshot_type == "HALFTIME"
+        if ht_attempt:
+            self._increment_runtime("ht_attempts")
+
+        def finish(result: FotMobRefreshResult) -> FotMobRefreshResult:
+            return self._record_ht_result(result) if ht_attempt else result
+
         link = self.provider_event_link_for_event(event)
         link_status = str(link["match_status"]).upper() if link is not None else ""
         link_id = (
@@ -895,14 +1017,16 @@ class FotMobService:
             resolved = self.resolver.resolve(event)
             resolved_status = str(resolved.match_result.status).upper()
             if resolved_status not in AUTO_LINK_STATUSES:
-                return FotMobRefreshResult(
-                    False,
-                    internal_match_id=internal_match_id,
-                    match_result=resolved.match_result,
-                    error=(
-                        "Kein sicherer FotMob-Link für die Halbzeit-Anreicherung: "
-                        f"{resolved_status}"
-                    ),
+                return finish(
+                    FotMobRefreshResult(
+                        False,
+                        internal_match_id=internal_match_id,
+                        match_result=resolved.match_result,
+                        error=(
+                            "Kein sicherer FotMob-Link für die Halbzeit-Anreicherung: "
+                            f"{resolved_status}"
+                        ),
+                    )
                 )
         if snapshot_type == "HALFTIME":
             current = self.store.current_state(internal_match_id)
@@ -913,28 +1037,34 @@ class FotMobService:
                 is_live_ht = bool(current["captured_live"]) and current["source_context"] == "LIVE_HT"
                 if 0 <= age < self.settings.fotmob_poll_seconds and is_live_ht:
                     if has_first_half:
-                        return FotMobRefreshResult(
+                        return finish(
+                            FotMobRefreshResult(
+                                True,
+                                internal_match_id=internal_match_id,
+                                result_consistency=current["result_consistency"],
+                                ht_consistency=current["ht_consistency"],
+                                ht_stats_available=True,
+                            )
+                        )
+                    return finish(
+                        FotMobRefreshResult(
                             True,
                             internal_match_id=internal_match_id,
                             result_consistency=current["result_consistency"],
                             ht_consistency=current["ht_consistency"],
-                            ht_stats_available=True,
+                            ht_stats_available=False,
+                            error="NO_HALFTIME: FotMob FirstHalf-Statistiken nicht vorhanden",
                         )
-                    return FotMobRefreshResult(
-                        True,
-                        internal_match_id=internal_match_id,
-                        result_consistency=current["result_consistency"],
-                        ht_consistency=current["ht_consistency"],
-                        ht_stats_available=False,
-                        error="NO_HALFTIME: FotMob FirstHalf-Statistiken nicht vorhanden",
                     )
-        return self.refresh_link(
-            internal_match_id,
-            snapshot_type=snapshot_type,
-            source_context="LIVE_HT" if snapshot_type == "HALFTIME" else "LIVE_REFRESH",
-            captured_live=snapshot_type == "HALFTIME",
-            stats_period="FIRST_HALF" if snapshot_type == "HALFTIME" else None,
-            tipico_event_id=str(event.event_id),
+        return finish(
+            self.refresh_link(
+                internal_match_id,
+                snapshot_type=snapshot_type,
+                source_context="LIVE_HT" if snapshot_type == "HALFTIME" else "LIVE_REFRESH",
+                captured_live=snapshot_type == "HALFTIME",
+                stats_period="FIRST_HALF" if snapshot_type == "HALFTIME" else None,
+                tipico_event_id=str(event.event_id),
+            )
         )
 
     def current_for_tipico_event(self, event: Any) -> Any:
@@ -942,10 +1072,16 @@ class FotMobService:
         return self.store.current_state(row["internal_match_id"]) if row else None
 
     def export_pending(self) -> dict[str, Any]:
-        return self.archive.export_pending(
+        result = self.archive.export_pending(
             self.store,
             batch_size=self.settings.fotmob_snapshot_outbox_batch_size,
         )
+        if int(result.get("errors") or 0):
+            error = f"FotMob Parquet export reported {result['errors']} error(s)"
+            self._mark_runtime_error("last_archive_export_error", error)
+        else:
+            self._mark_runtime_success("last_archive_export_success")
+        return result
 
     def metrics(self) -> dict[str, Any]:
         metrics = self.store.metrics_for_date()
@@ -957,6 +1093,19 @@ class FotMobService:
         metrics["manual_use_allowed"] = self.manual_use_allowed
         metrics["automated_worker_allowed"] = self.automated_worker_allowed
         metrics["access"] = client_metrics
+        metrics.update(self.runtime_metrics())
+        history_runtime = getattr(self.history_pipeline, "runtime_metrics", lambda: {})()
+        metrics.update(history_runtime)
+        matrix = feature_runtime_matrix(
+            self.settings,
+            fotmob_service=self,
+            database=getattr(self.store, "database", None),
+        )
+        metrics["feature_runtime_matrix"] = matrix
+        metrics["feature_health"] = feature_health(matrix)
+        metrics["runtime_warnings"] = runtime_warnings(matrix)
+        metrics["runtime_identity"] = runtime_identity(self.settings.root_dir)
+        metrics["config_fingerprint"] = config_fingerprint(self.settings)
         # The date-range UI now consumes the complete daily feed.  Keep this
         # aggregate unscoped so the debug panel does not silently report only
         # the legacy Bundesliga queue.

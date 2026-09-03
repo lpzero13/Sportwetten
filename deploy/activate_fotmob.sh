@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Enable the explicit FotMob date-range import in an already installed
-# container.  This deliberately does not enable the permanent FotMob worker.
+# Activate the integrated FotMob production path in an already installed
+# container.  The collector owns index discovery, linking and HT enrichment;
+# the standalone FotMob unit remains disabled to prevent duplicate traffic.
 ENV_FILE="${1:-/etc/default/tipico-observer}"
 
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -38,11 +39,11 @@ set_env_value() {
     fi
 }
 
-# The date-range button is an explicit manual action.  The worker remains
-# disabled below, even though the shared FotMob feature is enabled.
 set_env_value FOTMOB_ENABLED true
 set_env_value FOTMOB_HISTORY_ENABLED true
-set_env_value FOTMOB_NETWORK_MODE manual
+set_env_value FOTMOB_NETWORK_MODE worker
+set_env_value FOTMOB_PROVIDER_DECISION PRODUCTION_READY
+set_env_value FOTMOB_AUTOMATED_USAGE ACCEPTABLE_FOR_PROJECT
 set_env_value STORE_FOTMOB_HISTORICAL_RAW false
 set_env_value FOTMOB_ARCHIVE_ROOT /var/lib/wetten/archive/fotmob
 # The date-range UI uses FotMob's complete daily feed.  The legacy league
@@ -70,15 +71,19 @@ set_env_value FOTMOB_HISTORY_WORKERS 10
 set_env_value FOTMOB_HISTORY_REQUESTS_PER_SECOND 5
 set_env_value FOTMOB_HISTORY_LEAGUE_ID 54
 set_env_value FOTMOB_HT_ENRICHMENT_ENABLED true
+set_env_value WETTEN_APP_VERSION 0.5.9.1
+set_env_value WETTEN_DEPLOY_TIME "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 if command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now wetten-fotmob.service 2>/dev/null || true
     if [[ "${TIPICO_SKIP_SERVICE_RESTART:-0}" != "1" ]] && systemctl cat wetten-ui.service >/dev/null 2>&1; then
         systemctl daemon-reload
         systemctl restart wetten-ui.service
+        systemctl restart wetten-collector.service 2>/dev/null || true
         echo "wetten-ui.service neu gestartet."
+        echo "wetten-collector.service neu gestartet."
     fi
 fi
 
-echo "FotMob ist für manuelle Datumsbereich-Läufe aktiviert."
-echo "Kein permanenter FotMob-Worker wurde aktiviert."
+echo "FotMob-Produktionspfad ist im integrierten Collector aktiviert."
+echo "wetten-fotmob.service bleibt zur Vermeidung eines Doppel-Workers deaktiviert."

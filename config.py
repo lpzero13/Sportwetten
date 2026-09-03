@@ -111,9 +111,10 @@ SNAPSHOT_85_ENABLED = True
 SNAPSHOT_90_ENABLED = True
 SNAPSHOT_FINAL_ENABLED = True
 
-# FotMob date-range loading is enabled in the private deployment.  The
-# network mode is manual, so constructing the app or running the Tipico
-# collector never starts a FotMob worker or makes a background request.
+# FotMob is enabled for the integrated production collector.  The collector
+# owns the daily index, automatic resolver and halftime enrichment.  The
+# separate ``wetten-fotmob.service`` remains disabled to avoid a duplicate
+# provider worker.
 FOTMOB_ENABLED = True
 FOTMOB_BASE_URL = "https://www.fotmob.com"
 FOTMOB_API_BASE_URL = "https://www.fotmob.com/api"
@@ -126,8 +127,8 @@ FOTMOB_MATCHING_TOLERANCE_MINUTES = 15
 FOTMOB_HT_STABLE_DELAY_SECONDS = 45
 FOTMOB_SNAPSHOT_OUTBOX_EXPORT_INTERVAL_SECONDS = 300
 FOTMOB_SNAPSHOT_OUTBOX_BATCH_SIZE = 100
-FOTMOB_PROVIDER_DECISION = "LIMITED_USE"
-FOTMOB_AUTOMATED_USAGE = "UNCLEAR"
+FOTMOB_PROVIDER_DECISION = "PRODUCTION_READY"
+FOTMOB_AUTOMATED_USAGE = "ACCEPTABLE_FOR_PROJECT"
 FOTMOB_PROVIDER_DECISION_VALUES = ("PRODUCTION_READY", "LIMITED_USE", "NOT_SUITABLE")
 FOTMOB_AUTOMATED_USAGE_VALUES = (
     "ACCEPTABLE_FOR_PROJECT",
@@ -180,7 +181,7 @@ FOTMOB_HISTORY_STALE_MINUTES = 30
 FOTMOB_HISTORY_MAX_RETRY_ATTEMPTS = 3
 FOTMOB_HISTORY_BATCH_SIZE = 100
 STORE_FOTMOB_HISTORICAL_RAW = False
-FOTMOB_NETWORK_MODE = "manual"
+FOTMOB_NETWORK_MODE = "worker"
 FOTMOB_NETWORK_MODE_VALUES = ("off", "manual", "worker")
 FOTMOB_ARCHIVE_ROOT = ""
 FOTMOB_HISTORY_LEAGUE_ID = "54"

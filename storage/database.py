@@ -34,6 +34,16 @@ FINISHED_EVENT_STATUSES = frozenset(
     {"finished", "ended", "complete", "completed", "final"}
 )
 NO_LONGER_LIVE_STATUS = "NO_LONGER_LIVE"
+
+
+def _assert_sql_bind_count(statement: str, parameters: tuple[Any, ...], label: str) -> None:
+    """Fail loudly if a production SQL statement and its value tuple diverge."""
+
+    placeholders = statement.count("?")
+    if placeholders != len(parameters):
+        raise RuntimeError(
+            f"{label}: SQL expects {placeholders} values, received {len(parameters)}"
+        )
 PREMATCH_EVENT_STATUSES = frozenset({"pre_match", "prematch"})
 
 
@@ -2180,8 +2190,7 @@ class Database:
             transition_at = str(values.get("observed_at"))
             with self.connection:
                 if transition is not None:
-                    cursor = self.connection.execute(
-                        """
+                    evaluation_sql = """
                         INSERT INTO strategy_evaluations (
                             event_id, observed_at, strategy_type, strategy_version,
                             normalizer_version, status, total_stake, q_zero,
@@ -2192,26 +2201,30 @@ class Database:
                             trigger_type, is_eligible
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            event_id, values["observed_at"], strategy_type,
-                            values.get("strategy_version") or "",
-                            values.get("normalizer_version") or "",
-                            status, values.get("total_stake") or 0,
-                            values.get("q_zero"), values.get("q_two_plus"),
-                            values.get("source_zero"), values.get("source_two_plus"),
-                            values.get("stake_zero"), values.get("stake_two_plus"),
-                            values.get("payout_zero"), values.get("payout_two_plus"),
-                            values.get("payout_difference"), values.get("covered_profit"),
-                            values.get("win_roi"), values.get("p1_max"),
-                            values.get("p1_tipico"), values.get("p1_buffer"),
-                            values.get("p_zero"), values.get("p_one"),
-                            values.get("p_two_plus"), transition, int(eligible),
-                        ),
+                        """
+                    evaluation_params = (
+                        event_id, values["observed_at"], strategy_type,
+                        values.get("strategy_version") or "",
+                        values.get("normalizer_version") or "",
+                        status, values.get("total_stake") or 0,
+                        values.get("q_zero"), values.get("q_two_plus"),
+                        values.get("source_zero"), values.get("source_two_plus"),
+                        values.get("stake_zero"), values.get("stake_two_plus"),
+                        values.get("payout_zero"), values.get("payout_two_plus"),
+                        values.get("payout_difference"), values.get("covered_profit"),
+                        values.get("win_roi"), values.get("p1_max"),
+                        values.get("p1_tipico"), values.get("p1_buffer"),
+                        values.get("p_zero"), values.get("p_one"),
+                        values.get("p_two_plus"), transition, int(eligible),
                     )
+                    _assert_sql_bind_count(
+                        evaluation_sql,
+                        evaluation_params,
+                        "strategy_evaluations",
+                    )
+                    cursor = self.connection.execute(evaluation_sql, evaluation_params)
                     evaluation_id = int(cursor.lastrowid)
-                self.connection.execute(
-                    """
+                current_strategy_sql = """
                     INSERT INTO current_strategy_evaluations (
                         event_id, strategy_type, observed_at, strategy_version,
                         normalizer_version, status, total_stake, q_zero, q_two_plus,
@@ -2253,24 +2266,29 @@ class Database:
                                                       current_strategy_evaluations.last_evaluation_id),
                         updated_at = excluded.updated_at,
                         is_eligible = excluded.is_eligible
-                    """,
-                    (
-                        event_id, strategy_type, values["observed_at"],
-                        values.get("strategy_version") or "",
-                        values.get("normalizer_version") or "", status,
-                        values.get("total_stake") or 0, values.get("q_zero"),
-                        values.get("q_two_plus"), values.get("source_zero"),
-                        values.get("source_two_plus"), values.get("stake_zero"),
-                        values.get("stake_two_plus"), values.get("payout_zero"),
-                        values.get("payout_two_plus"), values.get("payout_difference"),
-                        values.get("covered_profit"), values.get("win_roi"),
-                        values.get("p1_max"), values.get("p1_tipico"),
-                        values.get("p1_buffer"), values.get("p_zero"),
-                        values.get("p_one"), values.get("p_two_plus"),
-                        transition, transition_at if transition else None,
-                        evaluation_id, datetime.now(timezone.utc).isoformat(), int(eligible),
-                    ),
+                    """
+                current_strategy_params = (
+                    event_id, strategy_type, values["observed_at"],
+                    values.get("strategy_version") or "",
+                    values.get("normalizer_version") or "", status,
+                    values.get("total_stake") or 0, values.get("q_zero"),
+                    values.get("q_two_plus"), values.get("source_zero"),
+                    values.get("source_two_plus"), values.get("stake_zero"),
+                    values.get("stake_two_plus"), values.get("payout_zero"),
+                    values.get("payout_two_plus"), values.get("payout_difference"),
+                    values.get("covered_profit"), values.get("win_roi"),
+                    values.get("p1_max"), values.get("p1_tipico"),
+                    values.get("p1_buffer"), values.get("p_zero"),
+                    values.get("p_one"), values.get("p_two_plus"),
+                    transition, transition_at if transition else None,
+                    evaluation_id, datetime.now(timezone.utc).isoformat(), int(eligible),
                 )
+                _assert_sql_bind_count(
+                    current_strategy_sql,
+                    current_strategy_params,
+                    "current_strategy_evaluations",
+                )
+                self.connection.execute(current_strategy_sql, current_strategy_params)
             return {
                 "transition_type": transition,
                 "evaluation_id": evaluation_id,
@@ -2606,6 +2624,28 @@ class Database:
                     (max(1, int(limit)),),
                 ).fetchall()
             )
+
+    def snapshot_outbox_status(self) -> dict[str, Any]:
+        """Return pending/export/error state without loading outbox payloads."""
+
+        with self._lock:
+            pending = self.connection.execute(
+                """
+                SELECT COUNT(*) AS pending, MIN(created_at) AS oldest_created_at,
+                       MAX(last_error) AS last_error
+                FROM snapshot_outbox
+                WHERE exported = 0
+                """
+            ).fetchone()
+            latest = self.connection.execute(
+                "SELECT MAX(exported_at) AS last_export_at FROM snapshots"
+            ).fetchone()
+        return {
+            "pending": int(pending["pending"] or 0) if pending else 0,
+            "oldest_created_at": pending["oldest_created_at"] if pending else None,
+            "last_export_at": latest["last_export_at"] if latest else None,
+            "last_error": pending["last_error"] if pending else None,
+        }
 
     def mark_snapshot_outbox_error(self, snapshot_ids: Iterable[int], error: str) -> None:
         ids = [int(item) for item in snapshot_ids]

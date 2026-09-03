@@ -1,9 +1,9 @@
 """League-to-season-to-match historical pipeline for FotMob.
 
 The pipeline intentionally separates index discovery from detail fetching.  It
-is safe to use with local fixtures in tests. Explicit CLI jobs use the
-``manual`` network mode; a permanent worker remains behind the stricter
-V0.5.1 provider-policy gate.
+is safe to use with local fixtures in tests. Explicit CLI jobs may use the
+``manual`` network mode; the integrated production collector uses ``worker``
+mode behind the provider-policy gate.
 """
 
 from __future__ import annotations
@@ -237,6 +237,13 @@ class FotMobHistoryPipeline:
         self._archive_lock = threading.RLock()
         self._daily_index_cache: dict[str, tuple[float, tuple[FotMobMatchIndexRecord, ...], str | None]] = {}
         self._daily_index_cache_lock = threading.RLock()
+        self._runtime_metrics_lock = threading.RLock()
+        self._runtime_metrics: dict[str, int] = {
+            "daily_index_requests": 0,
+            "daily_index_errors": 0,
+        }
+        self._last_daily_index_success: str | None = None
+        self._last_daily_index_error: str | None = None
         known_stable_rps = self.store.known_stable_max_rps(
             confirmations=int(
                 getattr(self.settings, "fotmob_performance_stable_confirmations", 2)
@@ -283,6 +290,30 @@ class FotMobHistoryPipeline:
             "FOTMOB_PROVIDER_DECISION=PRODUCTION_READY und "
             "FOTMOB_AUTOMATED_USAGE=ACCEPTABLE_FOR_PROJECT."
         )
+
+    def _fetch_daily_index(self, endpoint: str) -> tuple[dict[str, Any] | None, str | None]:
+        """Fetch one compact daily feed and expose request/error counters."""
+
+        with self._runtime_metrics_lock:
+            self._runtime_metrics["daily_index_requests"] += 1
+        payload, error = self._fetch_json(endpoint)
+        with self._runtime_metrics_lock:
+            if payload is None:
+                self._runtime_metrics["daily_index_errors"] += 1
+                self._last_daily_index_error = error or "daily index request failed"
+            else:
+                self._last_daily_index_success = _now()
+                self._last_daily_index_error = None
+        return payload, error
+
+    def runtime_metrics(self) -> dict[str, Any]:
+        """Return counters used by the collector status and debug UI."""
+
+        with self._runtime_metrics_lock:
+            result: dict[str, Any] = dict(self._runtime_metrics)
+            result["last_fotmob_daily_index_success"] = self._last_daily_index_success
+            result["last_fotmob_daily_index_error"] = self._last_daily_index_error
+            return result
 
     def _fetch_json(self, endpoint: str) -> tuple[dict[str, Any] | None, str | None]:
         fetched = self.client.fetch_json(endpoint)
@@ -1016,7 +1047,7 @@ class FotMobHistoryPipeline:
             return list(durable_records), None
 
         endpoint = self._daily_feed_endpoint(day_value)
-        payload, error = self._fetch_json(endpoint)
+        payload, error = self._fetch_daily_index(endpoint)
         if payload is None:
             # Never discard a known-good catalog because the refresh was
             # transiently unavailable.
@@ -1125,7 +1156,7 @@ class FotMobHistoryPipeline:
             observation_date = start + timedelta(days=offset)
             day = observation_date.isoformat()
             endpoint = self._daily_feed_endpoint(observation_date)
-            payload, error = self._fetch_json(endpoint)
+            payload, error = self._fetch_daily_index(endpoint)
             if payload is None:
                 message = f"{day}: {error or 'FotMob-Tagesfeed konnte nicht geladen werden'}"
                 index_errors.append(message)
@@ -1326,7 +1357,7 @@ class FotMobHistoryPipeline:
         league_id: str | None = None,
         fetch_details: bool = True,
         workers: int | None = None,
-        execution_mode: str = "manual",
+        execution_mode: str | None = None,
     ) -> dict[str, Any]:
         """Load an inclusive date range from FotMob's daily feed.
 
@@ -1337,6 +1368,9 @@ class FotMobHistoryPipeline:
         league/season-page path available for legacy CLI jobs.
         """
 
+        effective_execution_mode = str(
+            execution_mode or _network_mode(self.settings)
+        ).strip().casefold()
         start = self._coerce_date(start_date)
         end = self._coerce_date(end_date)
         if end < start:
@@ -1345,7 +1379,7 @@ class FotMobHistoryPipeline:
         if day_count > 3660:
             raise ValueError("Der Datumsbereich ist auf 10 Jahre begrenzt.")
         if league_id is None:
-            if not _history_network_allowed(self.settings, execution_mode):
+            if not _history_network_allowed(self.settings, effective_execution_mode):
                 return {
                     "status": "BLOCKED_BY_POLICY",
                     "scope": "ALL_LEAGUES",
@@ -1356,17 +1390,17 @@ class FotMobHistoryPipeline:
                     "fixtures": 0,
                     "unique_fixtures": 0,
                     "details": {},
-                    "error": self._network_error(execution_mode),
+                    "error": self._network_error(effective_execution_mode),
                 }
             return self._all_leagues_date_range(
                 start,
                 end,
                 fetch_details=fetch_details,
                 workers=workers,
-                execution_mode=execution_mode,
+                execution_mode=effective_execution_mode,
             )
         target_league = str(league_id or getattr(self.settings, "fotmob_history_league_id", "54"))
-        if not _history_network_allowed(self.settings, execution_mode):
+        if not _history_network_allowed(self.settings, effective_execution_mode):
             return {
                 "status": "BLOCKED_BY_POLICY",
                 "from_date": start.isoformat(),
@@ -1375,10 +1409,13 @@ class FotMobHistoryPipeline:
                 "days": day_count,
                 "fixtures": 0,
                 "details": {},
-                "error": self._network_error(execution_mode),
+                "error": self._network_error(effective_execution_mode),
             }
 
-        discovery = self.discover_league(target_league, execution_mode=execution_mode)
+        discovery = self.discover_league(
+            target_league,
+            execution_mode=effective_execution_mode,
+        )
         if not discovery.success:
             return {
                 "status": "ERROR",

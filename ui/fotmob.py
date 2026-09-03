@@ -120,10 +120,15 @@ def render_fotmob_tab(service: FotMobService, event: Any) -> None:
         )
     elif not service.manual_use_allowed:
         st.warning("FotMob-Einzelspielnutzung ist durch die aktuelle Provider-Policy deaktiviert.")
+    elif service.automated_worker_allowed:
+        st.info(
+            "FotMob-Produktionspfad ist aktiv: Der integrierte Collector darf "
+            "Tagesindex, automatische Links und HT-Enrichment lesen."
+        )
     else:
         st.info(
             "FotMob ist nur für ein ausdrücklich ausgewähltes Einzelspiel aktiv. "
-            "Der periodische Worker bleibt bei dieser Provider-Entscheidung deaktiviert."
+            "Für automatische Läufe fehlen die Produktions-Gates."
         )
 
     if can_load:
@@ -218,6 +223,11 @@ def render_fotmob_tab(service: FotMobService, event: Any) -> None:
             f"HT consistency: {quality['ht_consistency'] or '—'} · "
             f"HT-Stats verfügbar: {'ja' if quality['fotmob_ht_stats_available'] else 'nein'}"
         )
+    readiness = service.ml_ht_readiness_for_event(event)
+    st.caption(
+        f"FotMob HT-Status: {readiness['fotmob_ht_status']} · "
+        f"Enhanced ML: {'ja' if readiness['enhanced_ml_allowed'] else 'nein'}"
+    )
 
 
 def render_fotmob_debug(service: FotMobService) -> None:
@@ -237,6 +247,34 @@ def render_fotmob_debug(service: FotMobService) -> None:
         f"Einzelspiel: {'AN' if metrics['manual_use_allowed'] else 'AUS'} · "
         f"Worker: {'AN' if metrics['automated_worker_allowed'] else 'AUS'}"
     )
+    if metrics.get("runtime_warnings"):
+        st.warning(" · ".join(str(item) for item in metrics["runtime_warnings"]))
+    matrix = metrics.get("feature_runtime_matrix", []) or []
+    if matrix:
+        with st.expander("Feature Runtime Matrix", expanded=bool(metrics.get("runtime_warnings"))):
+            st.dataframe(
+                [
+                    {
+                        "Feature": item.get("feature"),
+                        "Konfiguriert": "AN" if item.get("configured_enabled") else "AUS",
+                        "Effektiv": "AN" if item.get("effective_enabled") else "AUS",
+                        "Blocking Gate": item.get("blocking_gate") or "—",
+                        "Grund": item.get("reason") or "—",
+                    }
+                    for item in matrix
+                    if isinstance(item, dict)
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+    runtime_columns = st.columns(7)
+    runtime_columns[0].metric("Daily Index", metrics.get("daily_index_requests", 0))
+    runtime_columns[1].metric("Auto-Link", metrics.get("links_exact", 0) + metrics.get("links_high_confidence", 0))
+    runtime_columns[2].metric("Link unklar", metrics.get("links_ambiguous", 0) + metrics.get("links_unmatched", 0))
+    runtime_columns[3].metric("Detail Requests", metrics.get("detail_requests", 0))
+    runtime_columns[4].metric("HT Erfolg", metrics.get("ht_success", 0))
+    runtime_columns[5].metric("HT ohne Daten", metrics.get("ht_no_data", 0))
+    runtime_columns[6].metric("ML HT ready", metrics.get("enhanced_ml_allowed_count", 0))
     _render_historical_date_loader(service)
     st.subheader("FotMob Access")
     access = metrics.get("access", {}) or {}
@@ -478,7 +516,9 @@ def _render_historical_date_loader(service: FotMobService) -> None:
                     end_date,
                     fetch_details=True,
                     workers=service.settings.fotmob_history_workers,
-                    execution_mode="manual",
+                    execution_mode=(
+                        "worker" if service.automated_worker_allowed else "manual"
+                    ),
                 )
             st.session_state["fotmob_last_date_load"] = result
         except (TypeError, ValueError, OSError, RuntimeError) as exc:

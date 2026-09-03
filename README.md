@@ -35,6 +35,8 @@ Der aktuelle Projektumfang umfasst:
   informatives Live-Enrichment ohne Einfluss auf Quoten, Strategie oder Paper Trading
 - V0.5.8: atomare Feed-Reconciliation, Coverage-Cache, Queue-Diagnostik und
   capability-basierte Smart-Live-Universe-Priorisierung
+- V0.5.9.1: integrierter FotMob-Produktionspfad mit sichtbarer Runtime-Matrix,
+  Feature-Health, Resolver-/HT-Metriken, Deploy-Identität und Logrotate-Härtung
 
 Nicht enthalten sind eigene ML-Wahrscheinlichkeiten, FotMob-Quoten,
 WebSocket/STOMP, Inhaltsfilter, automatische Optimierung und echte Wettabgabe.
@@ -186,23 +188,21 @@ P1. Frauenfußball wird nicht pauschal ausgeschlossen. Die Tabellen
 Capability-Caches; historische Daten und das ausgewählte V0.5.7-FotMob-Live-
 Panel bleiben unverändert.
 
-### FotMob-Enrichment (V0.5.3)
+### FotMob-Enrichment (V0.5.3 / V0.5.9.1)
 
-FotMob ist in der privaten Standardkonfiguration aktiviert, aber ausschließlich
-für bewusst ausgelöste manuelle Läufe. Der
+FotMob ist in der privaten Standardkonfiguration aktiviert. Der integrierte
 Tipico-Collector kann bei einer bestätigten Liga-/Team-/Kickoff-Verknüpfung
 Pre-Match nur den kleinen Match-Index nutzen und beim ersten Tipico-HZ-Signal
 genau einen öffentlichen `/api/data/matchDetails?matchId={id}`-Abruf auslösen. Der FotMob-Tab zeigt
 die FirstHalf-Werte daneben. FotMob-Werte werden weder für das Tipico-
 Market-Ranking noch für Paper-Trades oder Settlement verwendet.
 
-Die Providerentscheidung bleibt `LIMITED_USE` bei `AUTOMATED_USAGE=UNCLEAR`.
-Der automatische FotMob-Worker bleibt aus. Eine automatisierte HZ-Anreicherung benötigt
-zusätzlich `FOTMOB_NETWORK_MODE=worker`,
-`FOTMOB_PROVIDER_DECISION=PRODUCTION_READY` und
-`FOTMOB_AUTOMATED_USAGE=ACCEPTABLE_FOR_PROJECT`. Ohne diese Freigabe läuft
-der Tipico-Collector unverändert weiter. Für ein einzelnes ausdrücklich
-gewünschtes Match gibt es `scripts/discover_fotmob.py`:
+Der Produktionspfad verlangt weiterhin die drei expliziten Gates
+`FOTMOB_NETWORK_MODE=worker`, `FOTMOB_PROVIDER_DECISION=PRODUCTION_READY` und
+`FOTMOB_AUTOMATED_USAGE=ACCEPTABLE_FOR_PROJECT`. Der Collector-Status zeigt
+eine maschinenlesbare `feature_runtime_matrix` und sichtbare Warnungen, wenn
+eine konfigurierte Funktion effektiv blockiert ist. Für ein einzelnes
+ausdrücklich gewünschtes Match gibt es weiterhin `scripts/discover_fotmob.py`:
 
 ~~~powershell
 $env:FOTMOB_ENABLED="true"
@@ -221,10 +221,33 @@ $env:FOTMOB_AUTOMATED_USAGE="ACCEPTABLE_FOR_PROJECT"
 python scripts/run_collector.py --root .
 ~~~
 
-Für Proxmox ist `wetten-fotmob.service` vorhanden, wird vom Installationsskript
-nicht aktiviert. Bei `LIMITED_USE`/`UNCLEAR` bleiben automatische FotMob-
-Requests blockiert; die manuelle Datumsbereich-Auswahl und die Anzeige bereits
-gespeicherter Daten bleiben verfügbar.
+Für Proxmox ist `wetten-fotmob.service` vorhanden, bleibt aber bewusst
+deaktiviert: Der integrierte `wetten-collector.service` ist der einzige
+FotMob-Worker und verhindert doppelte Requests. Bei `LIMITED_USE`/`UNCLEAR`
+bleiben automatische FotMob-Requests sichtbar blockiert; die manuelle
+Datumsbereich-Auswahl und die Anzeige bereits gespeicherter Daten bleiben
+verfügbar.
+
+### Production Activation and Validation (V0.5.9.1)
+
+`deploy/activate_fotmob.sh` setzt die Produktions-Gates in der vorhandenen
+Konfiguration, sichert die alte Datei, deaktiviert den separaten FotMob-Service
+und startet UI sowie Collector neu. `deploy/install_proxmox.sh` installiert
+zusätzlich `/etc/logrotate.d/wetten` mit dem korrekten Dienstbenutzer. Der
+Collector-Status enthält Version, Git-Commit/Branch, Dirty-State,
+Konfigurations-Fingerprint, effektive FotMob-Schalter, Resolver-/Detail-/HT-
+Zähler, Outbox-Alter und die Feature-Health.
+
+Die lokale Test- und Providerprüfung kann den tatsächlichen CT110-Live-Canary
+nicht ersetzen. Ohne Zugriff auf den privaten Proxmox-Container bleibt der
+Release-Status deshalb `PARTIAL`, bis dort `wetten-collector.service`,
+`systemctl is-active`, `logrotate -d` und ein echtes Live-Spiel geprüft wurden.
+Der lokale Prüfrahmen ist über `scripts/validate_v0591.py` ausführbar; der
+verbindliche Zwischenstand steht in `V0591_STATUS.md`:
+
+~~~bash
+python3 scripts/validate_v0591.py --run-tests --local-provider --live-canary
+~~~
 
 ### FotMob Historical Foundation (V0.5.2)
 
@@ -238,10 +261,10 @@ Minuten zurück. Halbzeit- und Endstand werden getrennt gespeichert; fehlende
 Werte bleiben `NULL`, und `second_half_goals` wird ausschließlich aus
 `FT total - HT total` für gültige Scores berechnet.
 
-Die Jobs sind bewusst getrennt. Standardmäßig ist
-`FOTMOB_NETWORK_MODE=manual`; Netzwerkzugriff entsteht nur durch einen bewusst
-manuell gestarteten Discovery-/Index-/Fetch-Job beziehungsweise den Button im
-Dashboard. Der Modus aktiviert keinen dauerhaften Worker:
+Die Jobs sind bewusst getrennt. Explizite CLI-/UI-Läufe können weiterhin
+`FOTMOB_NETWORK_MODE=manual` verwenden. Der installierte Produktionspfad läuft
+mit `worker` im integrierten Collector; der separate FotMob-Service wird nicht
+aktiviert:
 
 ~~~powershell
 # Bei einer expliziten Deaktivierung bleibt der Lauf ohne Netzwerkzugriff:
@@ -502,7 +525,7 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | COLLECTOR_SQL_TRACE_ENABLED | false | optionale SQL-/Commit-Messung für Benchmarks |
 | MAX_LIVE_ODDS_AGE_SECONDS | 10 | Freshness-Grenze für Live-Quoten |
 | DEFAULT_TOTAL_STAKE_EUR | 30 | Default-Einsatz für Szenarien |
-| FOTMOB_ENABLED | true | FotMob-Funktion; Netzwerk wird nur durch manuelle Läufe genutzt |
+| FOTMOB_ENABLED | true | FotMob-Funktion für integrierten read-only Produktionspfad |
 | FOTMOB_API_BASE_URL | https://www.fotmob.com/api | API-Basis für den öffentlichen FotMob-Datenzugriff |
 | FOTMOB_MATCH_DETAILS_PATH | /data/matchDetails?matchId={match_id} | öffentliches Matchdetail-JSON |
 | FOTMOB_TIMEOUT_SECONDS | 10 | FotMob-Timeout |
@@ -510,8 +533,8 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | FOTMOB_MIN_REQUEST_INTERVAL_SECONDS | 1 | Legacy-Intervall nur für `FIXED`; historische Standardläufe nutzen adaptive RPS |
 | FOTMOB_MATCHING_TOLERANCE_MINUTES | 15 | Kickoff-Matchingfenster |
 | FOTMOB_POLL_SECONDS | 30 | optionaler Worker-Poll |
-| FOTMOB_PROVIDER_DECISION | LIMITED_USE | V0.5.1-Providerentscheidung; Worker benötigt PRODUCTION_READY |
-| FOTMOB_AUTOMATED_USAGE | UNCLEAR | Nutzungsfreigabe; Worker benötigt ACCEPTABLE_FOR_PROJECT |
+| FOTMOB_PROVIDER_DECISION | PRODUCTION_READY | explizite Providerentscheidung für den integrierten Worker |
+| FOTMOB_AUTOMATED_USAGE | ACCEPTABLE_FOR_PROJECT | explizite Projektfreigabe für automatisierte read-only Nutzung |
 | FOTMOB_LEAGUE_PATH | /leagues/{league_id} | öffentliche League-Seite für Discovery |
 | FOTMOB_SEASON_PATH | /leagues/{league_id}?season={season_label} | öffentliche Fixture-/Result-Seite; Label wird als sichtbares `YYYY/YYYY` übergeben |
 | FOTMOB_DAILY_MATCHES_PATH | /data/matches?... | vollständiger FotMob-Tagesfeed inklusive `includeNextDayLateNight=true` |
@@ -520,7 +543,7 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | FOTMOB_DAILY_CCODE3 | DEU | Länderparameter des Tagesfeed-Requests; der Feed liefert mehrere Länder |
 | FOTMOB_DAILY_LOCALE | de | Sprache für Katalogbezeichnungen |
 | FOTMOB_HISTORY_ENABLED | true | Historical-Netzwerkzugriff, zusätzlich zur Providerfreigabe |
-| FOTMOB_NETWORK_MODE | manual | `off`, `manual` für explizite CLI-/UI-Läufe, `worker` nur mit Worker-Gates |
+| FOTMOB_NETWORK_MODE | worker | `off`, `manual` für explizite Läufe, `worker` für den integrierten Collector |
 | FOTMOB_RATE_MODE | adaptive | `adaptive`, `fixed` oder `conservative` |
 | FOTMOB_INITIAL_RPS | 5 | Startwert für adaptive Historical-Läufe |
 | FOTMOB_RPS_STEP | 5 | RPS-Schritt beim gesunden Ramp-up |

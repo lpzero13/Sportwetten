@@ -89,9 +89,19 @@ def is_plausible_live_feed(
         return False, "LIVE.events is missing or not an object"
     if not isinstance(events_by_sport, dict):
         return False, "LIVE.eventsBySport is missing or not an object"
-    soccer_items = events_by_sport.get("soccer")
-    if not isinstance(soccer_items, (list, tuple)):
-        return False, "LIVE.eventsBySport.soccer is missing or not a list"
+    # Tipico omits the soccer bucket when the live universe currently only
+    # contains other sports (for example tennis).  That is a valid no-soccer
+    # state, not a malformed response.  Once soccer events were active,
+    # however, an absent bucket is unsafe because it could terminalize the
+    # persisted/in-memory universe; keep the reconciliation guard below
+    # strict in that case.
+    active_reference = max(int(persisted_active_count), int(previous_active_count))
+    soccer_index_present = "soccer" in events_by_sport
+    soccer_items = events_by_sport.get("soccer", [])
+    if soccer_index_present and not isinstance(soccer_items, (list, tuple)):
+        return False, "LIVE.eventsBySport.soccer is present but not a list"
+    if not soccer_index_present and active_reference > 0:
+        return False, "soccer index missing while previously active events exist"
 
     soccer_ids = {
         item_id
@@ -105,15 +115,15 @@ def is_plausible_live_feed(
             event_ids.add(item_id)
     if soccer_ids and not soccer_ids.issubset(event_ids):
         return False, "soccer index references missing event objects"
-    if events and not soccer_ids:
+    if events and soccer_index_present and not soccer_ids and parsed_events:
         return False, "non-empty event map has no soccer index"
 
     parsed_ids = {str(event.event_id) for event in parsed_events}
     if soccer_ids and not soccer_ids.issubset(parsed_ids):
         return False, "soccer event could not be parsed completely"
-    # A structurally valid empty feed is safe only when no previously active
-    # event would be globally terminalized by that emptiness.
-    active_reference = max(int(persisted_active_count), int(previous_active_count))
+    # A structurally valid empty/no-soccer feed is safe only when no
+    # previously active event would be globally terminalized by that
+    # emptiness.
     if active_reference > 0 and not parsed_events:
         return False, "empty feed while previously active events exist"
     # A non-empty response can still be a truncated provider payload.  Keep

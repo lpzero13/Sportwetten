@@ -145,6 +145,12 @@ class FotMobTipicoResolver:
         )
         self.mappings = mappings
 
+    def _record_resolution(self, result: ResolverResult) -> ResolverResult:
+        recorder = getattr(self.service, "record_link_resolution", None)
+        if callable(recorder):
+            recorder(result.match_result)
+        return result
+
     def seed_default_competition_links(self) -> int:
         for mapping in self.mappings:
             self.service.store.upsert_competition_provider_link(
@@ -351,11 +357,13 @@ class FotMobTipicoResolver:
                 ),
                 reasons=["persisted_manual_invalidation"],
             )
-            return ResolverResult(
-                internal_id,
-                result,
-                [],
-                self.mapping_for_event(event),
+            return self._record_resolution(
+                ResolverResult(
+                    internal_id,
+                    result,
+                    [],
+                    self.mapping_for_event(event),
+                )
             )
         if (
             existing is not None
@@ -378,7 +386,9 @@ class FotMobTipicoResolver:
                 provider_match_id=str(provider_match_id),
                 reasons=["persisted_link_no_rematch"],
             )
-            return ResolverResult(internal_id, result, [], self.mapping_for_event(event))
+            return self._record_resolution(
+                ResolverResult(internal_id, result, [], self.mapping_for_event(event))
+            )
 
         mapping = self.mapping_for_event(event)
         # A known mapping that fails its country/name guard is a hard reject;
@@ -397,14 +407,18 @@ class FotMobTipicoResolver:
                 provider_match_id=None,
                 reasons=["competition_provider_mapping_missing_or_country_mismatch"],
             )
-            return ResolverResult(internal_id, result, [], None)
+            return self._record_resolution(ResolverResult(internal_id, result, [], None))
         # A competition without a learned provider mapping is still eligible
         # for safe discovery. ``candidate_rows`` narrows the daily index by
         # the exact normalized competition and country before team/kickoff
         # scoring, so this does not become a global fuzzy search.
         candidates = self.candidates(event)
-        result = self.service.match_tipico_event(event, candidates)
-        return ResolverResult(internal_id, result, candidates, mapping)
+        result = self.service.match_tipico_event(
+            event,
+            candidates,
+            _record_metrics=False,
+        )
+        return self._record_resolution(ResolverResult(internal_id, result, candidates, mapping))
 
     def resolve_many(self, events: list[Any]) -> list[ResolverResult]:
         return [self.resolve(event) for event in events]
