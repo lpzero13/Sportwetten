@@ -11,3 +11,9 @@ logs/*
 !logs/.gitkeep
 archived_logs/
 latest_logs/
+research/cache/
+research/models/
+research/output/
+research/ml_registry.sqlite
+research/ml_registry.sqlite-*
+research/ml_registry.sqlite.*

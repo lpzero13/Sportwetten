@@ -48,6 +48,7 @@ from .history_models import (
 )
 from .history_storage import FotMobHistoricalArchive, FotMobHistoryStore
 from .models import FotMobFetchResult
+from telemetry import SlowOperationTelemetry
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,12 +237,23 @@ class FotMobHistoryPipeline:
         )
         self._archive_lock = threading.RLock()
         self._daily_index_cache: dict[str, tuple[float, tuple[FotMobMatchIndexRecord, ...], str | None]] = {}
+        self._daily_index_cache_network_ready: dict[str, bool] = {}
+        self._daily_index_inflight: dict[str, threading.Event] = {}
         self._daily_index_cache_lock = threading.RLock()
         self._runtime_metrics_lock = threading.RLock()
-        self._runtime_metrics: dict[str, int] = {
+        self._runtime_metrics: dict[str, Any] = {
             "daily_index_requests": 0,
             "daily_index_errors": 0,
+            "daily_index_cache_hits": 0,
+            "daily_index_cache_misses": 0,
+            "daily_index_refreshes": 0,
+            "daily_index_singleflight_waiters": 0,
+            "daily_index_network_requests": 0,
+            "daily_index_generation": 0,
         }
+        self._slow_telemetry = SlowOperationTelemetry(
+            threshold_ms=float(getattr(settings, "slow_operation_threshold_ms", 500.0))
+        )
         self._last_daily_index_success: str | None = None
         self._last_daily_index_error: str | None = None
         known_stable_rps = self.store.known_stable_max_rps(
@@ -294,8 +306,10 @@ class FotMobHistoryPipeline:
     def _fetch_daily_index(self, endpoint: str) -> tuple[dict[str, Any] | None, str | None]:
         """Fetch one compact daily feed and expose request/error counters."""
 
+        started = time.perf_counter()
         with self._runtime_metrics_lock:
             self._runtime_metrics["daily_index_requests"] += 1
+            self._runtime_metrics["daily_index_network_requests"] += 1
         payload, error = self._fetch_json(endpoint)
         with self._runtime_metrics_lock:
             if payload is None:
@@ -304,6 +318,16 @@ class FotMobHistoryPipeline:
             else:
                 self._last_daily_index_success = _now()
                 self._last_daily_index_error = None
+        self._slow_telemetry.record(
+            "fotmob_daily_index_refresh",
+            (time.perf_counter() - started) * 1000.0,
+            details={
+                "cache": "network",
+                "endpoint": endpoint,
+                "error": error,
+                "payload_bytes": len(json.dumps(payload, default=str).encode("utf-8")) if payload is not None else 0,
+            },
+        )
         return payload, error
 
     def runtime_metrics(self) -> dict[str, Any]:
@@ -313,7 +337,18 @@ class FotMobHistoryPipeline:
             result: dict[str, Any] = dict(self._runtime_metrics)
             result["last_fotmob_daily_index_success"] = self._last_daily_index_success
             result["last_fotmob_daily_index_error"] = self._last_daily_index_error
-            return result
+        with self._daily_index_cache_lock:
+            ages = [
+                max(0.0, time.monotonic() - value[0])
+                for value in self._daily_index_cache.values()
+            ]
+        # ``max`` reports the oldest live cache entry.  A minimum would make
+        # the dashboard look fresh merely because one unrelated date was
+        # refreshed recently.
+        result["daily_index_age_seconds"] = round(max(ages), 3) if ages else None
+        result["daily_index_cache_entries"] = len(ages)
+        result["slow_operations"] = self._slow_telemetry.snapshot()
+        return result
 
     def _fetch_json(self, endpoint: str) -> tuple[dict[str, Any] | None, str | None]:
         fetched = self.client.fetch_json(endpoint)
@@ -1007,27 +1042,44 @@ class FotMobHistoryPipeline:
         *,
         allow_network: bool = False,
         force: bool = False,
-        cache_ttl_seconds: float = 300.0,
+        cache_ttl_seconds: float | None = None,
     ) -> tuple[list[FotMobMatchIndexRecord], str | None]:
-        """Return one all-league daily fixture index with a short RAM cache.
+        """Return one all-league daily fixture index with shared single-flight.
 
         The durable ``fotmob_daily_index`` remains the warm cache across
         restarts.  A network refresh is opt-in at this boundary and fetches
         only the compact daily feed; no ``matchDetails`` request is made for
-        identification.
+        identification.  All callers for the same provider/date/context share
+        this cache and at most one refresh can be active at a time.
         """
 
         day_value = self._coerce_date(observation_date)
         day = day_value.isoformat()
-        now_monotonic = time.monotonic()
-        with self._daily_index_cache_lock:
-            cached = self._daily_index_cache.get(day)
-            if (
-                cached is not None
-                and not force
-                and now_monotonic - cached[0] < max(0.0, float(cache_ttl_seconds))
-            ):
-                return list(cached[1]), cached[2]
+        ttl = max(
+            0.0,
+            float(
+                getattr(self.settings, "fotmob_daily_index_cache_ttl_seconds", 300.0)
+                if cache_ttl_seconds is None
+                else cache_ttl_seconds
+            ),
+        )
+        cache_key = self._daily_index_cache_key(day_value)
+
+        def cached_value() -> tuple[list[FotMobMatchIndexRecord], str | None] | None:
+            now = time.monotonic()
+            with self._daily_index_cache_lock:
+                cached = self._daily_index_cache.get(cache_key)
+                network_ready = self._daily_index_cache_network_ready.get(cache_key, True)
+                if cached is None or force or now - cached[0] >= ttl or (allow_network and not network_ready):
+                    return None
+                result = (list(cached[1]), cached[2])
+            with self._runtime_metrics_lock:
+                self._runtime_metrics["daily_index_cache_hits"] += 1
+            return result
+
+        fresh = cached_value()
+        if fresh is not None:
+            return fresh
 
         durable_rows = self.store.daily_index(
             start_date=day,
@@ -1037,73 +1089,149 @@ class FotMobHistoryPipeline:
             ascending=True,
         )
         durable_records = tuple(_row_to_index(row) for row in durable_rows)
-        if durable_records and not (allow_network and force):
+
+        # A durable row is a valid warm cache across restarts.  When a network
+        # refresh is explicitly allowed, its own fetched_at is also subject to
+        # the same TTL; this avoids refreshing an already fresh daily index.
+        durable_age = self._daily_index_durable_age_seconds(durable_rows)
+        if not allow_network or (not force and durable_age is not None and durable_age < ttl):
             with self._daily_index_cache_lock:
-                self._daily_index_cache[day] = (now_monotonic, durable_records, None)
-            return list(durable_records), None
-        if not allow_network:
-            with self._daily_index_cache_lock:
-                self._daily_index_cache[day] = (now_monotonic, durable_records, None)
+                self._daily_index_cache[cache_key] = (time.monotonic(), durable_records, None)
+                self._daily_index_cache_network_ready[cache_key] = bool(allow_network)
+            with self._runtime_metrics_lock:
+                self._runtime_metrics["daily_index_cache_hits"] += 1
             return list(durable_records), None
 
-        endpoint = self._daily_feed_endpoint(day_value)
-        payload, error = self._fetch_daily_index(endpoint)
-        if payload is None:
-            # Never discard a known-good catalog because the refresh was
-            # transiently unavailable.
-            message = error or "FotMob-Tagesfeed konnte nicht geladen werden"
-            with self._daily_index_cache_lock:
-                self._daily_index_cache[day] = (now_monotonic, durable_records, message)
-            return list(durable_records), message
-
-        fetched_at = _now()
-        records = tuple(
-            extract_daily_match_index(
-                payload,
-                observation_date=day_value,
-                first_seen_at=fetched_at,
-            )
-        )
-        self.store.upsert_match_index(records)
-        self.store.upsert_seasons(
-            FotMobSeasonRef(
-                provider=record.provider,
-                league_id=record.league_id,
-                season_id=record.season_id,
-                season_label=record.season_label,
-                league_name=record.league_name,
-                country=record.country_name or record.country,
-                discovered_at=fetched_at,
-            )
-            for record in records
-        )
-        self.store.upsert_daily_index(
-            records,
-            observation_date=day,
-            source_endpoint=endpoint,
-            payload_hash=_payload_hash(payload),
-            fetched_at=fetched_at,
-        )
-        summary = summarize_daily_feed(payload)
-        self.store.record_daily_load_run(
-            day,
-            "ALL",
-            season_id="DAILY_FEED",
-            status="COMPLETE",
-            fixture_count=len(records),
-            selected_count=len(records),
-            feed_group_count=summary["feed_group_count"],
-            feed_entry_count=summary["feed_entry_count"],
-            feed_unique_count=summary["feed_unique_count"],
-            next_day_count=summary["next_day_count"],
-            duplicates_removed_count=summary["duplicates_removed_count"],
-            payload_hash=_payload_hash(payload),
-            source_endpoint=endpoint,
-            fetched_at=fetched_at,
-        )
+        leader = False
         with self._daily_index_cache_lock:
-            self._daily_index_cache[day] = (time.monotonic(), records, None)
-        return list(records), None
+            inflight = self._daily_index_inflight.get(cache_key)
+            if inflight is None:
+                inflight = threading.Event()
+                self._daily_index_inflight[cache_key] = inflight
+                leader = True
+            else:
+                with self._runtime_metrics_lock:
+                    self._runtime_metrics["daily_index_singleflight_waiters"] += 1
+        if not leader:
+            inflight.wait()
+            return self.load_daily_fixture_index(
+                day_value,
+                allow_network=allow_network,
+                force=False,
+                cache_ttl_seconds=ttl,
+            )
+
+        with self._runtime_metrics_lock:
+            self._runtime_metrics["daily_index_cache_misses"] += 1
+            self._runtime_metrics["daily_index_refreshes"] += 1
+        endpoint = self._daily_feed_endpoint(day_value)
+        cached_records = durable_records
+        cached_error: str | None = None
+        try:
+            payload, error = self._fetch_daily_index(endpoint)
+            if payload is None:
+                # Never discard a known-good catalog because the refresh was
+                # transiently unavailable.
+                cached_error = error or "FotMob-Tagesfeed konnte nicht geladen werden"
+                return list(durable_records), cached_error
+
+            fetched_at = _now()
+            records = tuple(
+                extract_daily_match_index(
+                    payload,
+                    observation_date=day_value,
+                    first_seen_at=fetched_at,
+                )
+            )
+            self.store.upsert_match_index(records)
+            self.store.upsert_seasons(
+                FotMobSeasonRef(
+                    provider=record.provider,
+                    league_id=record.league_id,
+                    season_id=record.season_id,
+                    season_label=record.season_label,
+                    league_name=record.league_name,
+                    country=record.country_name or record.country,
+                    discovered_at=fetched_at,
+                )
+                for record in records
+            )
+            self.store.upsert_daily_index(
+                records,
+                observation_date=day,
+                source_endpoint=endpoint,
+                payload_hash=_payload_hash(payload),
+                fetched_at=fetched_at,
+            )
+            summary = summarize_daily_feed(payload)
+            self.store.record_daily_load_run(
+                day,
+                "ALL",
+                season_id="DAILY_FEED",
+                status="COMPLETE",
+                fixture_count=len(records),
+                selected_count=len(records),
+                feed_group_count=summary["feed_group_count"],
+                feed_entry_count=summary["feed_entry_count"],
+                feed_unique_count=summary["feed_unique_count"],
+                next_day_count=summary["next_day_count"],
+                duplicates_removed_count=summary["duplicates_removed_count"],
+                payload_hash=_payload_hash(payload),
+                source_endpoint=endpoint,
+                fetched_at=fetched_at,
+            )
+            with self._runtime_metrics_lock:
+                self._runtime_metrics["daily_index_generation"] += 1
+            cached_records = records
+            return list(records), None
+        except Exception as exc:
+            cached_error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            with self._daily_index_cache_lock:
+                self._daily_index_cache[cache_key] = (
+                    time.monotonic(),
+                    tuple(cached_records),
+                    cached_error,
+                )
+                self._daily_index_cache_network_ready[cache_key] = True
+                event = self._daily_index_inflight.pop(cache_key, None)
+                if event is not None:
+                    event.set()
+
+    def _daily_index_cache_key(self, observation_date: date) -> str:
+        """Build the service-level cache key, including request context."""
+
+        return "|".join(
+            (
+                "FOTMOB",
+                observation_date.isoformat(),
+                str(getattr(self.settings, "fotmob_daily_timezone", "Europe/Berlin")),
+                str(getattr(self.settings, "fotmob_daily_ccode3", "DEU")).upper(),
+                str(getattr(self.settings, "fotmob_daily_locale", "de")),
+            )
+        )
+
+    @staticmethod
+    def _daily_index_durable_age_seconds(rows: list[Any]) -> float | None:
+        timestamps: list[datetime] = []
+        for row in rows:
+            try:
+                value = row["fetched_at"]
+            except (KeyError, IndexError, TypeError):
+                value = None
+            if not value:
+                continue
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                timestamps.append(parsed.astimezone(timezone.utc))
+            except (TypeError, ValueError):
+                continue
+        if not timestamps:
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - max(timestamps)).total_seconds())
 
     def _all_leagues_date_range(
         self,

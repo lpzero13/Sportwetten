@@ -37,8 +37,12 @@ Der aktuelle Projektumfang umfasst:
   capability-basierte Smart-Live-Universe-Priorisierung
 - V0.5.9.1: integrierter FotMob-Produktionspfad mit sichtbarer Runtime-Matrix,
   Feature-Health, Resolver-/HT-Metriken, Deploy-Identität und Logrotate-Härtung
+- V0.6.0: getrennte historische HT-ML-Research-Factory mit Leakage-Audit,
+  kanonischem Parquet-Cache, Walk-forward-Validation, Registry, Resume und
+  reproduzierbaren Reports
 
-Nicht enthalten sind eigene ML-Wahrscheinlichkeiten, FotMob-Quoten,
+Nicht enthalten sind Live-ML-Wahrscheinlichkeiten oder eine automatische
+Modellaktivierung, FotMob-Quoten,
 WebSocket/STOMP, Inhaltsfilter, automatische Optimierung und echte Wettabgabe.
 
 ## Voraussetzungen
@@ -107,6 +111,65 @@ Die optionalen Einstellungen liegen nach der Installation in
 `/etc/default/tipico-observer`. Für ein Update genügt anschließend ein
 `git pull` mit Root-Rechten und ein erneuter Aufruf von
 `bash deploy/install_proxmox.sh`.
+
+## V0.6.0 Historical HT ML Research Factory
+
+Die Research-Engine ist ein separater, ausdrücklich gestarteter Prozess. Sie
+liest die vorhandenen FotMob-Parquet-Dateien read-only und erzeugt ihren
+eigenen Cache, ihre Registry, Modelle und Reports. Installation, UI-Start,
+Collector-Neustart und Container-Neustart starten kein Training.
+
+~~~powershell
+python -m research.ml_v060 audit
+python -m research.ml_v060 build-dataset --workers 10
+python -m research.ml_v060 run --mode local
+python -m research.ml_v060 resume
+python -m research.ml_v060 report
+python -m research.ml_v060 export-models --top-k 5
+~~~
+
+`local` trainiert höchstens die zehn handverlesenen Startkonfigurationen.
+`--max-experiments N` bedeutet immer bis zu `N` neue Experimente in diesem
+Aufruf; bereits registrierte Konfigurationen werden dedupliziert. Für größere
+explizite Läufe stehen beispielsweise `--mode standard --max-experiments 100`
+oder `--mode deep --max-experiments 1000` zur Verfügung. Eigene YAML-/JSON-
+Konfigurationen können mit `run --mode custom --config experiments.yaml`
+gestartet werden. Der Locked-Testzeitraum bleibt für die spätere Shortlist
+reserviert und wird im lokalen Lauf nicht zur Modellauswahl verwendet.
+
+Die zentralen Ergebnisse liegen lokal unter
+`research/cache/`, `research/ml_registry.sqlite`, `research/models/v060/` und
+`research/output/v060/`; diese erzeugten Daten sind absichtlich nicht Teil des
+Git-Repositories. Das Target sind ausschließlich reguläre Tore nach der
+Halbzeit (`H2_GOALS_0`, `H2_GOALS_1`/`LOSS_MIDDLE`, `H2_GOALS_2_PLUS`). V0.6.0
+beansprucht weder ROI noch eine Aktivierung für CT110 oder Paper Trading.
+
+### V0.6.1 Research-Hardening
+
+Die optionalen Research-Abhängigkeiten werden separat und reproduzierbar
+installiert:
+
+~~~powershell
+python -m pip install -r requirements-research.txt
+python -m research.ml_v060 preflight --container
+python -m research.ml_v060 plan --mode deep --max-experiments 100
+python -m research.ml_v060 run --mode deep --max-experiments 100
+~~~
+
+`preflight` führt für CatBoost einen echten Fit-, Predict-, Serialize- und
+Reload-Smoke-Test aus. `plan` trainiert nicht. Standard/Deep starten bei
+fehlender CatBoost-Fähigkeit oder verändertem Dataset-Hash nicht; ein
+angefordertes optionales Modell wird niemals still durch ein anderes ersetzt.
+Pro Experiment bleiben Registry-Metriken, Environment-/Dataset-Hashes und
+OOF-Predictions erhalten. Große Modell-Binaries werden standardmäßig auf die
+Top-2 je tatsächlich instanziierter Modellfamilie sowie explizit gepinnte
+Experimente begrenzt (`V061_ARTIFACT_TOP_K_PER_FAMILY`,
+`V061_PINNED_EXPERIMENTS`). Der Collector veröffentlicht zusätzlich Cache-,
+Resolver-, WAL-, Transaktions- und Slow-Operation-Metriken; schwere Status-
+Aggregationen laufen mit TTL und zeigen ihr `metric_age_seconds`.
+Die Nachtlaufdateien `V061_STATUS.md` und `V061_OVERNIGHT_REPORT.md` werden im
+Projektroot erzeugt. CT110-Canary und Collector-Beobachtung müssen dort
+separat ausgeführt werden.
 
 ## Bedienung
 

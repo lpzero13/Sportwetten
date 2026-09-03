@@ -44,10 +44,13 @@ from services.event_service import EventService, EventRefreshResult
 from services.live_universe import (
     LiveUniverse,
     LiveUniverseDecision,
+    P0_SELECTED,
+    P1_STRATEGY_ELIGIBLE,
     P2_DISCOVERY,
     P3_MINIMAL,
     P4_IGNORE,
 )
+from telemetry import SlowOperationTelemetry
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checkers
     from fotmob.service import FotMobService
@@ -325,6 +328,9 @@ class Collector:
         self._halftime_missing_events: dict[str, str] = {}
         self._runtime_identity = runtime_identity(settings.root_dir)
         self._config_fingerprint = config_fingerprint(settings)
+        self._slow_telemetry = SlowOperationTelemetry(
+            threshold_ms=float(getattr(settings, "slow_operation_threshold_ms", 500.0))
+        )
         startup_matrix = feature_runtime_matrix(
             self.settings,
             fotmob_service=self.fotmob_service,
@@ -400,7 +406,13 @@ class Collector:
         )
         ttl = max(
             1.0,
-            float(getattr(self.settings, "collection_metrics_cache_ttl_seconds", 30.0)),
+            float(
+                getattr(
+                    self.settings,
+                    "status_heavy_metrics_ttl_seconds",
+                    getattr(self.settings, "collection_metrics_cache_ttl_seconds", 30.0),
+                )
+            ),
         )
         cached = (
             not force_refresh
@@ -419,7 +431,13 @@ class Collector:
         day = datetime.now(timezone.utc).date().isoformat()
         ttl = max(
             0.0,
-            float(getattr(self.settings, "collection_metrics_cache_ttl_seconds", 30.0)),
+            float(
+                getattr(
+                    self.settings,
+                    "status_heavy_metrics_ttl_seconds",
+                    getattr(self.settings, "collection_metrics_cache_ttl_seconds", 30.0),
+                )
+            ),
         )
         age = (
             max(0.0, now - self._collection_metrics_cache_at)
@@ -521,9 +539,30 @@ class Collector:
             if previous is not None and _is_halftime(previous):
                 self.halftime_disappearance_count += 1
                 self._halftime_missing_events[str(event_id)] = _now_iso()
-        for event_id, event in current_events.items():
-            decision = self._universe_decision(event)
-            previous = previous_events.get(event_id)
+        work_items = [
+            (event_id, event, self._universe_decision(event), previous_events.get(event_id))
+            for event_id, event in current_events.items()
+        ]
+        priority_rank = {
+            P0_SELECTED: 0,
+            P1_STRATEGY_ELIGIBLE: 2,
+            P2_DISCOVERY: 3,
+            P3_MINIMAL: 4,
+            P4_IGNORE: 5,
+        }
+        # A halftime edge is a latency-sensitive trigger.  Process it before
+        # ordinary discovery work so a busy low-priority universe cannot push
+        # the HZ resolver/detail attempt behind a long queue.
+        work_items.sort(
+            key=lambda item: (
+                0 if _is_halftime(item[1]) else priority_rank.get(
+                    item[2].priority if item[2] is not None else P1_STRATEGY_ELIGIBLE,
+                    3,
+                ),
+                str(item[0]),
+            )
+        )
+        for event_id, event, decision, previous in work_items:
             if event_id in self._halftime_missing_events:
                 self.halftime_recovery_count += 1
                 self._halftime_missing_events.pop(event_id, None)
@@ -536,8 +575,12 @@ class Collector:
             # appearance is the second deterministic opportunity to resolve
             # it.  The resolver uses the daily fixture index and keeps a
             # confirmed link in the durable provider-link layer.
-            if previous is None:
-                self._resolve_fotmob_link(event)
+            if previous is None and not _is_halftime(event) and self._fotmob_resolver_allowed(
+                event,
+                decision,
+                trigger="LIVE_START",
+            ):
+                self._resolve_fotmob_link(event, trigger="LIVE_START", priority="P1")
             state = self._event_states.setdefault(event_id, CollectorEventState())
             observed_at = result.metrics.response_received_at if result.metrics else _now_iso()
             previous_h2 = self._second_half_goals(previous) if previous is not None else None
@@ -632,14 +675,6 @@ class Collector:
         if decision is not None and not decision.fotmob_probe_allowed:
             self._fotmob_detail_requests_avoided += 1
             return
-        if (
-            decision is not None
-            and decision.priority == P2_DISCOVERY
-            and self.live_universe is not None
-            and not self.live_universe.discovery_probe_due(event)
-        ):
-            self._fotmob_detail_requests_avoided += 1
-            return
         try:
             resolved = self._fotmob_link_resolution_results.get(str(event.event_id))
             resolved_status = getattr(
@@ -651,7 +686,7 @@ class Collector:
                 "MANUAL",
                 "MANUALLY_CONFIRMED",
             }:
-                resolved = self._resolve_fotmob_link(event)
+                resolved = self._resolve_fotmob_link(event, trigger="HALFTIME", priority="P0")
             if resolved is None:
                 return
             status = getattr(getattr(resolved, "match_result", None), "status", "UNMATCHED")
@@ -676,14 +711,62 @@ class Collector:
                 exc,
             )
 
-    def _resolve_fotmob_link(self, event: LiveEvent) -> Any | None:
+    def _fotmob_resolver_allowed(
+        self,
+        event: LiveEvent,
+        decision: LiveUniverseDecision | None,
+        *,
+        trigger: str,
+    ) -> bool:
+        """Apply universe policy before any provider-link resolver work.
+
+        P2 discovery is deliberately rate-limited per competition.  A
+        halftime/selected trigger is allowed to jump that P2 probe gate, but
+        a known ``NO_DATA`` capability still prevents background work unless
+        the universe explicitly marked the event as selected.
+        """
+
+        if decision is None:
+            return True
+        if decision.priority in {P3_MINIMAL, P4_IGNORE}:
+            return False
+        if not decision.fotmob_probe_allowed and decision.priority != P0_SELECTED:
+            return False
+        if (
+            decision.priority == P2_DISCOVERY
+            and str(trigger).upper() not in {"HALFTIME", "HT_STABLE", "SELECTED"}
+            and self.live_universe is not None
+            and not self.live_universe.discovery_probe_due(event)
+        ):
+            return False
+        return True
+
+    def _resolve_fotmob_link(
+        self,
+        event: LiveEvent,
+        *,
+        trigger: str = "POLL",
+        priority: str | None = None,
+    ) -> Any | None:
         """Resolve an index-only provider link without making a detail request."""
 
         service = self.fotmob_service
         if service is None or not getattr(service, "automated_worker_allowed", False):
             return None
         try:
-            resolved = service.resolver.resolve(event)
+            try:
+                resolved = service.resolver.resolve(
+                    event,
+                    trigger=trigger,
+                    priority=priority,
+                )
+            except TypeError as exc:
+                # Keep small injected test/dry-run resolvers compatible with
+                # the pre-V0.6.1 one-argument protocol.  Do not swallow a
+                # TypeError from the actual resolver implementation.
+                if "unexpected keyword" not in str(exc):
+                    raise
+                resolved = service.resolver.resolve(event)
             if resolved is not None:
                 self._fotmob_link_resolution_results[str(event.event_id)] = resolved
             return resolved
@@ -743,8 +826,12 @@ class Collector:
             if not accepted:
                 continue
             decision = self._universe_decision(event)
-            if decision is None or decision.priority not in {P3_MINIMAL, P4_IGNORE}:
-                self._resolve_fotmob_link(event)
+            if self._fotmob_resolver_allowed(
+                event,
+                decision,
+                trigger="PREMATCH",
+            ):
+                self._resolve_fotmob_link(event, trigger="PREMATCH", priority="P1")
             if not event.kickoff_time or event.status.strip().lower() not in {
                 "pre_match",
                 "prematch",
@@ -1267,6 +1354,7 @@ class Collector:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def _export_snapshots_if_due(self, *, force: bool = False) -> None:
+        export_started = time.perf_counter()
         now = time.monotonic()
         if (
             not force
@@ -1294,6 +1382,14 @@ class Collector:
                     )
             except Exception as exc:  # optional sink must not stop collection
                 self._record_error(f"FotMob Parquet export failed: {exc}")
+        self._slow_telemetry.record(
+            "archive_export",
+            (time.perf_counter() - export_started) * 1000.0,
+            details={
+                "outbox_pending": self.database.count_rows("snapshot_outbox"),
+                "force": bool(force),
+            },
+        )
 
     def status(self, *, force_refresh: bool = False) -> dict:
         status_started = time.perf_counter()
@@ -1341,6 +1437,17 @@ class Collector:
                 "last_error": None,
             }
         )
+        wal_metrics = (
+            self.database.wal_observability()
+            if hasattr(self.database, "wal_observability")
+            else {}
+        )
+        event_slow = getattr(self.event_service, "_slow_telemetry", None)
+        slow_operations = self._slow_telemetry.snapshot()
+        if fotmob_runtime.get("slow_operations"):
+            slow_operations["fotmob_service"] = fotmob_runtime["slow_operations"]
+        if event_slow is not None:
+            slow_operations["db_persistence"] = event_slow.snapshot()
         last_success = {
             "last_fotmob_daily_index_success": fotmob_runtime.get(
                 "last_fotmob_daily_index_success"
@@ -1448,6 +1555,13 @@ class Collector:
                 }
             )
 
+        metric_ages = [
+            coverage_meta.get("collection_metrics_age_seconds"),
+            archive_age,
+            fotmob_runtime.get("daily_index_age_seconds"),
+        ]
+        metric_ages = [float(value) for value in metric_ages if value is not None]
+        metric_age_seconds = max(metric_ages) if metric_ages else None
         base_status = "RUNNING" if self._running else "COMPLETED"
         result = {
             "status": f"{base_status}_DEGRADED" if warnings else base_status,
@@ -1523,6 +1637,8 @@ class Collector:
             "fotmob": fotmob_status,
             "coverage": coverage,
             "collection_metrics_age_seconds": coverage_meta["collection_metrics_age_seconds"],
+            "heavy_metrics_age_seconds": coverage_meta["collection_metrics_age_seconds"],
+            "metric_age_seconds": metric_age_seconds,
             "collection_metrics_cached": coverage_meta["collection_metrics_cached"],
             "collection_metrics_last_refresh": coverage_meta["collection_metrics_last_refresh"],
             "event_service": {
@@ -1538,6 +1654,18 @@ class Collector:
                 "last_timing_ms": dict(getattr(self.event_service, "last_timing", {})),
                 "last_sql_metrics": dict(getattr(self.event_service, "last_sql_metrics", {})),
             },
+            "database_transactions": (
+                self.database.transaction_metrics()
+                if hasattr(self.database, "transaction_metrics")
+                else {}
+            ),
+            "database_wal": wal_metrics,
+            "database_strategy_sql": (
+                self.database.strategy_sql_observability()
+                if hasattr(self.database, "strategy_sql_observability")
+                else {}
+            ),
+            "slow_operations": slow_operations,
             "smart_live_universe": universe_summary,
             "timings_ms": {
                 "feed_network": (
@@ -1564,6 +1692,19 @@ class Collector:
             },
         }
         result["status_runtime_ms"] = (time.perf_counter() - status_started) * 1000.0
+        self._slow_telemetry.record(
+            "status_generation",
+            result["status_runtime_ms"],
+            details={
+                "queue": result["queue_depth"],
+                "active_requests": result["active_detail_requests"],
+                "metric_age_seconds": result["metric_age_seconds"],
+                "wal_size_bytes": wal_metrics.get("wal_size_bytes"),
+            },
+        )
+        result["slow_operations"] = self._slow_telemetry.snapshot() | {
+            "db_persistence": event_slow.snapshot() if event_slow is not None else {},
+        }
         return result
 
     def _write_status(self, *, force: bool = False) -> None:

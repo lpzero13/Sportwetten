@@ -1046,6 +1046,24 @@ SNAPSHOT_COLUMNS = (
     "exported_at", "payload_hash",
 )
 
+# Keep the production strategy-event serializer and every INSERT path on one
+# canonical column contract.  This is deliberately a tuple (rather than a
+# hand-counted placeholder string) so schema/value drift fails before SQLite
+# is called.
+STRATEGY_EVALUATION_COLUMNS = (
+    "event_id", "observed_at", "strategy_type", "strategy_version",
+    "normalizer_version", "status", "total_stake", "q_zero",
+    "q_two_plus", "source_zero", "source_two_plus", "stake_zero",
+    "stake_two_plus", "payout_zero", "payout_two_plus",
+    "payout_difference", "covered_profit", "win_roi", "p1_max",
+    "p1_tipico", "p1_buffer", "p_zero", "p_one", "p_two_plus",
+    "trigger_type", "is_eligible",
+)
+
+
+def _sql_placeholders(columns: Iterable[str]) -> str:
+    return ", ".join("?" for _ in columns)
+
 
 class Database:
     """Thread-safe SQLite wrapper with explicit observation semantics."""
@@ -1060,6 +1078,13 @@ class Database:
             timeout=30,
         )
         self.connection.row_factory = sqlite3.Row
+        self._transaction_metrics_lock = threading.RLock()
+        self._transaction_metrics: dict[str, int] = {
+            "db_transactions": 0,
+            "db_commits": 0,
+            "db_rollbacks": 0,
+        }
+        self._strategy_sql_error_count = 0
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 30000")
         self.connection.execute("PRAGMA journal_mode = WAL")
@@ -1273,13 +1298,72 @@ class Database:
 
         with self._lock:
             self.connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            with self._transaction_metrics_lock:
+                self._transaction_metrics["db_transactions"] += 1
             try:
                 yield self.connection
             except Exception:
                 self.connection.rollback()
+                with self._transaction_metrics_lock:
+                    self._transaction_metrics["db_rollbacks"] += 1
                 raise
             else:
                 self.connection.commit()
+                with self._transaction_metrics_lock:
+                    self._transaction_metrics["db_commits"] += 1
+
+    def transaction_metrics(self, *, reset: bool = False) -> dict[str, int]:
+        """Return explicit transaction counters for collector diagnostics."""
+
+        with self._transaction_metrics_lock:
+            result = dict(self._transaction_metrics)
+            if reset:
+                for key in self._transaction_metrics:
+                    self._transaction_metrics[key] = 0
+            return result
+
+    def wal_observability(self) -> dict[str, Any]:
+        """Expose WAL facts without forcing a checkpoint or reducing durability."""
+
+        wal_path = Path(str(self.path) + "-wal")
+        try:
+            wal_size = wal_path.stat().st_size if wal_path.exists() else 0
+        except OSError:
+            wal_size = 0
+        with self._lock:
+            journal = self.connection.execute("PRAGMA journal_mode").fetchone()
+            synchronous = self.connection.execute("PRAGMA synchronous").fetchone()
+        return {
+            "wal_path": str(wal_path),
+            "wal_size_bytes": int(wal_size),
+            "journal_mode": str(journal[0]) if journal else None,
+            "synchronous": int(synchronous[0]) if synchronous else None,
+            "checkpoint_events": 0,
+            "checkpoint_duration_ms": 0.0,
+            "checkpoint_policy": "OBSERVE_ONLY",
+        }
+
+    def strategy_sql_observability(self) -> dict[str, Any]:
+        """Expose the production strategy INSERT contract for runtime status."""
+
+        return {
+            "columns_count": len(STRATEGY_EVALUATION_COLUMNS),
+            "placeholders_count": len(STRATEGY_EVALUATION_COLUMNS),
+            "bind_mismatch_errors": int(self._strategy_sql_error_count),
+            "status": "PASS" if self._strategy_sql_error_count == 0 else "FAIL",
+        }
+
+    def _assert_strategy_bind_count(
+        self,
+        statement: str,
+        parameters: tuple[Any, ...],
+        label: str,
+    ) -> None:
+        try:
+            _assert_sql_bind_count(statement, parameters, label)
+        except RuntimeError:
+            self._strategy_sql_error_count += 1
+            raise
 
     @contextmanager
     def trace_sql(self):
@@ -2141,6 +2225,13 @@ class Database:
         return {
             "changed_state_count": changed_states,
             "history_state_count": history_states,
+            "rows_changed": changed_states + history_states,
+            # The feed path deliberately uses exactly one logical transaction;
+            # expose that fact for production benchmarks.  The explicit
+            # transaction context also updates the cumulative counters.
+            "db_transactions": 1,
+            "db_commits": 1,
+            "db_rollbacks": 0,
             "reconciled_event_ids": reconciled,
             "ignored_event_ids": ignored,
             "stale_pre_match_event_ids": stale_ids,
@@ -2190,18 +2281,10 @@ class Database:
             transition_at = str(values.get("observed_at"))
             with self.connection:
                 if transition is not None:
-                    evaluation_sql = """
-                        INSERT INTO strategy_evaluations (
-                            event_id, observed_at, strategy_type, strategy_version,
-                            normalizer_version, status, total_stake, q_zero,
-                            q_two_plus, source_zero, source_two_plus, stake_zero,
-                            stake_two_plus, payout_zero, payout_two_plus,
-                            payout_difference, covered_profit, win_roi, p1_max,
-                            p1_tipico, p1_buffer, p_zero, p_one, p_two_plus,
-                            trigger_type, is_eligible
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """
+                    evaluation_sql = (
+                        f"INSERT INTO strategy_evaluations ({', '.join(STRATEGY_EVALUATION_COLUMNS)}) "
+                        f"VALUES ({_sql_placeholders(STRATEGY_EVALUATION_COLUMNS)})"
+                    )
                     evaluation_params = (
                         event_id, values["observed_at"], strategy_type,
                         values.get("strategy_version") or "",
@@ -2217,7 +2300,7 @@ class Database:
                         values.get("p_zero"), values.get("p_one"),
                         values.get("p_two_plus"), transition, int(eligible),
                     )
-                    _assert_sql_bind_count(
+                    self._assert_strategy_bind_count(
                         evaluation_sql,
                         evaluation_params,
                         "strategy_evaluations",
@@ -2283,7 +2366,7 @@ class Database:
                     transition, transition_at if transition else None,
                     evaluation_id, datetime.now(timezone.utc).isoformat(), int(eligible),
                 )
-                _assert_sql_bind_count(
+                self._assert_strategy_bind_count(
                     current_strategy_sql,
                     current_strategy_params,
                     "current_strategy_evaluations",
@@ -2304,32 +2387,22 @@ class Database:
     ) -> int:
         """Append one explicitly requested strategy audit event and return its ID."""
 
-        columns = (
-            "event_id", "observed_at", "strategy_type", "strategy_version",
-            "normalizer_version", "status", "total_stake", "q_zero",
-            "q_two_plus", "source_zero", "source_two_plus", "stake_zero",
-            "stake_two_plus", "payout_zero", "payout_two_plus",
-            "payout_difference", "covered_profit", "win_roi", "p1_max",
-            "p1_tipico", "p1_buffer", "p_zero", "p_one", "p_two_plus",
-            "trigger_type", "is_eligible",
-        )
+        columns = STRATEGY_EVALUATION_COLUMNS
         available = values.keys() if hasattr(values, "keys") else ()
 
         def value(column: str) -> Any:
             return values[column] if column in available else None
 
-        params = tuple(
-            value(column)
-            for column in columns[:-2]
-        ) + (str(trigger_type), int(bool(is_eligible)))
+        params = tuple(value(column) for column in columns[:-2]) + (
+            str(trigger_type), int(bool(is_eligible)),
+        )
+        statement = (
+            f"INSERT INTO strategy_evaluations ({', '.join(columns)}) "
+            f"VALUES ({_sql_placeholders(columns)})"
+        )
+        self._assert_strategy_bind_count(statement, params, "strategy_evaluations")
         with self._lock, self.connection:
-            cursor = self.connection.execute(
-                f"""
-                INSERT INTO strategy_evaluations ({', '.join(columns)})
-                VALUES ({', '.join('?' for _ in columns)})
-                """,
-                params,
-            )
+            cursor = self.connection.execute(statement, params)
             evaluation_id = int(cursor.lastrowid)
         return evaluation_id
 
@@ -2997,20 +3070,12 @@ class Database:
             if not force and previous is not None and tuple(previous) == signature:
                 return False
             with self.connection:
-                self.connection.execute(
-                    """
+                strategy_sql = f"""
                     INSERT INTO strategy_evaluations (
-                        event_id, observed_at, strategy_type, strategy_version,
-                        normalizer_version, status, total_stake, q_zero,
-                        q_two_plus, source_zero, source_two_plus, stake_zero,
-                        stake_two_plus, payout_zero, payout_two_plus,
-                        payout_difference, covered_profit, win_roi, p1_max,
-                        p1_tipico, p1_buffer, p_zero, p_one, p_two_plus,
-                        trigger_type, is_eligible
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
+                        {', '.join(STRATEGY_EVALUATION_COLUMNS)}
+                    ) VALUES ({_sql_placeholders(STRATEGY_EVALUATION_COLUMNS)})
+                    """
+                strategy_params = (
                         str(event_id),
                         observed_at,
                         strategy_type,
@@ -3037,8 +3102,9 @@ class Database:
                         p_two_plus,
                         trigger_type,
                         None if is_eligible is None else int(bool(is_eligible)),
-                    ),
-                )
+                    )
+                self._assert_strategy_bind_count(strategy_sql, strategy_params, "strategy_evaluations")
+                self.connection.execute(strategy_sql, strategy_params)
             return True
 
     def latest_snapshot_for_event(

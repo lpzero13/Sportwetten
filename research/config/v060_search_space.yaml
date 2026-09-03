@@ -1,0 +1,164 @@
+version: "0.6.1"
+feature_universes:
+  - SCORE_ONLY
+  - CORE
+  - CORE_XG
+  - CORE_SHOTMAP
+  - CORE_XG_SHOTMAP
+  - CORE_EVENTS
+  - CORE_HISTORY
+  - ALL_AVAILABLE
+model_families:
+  - LOGISTIC
+  - HISTGRADIENTBOOSTING
+  - EXTRATREES
+  - RANDOMFOREST
+  - CATBOOST
+  - POISSON
+targets:
+  - MULTICLASS
+  - BINARY_P1
+  - COUNT
+training_windows:
+  - 2Y
+  - 3Y
+  - 4Y
+  - 5Y
+  - ALL
+time_decay:
+  - NONE
+  - 6M
+  - 12M
+  - 24M
+  - 36M
+calibration:
+  - NONE
+  - SIGMOID
+  - ISOTONIC
+league_scopes:
+  - GLOBAL
+  - GLOBAL_WITH_LEAGUE
+  - LEAGUE_SPECIFIC
+hyperparameters:
+  LOGISTIC:
+    - {C: 1.0, max_iter: 500}
+    - {C: 0.25, max_iter: 700}
+  HISTGRADIENTBOOSTING:
+    - {learning_rate: 0.05, max_iter: 150, max_leaf_nodes: 15, l2_regularization: 0.0}
+    - {learning_rate: 0.08, max_iter: 250, max_leaf_nodes: 31, l2_regularization: 0.5}
+  EXTRATREES:
+    - {n_estimators: 150, max_depth: null, min_samples_leaf: 2, max_features: "sqrt"}
+    - {n_estimators: 250, max_depth: 12, min_samples_leaf: 2, max_features: 0.7}
+  RANDOMFOREST:
+    - {n_estimators: 150, max_depth: null, min_samples_leaf: 2, max_features: "sqrt"}
+    - {n_estimators: 250, max_depth: 12, min_samples_leaf: 2, max_features: 0.7}
+  CATBOOST:
+    - {iterations: 250, depth: 6, learning_rate: 0.05, l2_leaf_reg: 3.0}
+    - {iterations: 400, depth: 7, learning_rate: 0.04, l2_leaf_reg: 5.0}
+  POISSON:
+    - {alpha: 0.5, max_iter: 300}
+    - {alpha: 1.0, max_iter: 500}
+
+# These ten entries are deliberately hand-selected.  They are not generated
+# from the larger search space and form the bounded local V0.6.0 smoke run.
+local_start_experiments:
+  - experiment_id: L01_LOGISTIC_MULTICLASS_SCORE_ONLY
+    model_family: LOGISTIC
+    target_type: MULTICLASS
+    feature_universe: SCORE_ONLY
+    training_window: ALL
+    time_decay: NONE
+    calibration: SIGMOID
+    league_scope: GLOBAL
+    hyperparameters: {C: 1.0, max_iter: 500}
+    stage: BROAD_EXPLORATION
+  - experiment_id: L02_LOGISTIC_MULTICLASS_CORE
+    model_family: LOGISTIC
+    target_type: MULTICLASS
+    feature_universe: CORE
+    training_window: ALL
+    time_decay: NONE
+    calibration: SIGMOID
+    league_scope: GLOBAL
+    hyperparameters: {C: 1.0, max_iter: 500}
+    stage: BROAD_EXPLORATION
+  - experiment_id: L03_HISTGRADIENTBOOSTING_MULTICLASS_CORE
+    model_family: HISTGRADIENTBOOSTING
+    target_type: MULTICLASS
+    feature_universe: CORE
+    training_window: ALL
+    time_decay: NONE
+    calibration: SIGMOID
+    league_scope: GLOBAL
+    hyperparameters: {learning_rate: 0.05, max_iter: 150, max_leaf_nodes: 15, l2_regularization: 0.0}
+    stage: BROAD_EXPLORATION
+  - experiment_id: L04_CATBOOST_MULTICLASS_CORE
+    model_family: CATBOOST
+    target_type: MULTICLASS
+    feature_universe: CORE
+    training_window: ALL
+    time_decay: NONE
+    calibration: SIGMOID
+    league_scope: GLOBAL
+    hyperparameters: {iterations: 250, depth: 6, learning_rate: 0.05, l2_leaf_reg: 3.0}
+    stage: BROAD_EXPLORATION
+  - experiment_id: L05_BOOSTING_MULTICLASS_CORE_XG
+    model_family: CATBOOST
+    target_type: MULTICLASS
+    feature_universe: CORE_XG
+    training_window: ALL
+    time_decay: NONE
+    calibration: SIGMOID
+    league_scope: GLOBAL
+    hyperparameters: {iterations: 250, depth: 6, learning_rate: 0.05, l2_leaf_reg: 3.0}
+    stage: BROAD_EXPLORATION
+  - experiment_id: L06_BOOSTING_MULTICLASS_CORE_SHOTMAP
+    model_family: CATBOOST
+    target_type: MULTICLASS
+    feature_universe: CORE_SHOTMAP
+    training_window: ALL
+    time_decay: NONE
+    calibration: SIGMOID
+    league_scope: GLOBAL
+    hyperparameters: {iterations: 250, depth: 6, learning_rate: 0.05, l2_leaf_reg: 3.0}
+    stage: BROAD_EXPLORATION
+  - experiment_id: L07_EXTRATREES_MULTICLASS_CORE
+    model_family: EXTRATREES
+    target_type: MULTICLASS
+    feature_universe: CORE
+    training_window: ALL
+    time_decay: NONE
+    calibration: SIGMOID
+    league_scope: GLOBAL
+    hyperparameters: {n_estimators: 150, max_depth: null, min_samples_leaf: 2, max_features: "sqrt"}
+    stage: BROAD_EXPLORATION
+  - experiment_id: L08_BOOSTING_BINARY_P1_CORE
+    model_family: CATBOOST
+    target_type: BINARY_P1
+    feature_universe: CORE
+    training_window: ALL
+    time_decay: NONE
+    calibration: SIGMOID
+    league_scope: GLOBAL
+    hyperparameters: {iterations: 250, depth: 6, learning_rate: 0.05, l2_leaf_reg: 3.0}
+    stage: P1_FOCUS
+  - experiment_id: L09_POISSON_COUNT_CORE
+    model_family: POISSON
+    target_type: COUNT
+    feature_universe: CORE
+    training_window: ALL
+    time_decay: NONE
+    calibration: NONE
+    league_scope: GLOBAL
+    hyperparameters: {alpha: 0.5, max_iter: 300}
+    stage: P1_CONFIRMATION
+  - experiment_id: L10_ENSEMBLE_P1_OOF
+    model_family: ENSEMBLE
+    target_type: MULTICLASS
+    feature_universe: CORE
+    training_window: ALL
+    time_decay: NONE
+    calibration: NONE
+    league_scope: GLOBAL
+    hyperparameters: {components: 2}
+    stage: ENSEMBLE

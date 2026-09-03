@@ -94,6 +94,9 @@ COLLECTOR_STRATEGIC_MINUTES = (55, 60, 65, 70, 75, 80, 85, 90)
 COLLECTOR_RETRY_DELAYS_SECONDS = (1, 3, 10)
 STALE_PREMATCH_GRACE_HOURS = 6.0
 COLLECTION_METRICS_CACHE_TTL_SECONDS = 30.0
+# V0.6.1: shared FotMob/index and runtime-observability controls.
+SLOW_OPERATION_THRESHOLD_MS = 500.0
+STATUS_HEAVY_METRICS_TTL_SECONDS = 15.0
 COLLECTOR_SQL_TRACE_ENABLED = False
 MAX_LIVE_ODDS_AGE_SECONDS = 10
 DEFAULT_TOTAL_STAKE_EUR = 30
@@ -145,6 +148,10 @@ FOTMOB_ALL_LEAGUES_PATH = "/data/allLeagues?locale={locale}&country={country}"
 FOTMOB_DAILY_TIMEZONE = "Europe/Berlin"
 FOTMOB_DAILY_CCODE3 = "DEU"
 FOTMOB_DAILY_LOCALE = "de"
+FOTMOB_DAILY_INDEX_CACHE_TTL_SECONDS = 300.0
+FOTMOB_NEGATIVE_RESOLVE_NO_CANDIDATE_TTL_SECONDS = 600.0
+FOTMOB_NEGATIVE_RESOLVE_AMBIGUOUS_TTL_SECONDS = 300.0
+FOTMOB_NEGATIVE_RESOLVE_NO_DATA_TTL_SECONDS = 1800.0
 FOTMOB_HISTORY_ENABLED = True
 # Historical research starts at a measurable throughput and can ramp in
 # configured steps.  The old 0.5 req/s value is retained only as a legacy
@@ -238,6 +245,8 @@ class Settings:
     collector_retry_delays_seconds: tuple[int, ...] = COLLECTOR_RETRY_DELAYS_SECONDS
     stale_prematch_grace_hours: float = STALE_PREMATCH_GRACE_HOURS
     collection_metrics_cache_ttl_seconds: float = COLLECTION_METRICS_CACHE_TTL_SECONDS
+    slow_operation_threshold_ms: float = SLOW_OPERATION_THRESHOLD_MS
+    status_heavy_metrics_ttl_seconds: float = STATUS_HEAVY_METRICS_TTL_SECONDS
     collector_sql_trace_enabled: bool = COLLECTOR_SQL_TRACE_ENABLED
     max_live_odds_age_seconds: int = MAX_LIVE_ODDS_AGE_SECONDS
     default_total_stake_eur: int = DEFAULT_TOTAL_STAKE_EUR
@@ -275,6 +284,10 @@ class Settings:
     fotmob_daily_timezone: str = FOTMOB_DAILY_TIMEZONE
     fotmob_daily_ccode3: str = FOTMOB_DAILY_CCODE3
     fotmob_daily_locale: str = FOTMOB_DAILY_LOCALE
+    fotmob_daily_index_cache_ttl_seconds: float = FOTMOB_DAILY_INDEX_CACHE_TTL_SECONDS
+    fotmob_negative_resolve_no_candidate_ttl_seconds: float = FOTMOB_NEGATIVE_RESOLVE_NO_CANDIDATE_TTL_SECONDS
+    fotmob_negative_resolve_ambiguous_ttl_seconds: float = FOTMOB_NEGATIVE_RESOLVE_AMBIGUOUS_TTL_SECONDS
+    fotmob_negative_resolve_no_data_ttl_seconds: float = FOTMOB_NEGATIVE_RESOLVE_NO_DATA_TTL_SECONDS
     fotmob_history_enabled: bool = FOTMOB_HISTORY_ENABLED
     fotmob_rate_mode: str = FOTMOB_RATE_MODE
     fotmob_initial_rps: float = FOTMOB_INITIAL_RPS
@@ -440,6 +453,17 @@ class Settings:
                     COLLECTION_METRICS_CACHE_TTL_SECONDS,
                 ),
             ),
+            slow_operation_threshold_ms=max(
+                0.0,
+                _env_float("SLOW_OPERATION_THRESHOLD_MS", SLOW_OPERATION_THRESHOLD_MS),
+            ),
+            status_heavy_metrics_ttl_seconds=max(
+                0.0,
+                _env_float(
+                    "STATUS_HEAVY_METRICS_TTL_SECONDS",
+                    STATUS_HEAVY_METRICS_TTL_SECONDS,
+                ),
+            ),
             collector_sql_trace_enabled=_env_bool(
                 "COLLECTOR_SQL_TRACE_ENABLED", COLLECTOR_SQL_TRACE_ENABLED
             ),
@@ -537,6 +561,34 @@ class Settings:
                 "FOTMOB_DAILY_LOCALE", FOTMOB_DAILY_LOCALE
             ).strip()
             or FOTMOB_DAILY_LOCALE,
+            fotmob_daily_index_cache_ttl_seconds=max(
+                0.0,
+                _env_float(
+                    "FOTMOB_DAILY_INDEX_CACHE_TTL_SECONDS",
+                    FOTMOB_DAILY_INDEX_CACHE_TTL_SECONDS,
+                ),
+            ),
+            fotmob_negative_resolve_no_candidate_ttl_seconds=max(
+                0.0,
+                _env_float(
+                    "FOTMOB_NEGATIVE_RESOLVE_NO_CANDIDATE_TTL_SECONDS",
+                    FOTMOB_NEGATIVE_RESOLVE_NO_CANDIDATE_TTL_SECONDS,
+                ),
+            ),
+            fotmob_negative_resolve_ambiguous_ttl_seconds=max(
+                0.0,
+                _env_float(
+                    "FOTMOB_NEGATIVE_RESOLVE_AMBIGUOUS_TTL_SECONDS",
+                    FOTMOB_NEGATIVE_RESOLVE_AMBIGUOUS_TTL_SECONDS,
+                ),
+            ),
+            fotmob_negative_resolve_no_data_ttl_seconds=max(
+                0.0,
+                _env_float(
+                    "FOTMOB_NEGATIVE_RESOLVE_NO_DATA_TTL_SECONDS",
+                    FOTMOB_NEGATIVE_RESOLVE_NO_DATA_TTL_SECONDS,
+                ),
+            ),
             fotmob_history_enabled=_env_bool("FOTMOB_HISTORY_ENABLED", FOTMOB_HISTORY_ENABLED),
             fotmob_rate_mode=_env_choice(
                 "FOTMOB_RATE_MODE", FOTMOB_RATE_MODE, FOTMOB_RATE_MODE_VALUES

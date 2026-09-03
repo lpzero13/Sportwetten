@@ -1,0 +1,4 @@
+# Reproducible optional dependencies for the V0.6.1 research factory.
+# Keep the CatBoost version pinned so model identity and serialized artifacts
+# remain comparable between local runs and CT110.
+catboost==1.2.8

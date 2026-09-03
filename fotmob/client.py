@@ -169,6 +169,9 @@ class FotMobAccessMetrics:
         result: dict[str, Any] = {
             "requests": self.requests,
             "requested": self.requests,
+            "network_served": self.requests,
+            "cache_served": 0,
+            "connection_pool_reused": True,
             "successes": self.successes,
             "successful": self.successes,
             "errors": self.errors,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -32,6 +33,7 @@ from runtime_status import (
     runtime_identity,
     runtime_warnings,
 )
+from telemetry import SlowOperationTelemetry
 
 
 @dataclass(slots=True)
@@ -154,6 +156,13 @@ class FotMobService:
         self._runtime_metrics_lock = threading.RLock()
         self._runtime_metrics: dict[str, int] = {
             "link_attempts": 0,
+            "resolver_attempts": 0,
+            "resolver_candidate_scans": 0,
+            "resolver_negative_cache_hits": 0,
+            "resolver_negative_cache_invalidations": 0,
+            "confirmed_link_fast_path": 0,
+            "prematch_link_attempts": 0,
+            "ht_priority_retries": 0,
             "links_exact": 0,
             "links_high_confidence": 0,
             "links_ambiguous": 0,
@@ -165,6 +174,9 @@ class FotMobService:
             "ht_no_data": 0,
             "ht_errors": 0,
         }
+        self._slow_telemetry = SlowOperationTelemetry(
+            threshold_ms=float(getattr(settings, "slow_operation_threshold_ms", 500.0))
+        )
         self._last_runtime_success: dict[str, str | None] = {
             "last_auto_link_success": None,
             "last_fotmob_detail_success": None,
@@ -264,6 +276,27 @@ class FotMobService:
         if status in AUTO_LINK_STATUSES:
             self._mark_runtime_success("last_auto_link_success")
 
+    def record_resolver_attempt(self, *, candidate_scan: bool = True, trigger: str | None = None) -> None:
+        """Record an actual identity-resolution pass, excluding fast paths."""
+
+        self._increment_runtime("resolver_attempts")
+        if candidate_scan:
+            self._increment_runtime("resolver_candidate_scans")
+        normalized_trigger = str(trigger or "").upper()
+        if normalized_trigger == "PREMATCH":
+            self._increment_runtime("prematch_link_attempts")
+        if normalized_trigger in {"HALFTIME", "HT_STABLE"}:
+            self._increment_runtime("ht_priority_retries")
+
+    def record_resolver_cache_hit(self) -> None:
+        self._increment_runtime("resolver_negative_cache_hits")
+
+    def record_resolver_cache_invalidation(self) -> None:
+        self._increment_runtime("resolver_negative_cache_invalidations")
+
+    def record_confirmed_link_fast_path(self) -> None:
+        self._increment_runtime("confirmed_link_fast_path")
+
     def _record_detail_started(self) -> None:
         self._increment_runtime("detail_requests")
 
@@ -290,6 +323,7 @@ class FotMobService:
             result: dict[str, Any] = dict(self._runtime_metrics)
             result.update(self._last_runtime_success)
             result.update(self._last_runtime_error)
+            result["slow_operations"] = self._slow_telemetry.snapshot()
             return result
 
     def _matcher(self) -> MatchMatcher:
@@ -516,7 +550,7 @@ class FotMobService:
     def ensure_tipico_event(self, event: Any, *, observed_at: str | None = None) -> str:
         return self.store.upsert_tipico_event(event, observed_at=observed_at)
 
-    def provider_event_link_for_event(self, event: Any) -> Any | None:
+    def provider_event_link_for_event(self, event: Any, *, revalidate: bool = True) -> Any | None:
         """Return the durable rich link, with a legacy compatibility fallback."""
 
         event_id = str(getattr(event, "event_id", ""))
@@ -525,7 +559,10 @@ class FotMobService:
         row = self.store.provider_event_link_for_tipico_event(event_id)
         if row is not None:
             status = str(row["match_status"] or "").upper()
-            if status in AUTO_LINK_STATUSES:
+            # The collector's ordinary poll uses a deliberately cheap lookup.
+            # Full normalization/revalidation is reserved for an identity
+            # change or an explicit UI/refresh request.
+            if status in AUTO_LINK_STATUSES and revalidate:
                 mismatch_reason: str | None = None
                 stored_competition = row["tipico_competition_id"]
                 current_competition = getattr(event, "competition_id", None)
@@ -1014,7 +1051,11 @@ class FotMobService:
             else None
         )
         if link_status not in AUTO_LINK_STATUSES or not link_id:
-            resolved = self.resolver.resolve(event)
+            resolved = self.resolver.resolve(
+                event,
+                trigger="HALFTIME" if ht_attempt else "SELECTED",
+                priority="P0" if ht_attempt else "P1",
+            )
             resolved_status = str(resolved.match_result.status).upper()
             if resolved_status not in AUTO_LINK_STATUSES:
                 return finish(
@@ -1072,6 +1113,7 @@ class FotMobService:
         return self.store.current_state(row["internal_match_id"]) if row else None
 
     def export_pending(self) -> dict[str, Any]:
+        started = time.perf_counter()
         result = self.archive.export_pending(
             self.store,
             batch_size=self.settings.fotmob_snapshot_outbox_batch_size,
@@ -1081,9 +1123,18 @@ class FotMobService:
             self._mark_runtime_error("last_archive_export_error", error)
         else:
             self._mark_runtime_success("last_archive_export_success")
+        self._slow_telemetry.record(
+            "fotmob_archive_export",
+            (time.perf_counter() - started) * 1000.0,
+            details={
+                "errors": int(result.get("errors") or 0),
+                "exported": int(result.get("exported") or result.get("written") or 0),
+            },
+        )
         return result
 
     def metrics(self) -> dict[str, Any]:
+        metrics_started = time.perf_counter()
         metrics = self.store.metrics_for_date()
         client_metrics = getattr(self.client, "metrics_snapshot", lambda: {})()
         metrics["enabled"] = self.enabled
@@ -1096,6 +1147,15 @@ class FotMobService:
         metrics.update(self.runtime_metrics())
         history_runtime = getattr(self.history_pipeline, "runtime_metrics", lambda: {})()
         metrics.update(history_runtime)
+        metrics["access"] = dict(client_metrics) | {
+            "cache_served": int(history_runtime.get("daily_index_cache_hits") or 0),
+            "network_served": int(client_metrics.get("requests") or 0),
+            "connection_pool_reused": True,
+        }
+        metrics["slow_operations"] = {
+            "service": self._slow_telemetry.snapshot(),
+            "history": history_runtime.get("slow_operations", {}),
+        }
         matrix = feature_runtime_matrix(
             self.settings,
             fotmob_service=self,
@@ -1129,4 +1189,14 @@ class FotMobService:
         }
         metrics["canonical_archive"] = str(self.canonical_archive.root)
         metrics["canonical_archive_bytes"] = self.canonical_archive.total_size_bytes
+        self._slow_telemetry.record(
+            "fotmob_status_generation",
+            (time.perf_counter() - metrics_started) * 1000.0,
+            details={
+                "cache": "service_metrics",
+                "daily_index_cache_hits": metrics.get("daily_index_cache_hits", 0),
+                "daily_index_cache_misses": metrics.get("daily_index_cache_misses", 0),
+            },
+        )
+        metrics["slow_operations"] = self._slow_telemetry.snapshot()
         return metrics

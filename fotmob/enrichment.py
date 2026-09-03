@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -116,6 +120,8 @@ class ResolverResult:
     match_result: MatchMatchResult
     candidates: list[FotMobMatch]
     mapping: Any | None = None
+    from_cache: bool = False
+    cache_state: str | None = None
 
     @property
     def provider_match_id(self) -> str | None:
@@ -144,6 +150,156 @@ class FotMobTipicoResolver:
             service.settings.archive_path,
         )
         self.mappings = mappings
+        self._negative_cache: dict[tuple[str, str], tuple[float, ResolverResult, int]] = {}
+        self._negative_cache_lock = threading.RLock()
+
+    def _daily_index_generation(self) -> int:
+        """Read the shared index generation without issuing a network call."""
+
+        pipeline = getattr(self.service, "history_pipeline", None)
+        metrics_reader = getattr(pipeline, "runtime_metrics", None)
+        if not callable(metrics_reader):
+            return 0
+        try:
+            return int(metrics_reader().get("daily_index_generation", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def resolver_input_fingerprint(event: Any) -> str:
+        """Hash the identity fields that can change a provider match."""
+
+        kickoff = _parse_time(getattr(event, "kickoff_time", None))
+        identity = {
+            "competition": str(getattr(event, "competition_name", "") or "").strip().casefold(),
+            "country": normalize_country(getattr(event, "competition_country", None)),
+            "home": str(getattr(event, "home_team", "") or "").strip().casefold(),
+            "away": str(getattr(event, "away_team", "") or "").strip().casefold(),
+            "kickoff": kickoff.isoformat() if kickoff is not None else None,
+        }
+        return hashlib.sha256(
+            json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _negative_ttl(self, state: str) -> float:
+        setting_name = {
+            "NO_CANDIDATE": "fotmob_negative_resolve_no_candidate_ttl_seconds",
+            "AMBIGUOUS": "fotmob_negative_resolve_ambiguous_ttl_seconds",
+            "NO_DATA": "fotmob_negative_resolve_no_data_ttl_seconds",
+        }.get(state, "fotmob_negative_resolve_no_candidate_ttl_seconds")
+        defaults = {"NO_CANDIDATE": 600.0, "AMBIGUOUS": 300.0, "NO_DATA": 1800.0}
+        return max(0.0, float(getattr(self.service.settings, setting_name, defaults.get(state, 600.0))))
+
+    def _invalidate_material_changes(self, internal_id: str, fingerprint: str) -> None:
+        removed = 0
+        with self._negative_cache_lock:
+            for key in list(self._negative_cache):
+                if key[0] == internal_id and key[1] != fingerprint:
+                    self._negative_cache.pop(key, None)
+                    removed += 1
+        recorder = getattr(self.service, "record_resolver_cache_invalidation", None)
+        if removed and callable(recorder):
+            recorder()
+
+    def _negative_cache_get(
+        self,
+        internal_id: str,
+        fingerprint: str,
+        *,
+        trigger: str,
+        generation: int = 0,
+    ) -> ResolverResult | None:
+        bypass_triggers = {
+            "PREMATCH", "LIVE_START", "HALFTIME", "HT_STABLE", "SELECTED",
+            "MATERIAL_CHANGE", "DAILY_INDEX_REFRESH", "FORCE",
+        }
+        if str(trigger or "POLL").upper() in bypass_triggers:
+            return None
+        with self._negative_cache_lock:
+            value = self._negative_cache.get((internal_id, fingerprint))
+            if value is None:
+                return None
+            expires_at, result, cached_generation = value
+            if expires_at <= time.monotonic() or (
+                generation > 0 and cached_generation < generation
+            ):
+                self._negative_cache.pop((internal_id, fingerprint), None)
+                if cached_generation < generation:
+                    recorder = getattr(self.service, "record_resolver_cache_invalidation", None)
+                    if callable(recorder):
+                        recorder()
+                return None
+        recorder = getattr(self.service, "record_resolver_cache_hit", None)
+        if callable(recorder):
+            recorder()
+        return ResolverResult(
+            internal_id,
+            result.match_result,
+            list(result.candidates),
+            result.mapping,
+            from_cache=True,
+            cache_state=result.cache_state,
+        )
+
+    def _negative_cache_put(
+        self,
+        internal_id: str,
+        fingerprint: str,
+        result: ResolverResult,
+        state: str,
+    ) -> ResolverResult:
+        value = ResolverResult(
+            internal_id,
+            result.match_result,
+            list(result.candidates),
+            result.mapping,
+            cache_state=state,
+        )
+        ttl = self._negative_ttl(state)
+        if ttl > 0:
+            with self._negative_cache_lock:
+                self._negative_cache[(internal_id, fingerprint)] = (
+                    time.monotonic() + ttl,
+                    value,
+                    self._daily_index_generation(),
+                )
+        return value
+
+    def _stored_identity_changed(self, existing: Any, event: Any) -> bool:
+        """Cheap raw-field check before paying for full revalidation."""
+
+        stored_competition = _row_value(existing, "tipico_competition_id")
+        current_competition = getattr(event, "competition_id", None)
+        if stored_competition not in (None, "") and current_competition not in (None, ""):
+            if str(stored_competition) != str(current_competition):
+                return True
+        for field, event_field in (("tipico_home_team", "home_team"), ("tipico_away_team", "away_team")):
+            stored = _row_value(existing, field)
+            current = getattr(event, event_field, None)
+            if stored not in (None, "") and current not in (None, ""):
+                if str(stored).strip().casefold() != str(current).strip().casefold():
+                    return True
+        stored_kickoff = _parse_time(_row_value(existing, "tipico_kickoff"))
+        current_kickoff = _parse_time(getattr(event, "kickoff_time", None))
+        if stored_kickoff is not None and current_kickoff is not None:
+            tolerance = max(
+                1,
+                int(getattr(self.service.settings, "fotmob_matching_tolerance_minutes", 15)),
+            )
+            if abs((stored_kickoff - current_kickoff).total_seconds()) / 60 > tolerance:
+                return True
+        return False
+
+    def _direct_link(self, event: Any, *, revalidate: bool) -> Any | None:
+        direct_link = getattr(self.service, "provider_event_link_for_event", None)
+        if not callable(direct_link):
+            return None
+        try:
+            return direct_link(event, revalidate=revalidate)
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc):
+                raise
+            return direct_link(event)
 
     def _record_resolution(self, result: ResolverResult) -> ResolverResult:
         recorder = getattr(self.service, "record_link_resolution", None)
@@ -234,6 +390,7 @@ class FotMobTipicoResolver:
         )
         pipeline = getattr(self.service, "history_pipeline", None)
         rows_by_key: dict[tuple[str, str], Any] = {}
+        lookup_error = False
         for day in dates:
             day_text = day.isoformat()
             rows = self.history_store.daily_index(
@@ -243,17 +400,21 @@ class FotMobTipicoResolver:
                 order_by="kickoff_at_utc",
                 ascending=True,
             )
-            if pipeline is not None and allow_network and (not rows or force_network):
+            if pipeline is not None and allow_network:
                 try:
-                    pipeline.load_daily_fixture_index(
+                    loaded = pipeline.load_daily_fixture_index(
                         day,
                         allow_network=True,
-                        force=force_network,
+                        # Only an explicit refresh trigger may bypass the
+                        # service-level TTL; a missing event never does so.
+                        force=bool(force_network),
                     )
+                    if isinstance(loaded, tuple) and len(loaded) > 1 and loaded[1]:
+                        lookup_error = True
                 except (AttributeError, TypeError, ValueError, OSError, RuntimeError):
                     # Provider discovery is optional; the caller still gets
                     # the durable index and can use an explicit manual link.
-                    pass
+                    lookup_error = True
                 rows = self.history_store.daily_index(
                     start_date=day_text,
                     end_date=day_text,
@@ -264,6 +425,7 @@ class FotMobTipicoResolver:
             for row in rows:
                 key = (day_text, str(row["fotmob_match_id"]))
                 rows_by_key[key] = row
+        self._last_daily_lookup_state = "NO_DATA" if lookup_error else "NO_CANDIDATE"
         return list(rows_by_key.values())
 
     def _matches_event_scope(self, event: Any, row: Any, mapping: Any | None) -> bool:
@@ -282,14 +444,20 @@ class FotMobTipicoResolver:
                 return False
         return True
 
-    def candidate_rows(self, event: Any) -> list[Any]:
+    def candidate_rows(
+        self,
+        event: Any,
+        *,
+        trigger: str = "POLL",
+        force_refresh: bool = False,
+    ) -> list[Any]:
         mapping = self.mapping_for_event(event)
         event_time = _parse_time(getattr(event, "kickoff_time", None))
         if event_time is None:
             return []
         tolerance = max(1, int(self.service.settings.fotmob_matching_tolerance_minutes))
         rows = [
-            row for row in self._daily_rows(event)
+            row for row in self._daily_rows(event, force_network=force_refresh)
             if self._matches_event_scope(event, row, mapping)
         ]
         # Existing season indexes remain a safe compatibility fallback only
@@ -299,14 +467,6 @@ class FotMobTipicoResolver:
                 row for row in self.history_store.match_index_for_league(
                     str(mapping["provider_competition_id"]),
                 )
-            ]
-        # If a current-day catalog was warm but did not yet contain a match,
-        # perform one controlled daily-feed refresh.  The pipeline cache makes
-        # this at most one request per day per TTL, not one request per event.
-        if not rows and getattr(self.service, "automated_worker_allowed", False):
-            rows = [
-                row for row in self._daily_rows(event, force_network=True)
-                if self._matches_event_scope(event, row, mapping)
             ]
         candidates = []
         for row in rows:
@@ -323,15 +483,66 @@ class FotMobTipicoResolver:
                 candidates.append(row)
         return candidates
 
-    def candidates(self, event: Any) -> list[FotMobMatch]:
-        return [_row_to_match(row) for row in self.candidate_rows(event)]
+    def candidates(
+        self,
+        event: Any,
+        *,
+        trigger: str = "POLL",
+        force_refresh: bool = False,
+    ) -> list[FotMobMatch]:
+        return [
+            _row_to_match(row)
+            for row in self.candidate_rows(
+                event,
+                trigger=trigger,
+                force_refresh=force_refresh,
+            )
+        ]
 
-    def resolve(self, event: Any) -> ResolverResult:
+    def resolve(
+        self,
+        event: Any,
+        *,
+        trigger: str = "POLL",
+        priority: str | None = None,
+        force: bool = False,
+    ) -> ResolverResult:
+        started = time.perf_counter()
+        try:
+            return self._resolve_impl(
+                event,
+                trigger=trigger,
+                priority=priority,
+                force=force,
+            )
+        finally:
+            telemetry = getattr(self.service, "_slow_telemetry", None)
+            if telemetry is not None:
+                telemetry.record(
+                    "fotmob_resolver",
+                    (time.perf_counter() - started) * 1000.0,
+                    details={"trigger": str(trigger).upper(), "priority": priority},
+                )
+
+    def _resolve_impl(
+        self,
+        event: Any,
+        *,
+        trigger: str = "POLL",
+        priority: str | None = None,
+        force: bool = False,
+    ) -> ResolverResult:
         internal_id = self.service.ensure_tipico_event(event)
-        existing = None
-        direct_link = getattr(self.service, "provider_event_link_for_event", None)
-        if callable(direct_link):
-            existing = direct_link(event)
+        fingerprint = self.resolver_input_fingerprint(event)
+        self._invalidate_material_changes(internal_id, fingerprint)
+        existing = self._direct_link(event, revalidate=False)
+        existing_status_hint = str(_row_value(existing, "match_status", "")).upper()
+        if (
+            existing is not None
+            and existing_status_hint in CONFIRMED_LINK_STATUSES
+            and self._stored_identity_changed(existing, event)
+        ):
+            existing = self._direct_link(event, revalidate=True)
         if existing is None:
             existing = self.service.store.link_for_internal(internal_id)
         existing_status = str(_row_value(existing, "match_status", "")).upper()
@@ -386,9 +597,28 @@ class FotMobTipicoResolver:
                 provider_match_id=str(provider_match_id),
                 reasons=["persisted_link_no_rematch"],
             )
+            fast_path_recorder = getattr(self.service, "record_confirmed_link_fast_path", None)
+            if callable(fast_path_recorder):
+                fast_path_recorder()
             return self._record_resolution(
-                ResolverResult(internal_id, result, [], self.mapping_for_event(event))
+                ResolverResult(
+                    internal_id,
+                    result,
+                    [],
+                    None,
+                    from_cache=True,
+                    cache_state="CONFIRMED",
+                )
             )
+
+        cached = self._negative_cache_get(
+            internal_id,
+            fingerprint,
+            trigger=trigger,
+            generation=self._daily_index_generation(),
+        )
+        if cached is not None and not force:
+            return self._record_resolution(cached)
 
         mapping = self.mapping_for_event(event)
         # A known mapping that fails its country/name guard is a hard reject;
@@ -407,18 +637,39 @@ class FotMobTipicoResolver:
                 provider_match_id=None,
                 reasons=["competition_provider_mapping_missing_or_country_mismatch"],
             )
-            return self._record_resolution(ResolverResult(internal_id, result, [], None))
+            negative = ResolverResult(internal_id, result, [], None, cache_state="NO_CANDIDATE")
+            return self._record_resolution(
+                self._negative_cache_put(internal_id, fingerprint, negative, "NO_CANDIDATE")
+            )
         # A competition without a learned provider mapping is still eligible
         # for safe discovery. ``candidate_rows`` narrows the daily index by
         # the exact normalized competition and country before team/kickoff
         # scoring, so this does not become a global fuzzy search.
-        candidates = self.candidates(event)
+        attempt_recorder = getattr(self.service, "record_resolver_attempt", None)
+        if callable(attempt_recorder):
+            attempt_recorder(candidate_scan=True, trigger=trigger)
+        candidates = self.candidates(
+            event,
+            trigger=trigger,
+            force_refresh=bool(
+                force and str(trigger or "").upper() in {"FORCE", "DAILY_INDEX_REFRESH"}
+            ),
+        )
         result = self.service.match_tipico_event(
             event,
             candidates,
             _record_metrics=False,
         )
-        return self._record_resolution(ResolverResult(internal_id, result, candidates, mapping))
+        state: str | None = None
+        result_status = str(result.status or "").upper()
+        if result_status == "AMBIGUOUS" or len(candidates) > 1:
+            state = "AMBIGUOUS"
+        elif not candidates and result_status not in CONFIRMED_LINK_STATUSES:
+            state = getattr(self, "_last_daily_lookup_state", "NO_CANDIDATE")
+        resolved = ResolverResult(internal_id, result, candidates, mapping, cache_state=state)
+        if state:
+            resolved = self._negative_cache_put(internal_id, fingerprint, resolved, state)
+        return self._record_resolution(resolved)
 
     def resolve_many(self, events: list[Any]) -> list[ResolverResult]:
         return [self.resolve(event) for event in events]

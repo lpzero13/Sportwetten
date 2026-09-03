@@ -16,6 +16,7 @@ from storage.raw_storage import RawStorage
 from storage.repositories import EventRepository
 from tipico.client import ApiResponse, RequestMetrics, TipicoApiError, TipicoClient
 from tipico.parser import parse_live_feed
+from telemetry import SlowOperationTelemetry
 
 
 @dataclass(slots=True)
@@ -181,6 +182,9 @@ class EventService:
         self._startup_reconciliation_done = False
         self.last_timing: dict[str, float] = {}
         self.last_sql_metrics: dict[str, int] = {}
+        self._slow_telemetry = SlowOperationTelemetry(
+            threshold_ms=float(getattr(settings, "slow_operation_threshold_ms", 500.0))
+        )
 
     @property
     def events(self) -> list[LiveEvent]:
@@ -422,6 +426,16 @@ class EventService:
             )
 
         persistence_ms = (time.perf_counter() - persistence_started) * 1000.0
+        self._slow_telemetry.record(
+            "db_persistence",
+            persistence_ms,
+            details={
+                "rows": len(next_events),
+                "rows_changed": int(persisted.get("rows_changed") or 0),
+                "db_transactions": int(persisted.get("db_transactions") or 0),
+                "db_busy_lock": self.persistence_error_count > 0,
+            },
+        )
         reconciled_ids = tuple(str(value) for value in persisted.get("reconciled_event_ids", ()))
         ignored_ids = tuple(str(value) for value in persisted.get("ignored_event_ids", ()))
         if ignored_ids:
@@ -446,6 +460,13 @@ class EventService:
             for key, value in (sql_metrics or {}).items()
             if isinstance(value, int)
         }
+        # These counters are available even when the optional SQLite trace is
+        # disabled.  The live-feed batch is one logical transaction by
+        # construction; the trace adds statement-level detail only when
+        # explicitly requested.
+        for key in ("db_transactions", "db_commits", "db_rollbacks", "rows_changed"):
+            if key in persisted:
+                self.last_sql_metrics[key] = int(persisted.get(key) or 0)
         reconciliation_ms = float(persisted.get("reconciliation_ms") or 0.0)
         self.last_timing = {
             "network_ms": network_ms,
