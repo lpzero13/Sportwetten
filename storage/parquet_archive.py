@@ -432,19 +432,39 @@ class ParquetArchive:
         self._lock = threading.RLock()
         self.last_export_at: str | None = None
         self.last_error: str | None = None
+        self._size_cache: int | None = None
+        self._size_cache_at: str | None = None
+        self.refresh_size_cache()
+
+    def refresh_size_cache(self) -> int:
+        """Scan archive bytes once and retain the result for status reads.
+
+        The collector status endpoint is called frequently.  A recursive
+        archive walk belongs at startup/export or an explicit refresh, not in
+        every heartbeat.
+        """
+
+        total = 0
+        if self.root.exists():
+            for path in self.root.rglob("*"):
+                if path.is_file():
+                    try:
+                        total += path.stat().st_size
+                    except OSError:
+                        pass
+        self._size_cache = int(total)
+        self._size_cache_at = datetime.now(timezone.utc).isoformat()
+        return self._size_cache
 
     @property
     def total_size_bytes(self) -> int:
-        if not self.root.exists():
-            return 0
-        total = 0
-        for path in self.root.rglob("*"):
-            if path.is_file():
-                try:
-                    total += path.stat().st_size
-                except OSError:
-                    pass
-        return total
+        if self._size_cache is None:
+            return self.refresh_size_cache()
+        return int(self._size_cache)
+
+    @property
+    def size_cache_at(self) -> str | None:
+        return self._size_cache_at
 
     def size_for_date(self, date_text: str) -> int:
         """Return the archive size for one UTC date partition."""
@@ -592,6 +612,7 @@ class ParquetArchive:
                     exported += database.mark_snapshots_exported(ids, str(path), stamp)
                     database.delete_exported_snapshot_outbox()
                     self.last_export_at = stamp
+                    self.refresh_size_cache()
                     batches += 1
                 except Exception as exc:
                     errors += 1
@@ -638,4 +659,5 @@ class ParquetArchive:
             if not self._file_matches(strategy_path, {int(row["snapshot_id"]) for row in date_rows}):
                 self._write_strategy_table(strategy_path, date_rows)
             files.append(str(path))
+        self.refresh_size_cache()
         return {"files": files, "rows": len(rows)}

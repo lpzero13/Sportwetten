@@ -30,6 +30,7 @@ class SlowOperationTelemetry:
         self._samples: deque[dict[str, Any]] = deque(maxlen=self.max_samples)
         self._counts: Counter[str] = Counter()
         self._total = 0
+        self._last_status_generation_breakdown: dict[str, Any] = {}
 
     def record(
         self,
@@ -78,6 +79,16 @@ class SlowOperationTelemetry:
                 "slow_operation_count": self._total,
                 "by_operation": dict(self._counts),
                 "samples": list(self._samples),
+                "status_generation_breakdown": dict(self._last_status_generation_breakdown),
+            }
+
+    def record_status_generation_breakdown(self, breakdown: Mapping[str, Any]) -> None:
+        """Persist the most recent status phase timings without requiring a slow sample."""
+
+        with self._lock:
+            self._last_status_generation_breakdown = {
+                str(key): round(float(value), 3) if isinstance(value, (int, float)) else value
+                for key, value in dict(breakdown).items()
             }
 
 

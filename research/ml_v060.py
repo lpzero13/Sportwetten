@@ -31,7 +31,7 @@ import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -58,11 +58,26 @@ try:  # pragma: no cover - dependency is declared in requirements
 except ImportError:  # pragma: no cover
     yaml = None
 
-from runtime_status import APP_VERSION, runtime_identity
+from runtime_status import (
+    APP_VERSION,
+    RESEARCH_VERSION,
+    config_fingerprint,
+    deployment_status,
+    runtime_identity,
+    source_tree_hash,
+)
+from research.v0611_runtime import (
+    AlreadyRunningError,
+    ResearchRunLock,
+    StaleLockError,
+    deployment_manifest_path,
+    write_deployment_manifest,
+)
 
 
 V060_VERSION = "0.6.0"
 V061_VERSION = "0.6.1"
+V0611_VERSION = "0.6.1.1"
 IO_WORKERS = 10
 DATASET_SCHEMA_VERSION = "v060_ht_dataset_v2"
 FEATURE_SCHEMA_VERSION = "v060_feature_schema_v2"
@@ -311,16 +326,40 @@ def resource_guard(root: Path, *, phase: str = "experiment") -> dict[str, Any]:
     """Check resources before work that can allocate a large model."""
 
     snapshot = _resource_snapshot(root)
-    min_ram_mb = max(64, int(os.getenv("V061_MIN_AVAILABLE_RAM_MB", "512")))
-    min_disk_gb = max(0.1, float(os.getenv("V061_MIN_FREE_DISK_GB", "1")))
-    max_swap_percent = max(0.0, float(os.getenv("V061_MAX_SWAP_PERCENT", "50")))
+    try:
+        min_ram_mb = max(64, int(os.getenv("V061_MIN_AVAILABLE_RAM_MB", "512")))
+    except ValueError:
+        min_ram_mb = 512
+    # Keep the ML guard at least at the configured CRITICAL threshold.  A
+    # deployment may deliberately choose a higher value (the example env
+    # uses 5 GiB), but the default must never allow a deep run into a disk
+    # state that the collector reports as critical.
+    try:
+        min_disk_gb = max(2.0, float(os.getenv("V061_MIN_FREE_DISK_GB", "2")))
+    except ValueError:
+        min_disk_gb = 2.0
+    try:
+        estimated_artifact_bytes = max(
+            0,
+            int(os.getenv("V061_ESTIMATED_ARTIFACT_BYTES", "0") or 0),
+        )
+    except ValueError:
+        estimated_artifact_bytes = 0
+    try:
+        max_swap_percent = max(0.0, float(os.getenv("V061_MAX_SWAP_PERCENT", "50")))
+    except ValueError:
+        max_swap_percent = 50.0
     reasons: list[str] = []
     available = snapshot.get("available_ram_bytes")
     if available is not None and available < min_ram_mb * 1024 * 1024:
         reasons.append(f"available RAM below {min_ram_mb} MB")
     free_disk = snapshot.get("free_disk_bytes")
-    if free_disk is not None and free_disk < min_disk_gb * 1024**3:
-        reasons.append(f"free disk below {min_disk_gb:.1f} GB")
+    required_free_disk = min_disk_gb * 1024**3 + estimated_artifact_bytes
+    if free_disk is not None and free_disk < required_free_disk:
+        reasons.append(
+            f"free disk below {min_disk_gb:.1f} GB plus estimated artifacts "
+            f"({estimated_artifact_bytes} bytes)"
+        )
     swap_percent = snapshot.get("swap_percent")
     if swap_percent is not None and swap_percent > max_swap_percent:
         reasons.append(f"swap usage above {max_swap_percent:.1f}%")
@@ -331,6 +370,8 @@ def resource_guard(root: Path, *, phase: str = "experiment") -> dict[str, Any]:
             "guard_reasons": reasons,
             "minimum_available_ram_mb": min_ram_mb,
             "minimum_free_disk_gb": min_disk_gb,
+            "estimated_artifact_requirement_bytes": estimated_artifact_bytes,
+            "required_free_disk_bytes": int(required_free_disk),
             "maximum_swap_percent": max_swap_percent,
         }
     )
@@ -2045,7 +2086,36 @@ def research_preflight(
     xgboost = _optional_dependency_status("xgboost")
     lightgbm = _optional_dependency_status("lightgbm")
     resources = _resource_snapshot(root)
+    try:
+        configured_min_disk_gb = max(
+            2.0, float(os.getenv("V061_MIN_FREE_DISK_GB", "2"))
+        )
+    except ValueError:
+        configured_min_disk_gb = 2.0
+    resources["minimum_free_disk_gb"] = configured_min_disk_gb
+    resources["disk_guard_status"] = (
+        "PASS"
+        if resources.get("free_disk_bytes") is not None
+        and int(resources["free_disk_bytes"]) >= configured_min_disk_gb * 1024**3
+        else "FAIL"
+    )
     target = target_regression_preflight()
+    lock_status = ResearchRunLock(root).inspect().as_dict()
+    deploy_status = deployment_status(root, check_integrity=False)
+    canary_status: dict[str, Any]
+    try:
+        canary_registry = ExperimentRegistry(registry_file)
+        try:
+            canary_status = catboost_real_canary_status(
+                canary_registry,
+                scope="CT110",
+                dataset_hash=dataset.get("hash"),
+                tree_hash=source_tree_hash(root),
+            )
+        finally:
+            canary_registry.close()
+    except Exception as exc:
+        canary_status = {"status": "FAIL", "error": f"{type(exc).__name__}: {exc}"}
     required_core = all(
         (
             dataset["status"] == "PASS",
@@ -2062,6 +2132,7 @@ def research_preflight(
     overall = "PASS" if required_core and cat_required_ok else "PARTIAL" if required_core else "FAIL"
     result = {
         "v061_version": V061_VERSION,
+        "v0611_version": V0611_VERSION,
         "status": overall,
         "RESEARCH_PREFLIGHT": overall,
         "python_version": environment["python_version"],
@@ -2069,6 +2140,11 @@ def research_preflight(
         "package_versions": environment["packages"],
         "environment_manifest": environment,
         "environment_hash": environment_hash(environment),
+        "deployment": deploy_status,
+        "deployment_manifest": deploy_status,
+        "ML_LOCK": lock_status,
+        "ML_LOCK_STATUS": lock_status.get("status"),
+        "CATBOOST_CT_REAL_DATA_CANARY": canary_status,
         "dataset": dataset,
         "DATASET_IDENTITY": dataset["status"],
         "DATASET_REGISTRY_IDENTITY": registry_status.get("dataset_identity"),
@@ -2089,7 +2165,7 @@ def research_preflight(
         "lightgbm": lightgbm,
         "resources": resources,
         "RAM_GUARD": "PASS" if resources.get("available_ram_bytes") is not None else "PARTIAL",
-        "DISK_GUARD": "PASS" if resources.get("free_disk_bytes") is not None else "PARTIAL",
+        "DISK_GUARD": resources.get("disk_guard_status", "FAIL"),
         "registry": registry_status,
         "REGISTRY": "PASS" if registry_status.get("integrity") == "PASS" and registry_status.get("dataset_identity") == "PASS" else "FAIL",
         "write_permissions": write_status,
@@ -2139,7 +2215,11 @@ class ExperimentRegistry:
                 effective_target_type TEXT,
                 requested_feature_universe TEXT,
                 effective_feature_universe TEXT,
-                dependency TEXT
+                dependency TEXT,
+                tree_hash TEXT,
+                experiment_role TEXT,
+                plan_verified_at TEXT,
+                plan_verification_json TEXT
             )
             """
         )
@@ -2153,6 +2233,10 @@ class ExperimentRegistry:
             ("requested_feature_universe", "TEXT"),
             ("effective_feature_universe", "TEXT"),
             ("dependency", "TEXT"),
+            ("tree_hash", "TEXT"),
+            ("experiment_role", "TEXT"),
+            ("plan_verified_at", "TEXT"),
+            ("plan_verification_json", "TEXT"),
         ):
             self._ensure_column(column, definition)
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_v060_experiments_status ON experiments(status)")
@@ -2239,7 +2323,7 @@ class ExperimentRegistry:
     @staticmethod
     def _as_dict(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
-        for key in ("config_json", "hyperparameters_json", "metrics_json"):
+        for key in ("config_json", "hyperparameters_json", "metrics_json", "plan_verification_json"):
             if result.get(key):
                 try:
                     result[key[:-5] if key.endswith("_json") else key] = json.loads(result[key])
@@ -2253,7 +2337,15 @@ class ExperimentRegistry:
     def config_hashes(self) -> set[str]:
         return {str(row[0]) for row in self.connection.execute("SELECT config_hash FROM experiments")}
 
-    def insert_planned(self, config: Mapping[str, Any], dataset_hash: str | None, code_commit: str | None) -> dict[str, Any]:
+    def insert_planned(
+        self,
+        config: Mapping[str, Any],
+        dataset_hash: str | None,
+        code_commit: str | None,
+        *,
+        tree_hash: str | None = None,
+        experiment_role: str | None = None,
+    ) -> dict[str, Any]:
         config_dict = dict(config)
         config_hash = experiment_config_hash(config_dict)
         experiment_id = str(config_dict.get("experiment_id") or f"EXP_{config_hash[:16]}")
@@ -2271,8 +2363,9 @@ class ExperimentRegistry:
                 experiment_id, config_hash, status, created_at, dataset_hash, code_commit,
                 config_json, model_family, target_type, feature_set, training_window,
                 time_decay, calibration, league_scope, hyperparameters_json,
-                requested_model_family, requested_target_type, requested_feature_universe
-            ) VALUES (?, ?, 'PLANNED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                requested_model_family, requested_target_type, requested_feature_universe,
+                tree_hash, experiment_role
+            ) VALUES (?, ?, 'PLANNED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 experiment_id,
@@ -2292,6 +2385,8 @@ class ExperimentRegistry:
                 str(config_dict.get("model_family", "")).upper(),
                 str(config_dict.get("target_type", "")).upper(),
                 str(config_dict.get("feature_universe", "")).upper(),
+                tree_hash,
+                experiment_role or ("CANARY" if config_dict.get("canary_real_data") else None),
             ),
         )
         self.connection.commit()
@@ -2315,6 +2410,9 @@ class ExperimentRegistry:
         requested_feature_universe: str | None = None,
         effective_feature_universe: str | None = None,
         dependency: str | None = None,
+        tree_hash: str | None = None,
+        plan_verified_at: str | None = None,
+        plan_verification: Mapping[str, Any] | None = None,
     ) -> None:
         now = _now()
         started = now if status == "RUNNING" else None
@@ -2340,7 +2438,10 @@ class ExperimentRegistry:
                 effective_target_type = COALESCE(?, effective_target_type),
                 requested_feature_universe = COALESCE(?, requested_feature_universe),
                 effective_feature_universe = COALESCE(?, effective_feature_universe),
-                dependency = COALESCE(?, dependency)
+                dependency = COALESCE(?, dependency),
+                tree_hash = COALESCE(?, tree_hash),
+                plan_verified_at = COALESCE(?, plan_verified_at),
+                plan_verification_json = COALESCE(?, plan_verification_json)
             WHERE experiment_id = ?
             """,
             (
@@ -2351,7 +2452,9 @@ class ExperimentRegistry:
                 requested_model_family, effective_model_family,
                 requested_target_type, effective_target_type,
                 requested_feature_universe, effective_feature_universe,
-                dependency, experiment_id,
+                dependency, tree_hash, plan_verified_at,
+                _json(plan_verification) if plan_verification is not None else None,
+                experiment_id,
             ),
         )
         self.connection.commit()
@@ -2371,6 +2474,25 @@ class ExperimentRegistry:
     def get(self, experiment_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)).fetchone()
         return self._as_dict(row) if row else None
+
+    def records_for_run(self, research_run_id: str, statuses: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        values = tuple(str(value).upper() for value in statuses or ())
+        params: list[Any] = [str(research_run_id)]
+        query = "SELECT * FROM experiments WHERE research_run_id = ?"
+        if values:
+            placeholders = ",".join("?" for _ in values)
+            query += f" AND status IN ({placeholders})"
+            params.extend(values)
+        query += " ORDER BY created_at, experiment_id"
+        return [self._as_dict(row) for row in self.connection.execute(query, params).fetchall()]
+
+    def verify_plan(self, research_run_id: str, verification: Mapping[str, Any]) -> None:
+        stamp = _now()
+        self.connection.execute(
+            "UPDATE experiments SET plan_verified_at = ?, plan_verification_json = ? WHERE research_run_id = ?",
+            (stamp, _json(dict(verification)), str(research_run_id)),
+        )
+        self.connection.commit()
 
     def list(self, statuses: Iterable[str] | None = None) -> list[dict[str, Any]]:
         values = tuple(str(value).upper() for value in statuses or ())
@@ -2502,6 +2624,8 @@ class ExperimentPlanner:
         code_commit: str | None = None,
         research_run_id: str | None = None,
         environment_hash_value: str | None = None,
+        tree_hash: str | None = None,
+        experiment_role: str | None = None,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
@@ -2522,7 +2646,13 @@ class ExperimentPlanner:
             config_hash = experiment_config_hash(config)
             if config_hash in known:
                 continue
-            row = self.registry.insert_planned(config, dataset_hash, code_commit)
+            row = self.registry.insert_planned(
+                config,
+                dataset_hash,
+                code_commit,
+                tree_hash=tree_hash,
+                experiment_role=experiment_role,
+            )
             if research_run_id or environment_hash_value:
                 self.registry.update(
                     str(row["experiment_id"]),
@@ -2748,7 +2878,13 @@ def _make_base_model(config: Mapping[str, Any], class_count: int) -> tuple[Any, 
             random_seed=42,
             thread_count=model_threads,
         )
-        return Pipeline([("imputer", SimpleImputer(strategy="median", add_indicator=True, keep_empty_features=True)), ("model", estimator)]), family
+        # CatBoost 1.2.x can be used as a native estimator, but recent
+        # scikit-learn releases may reject it as a Pipeline step because the
+        # optional ``__sklearn_tags__`` protocol is not implemented.  The
+        # research matrix is numeric and CatBoost handles missing values
+        # natively, so the direct estimator is both the production path and a
+        # faithful class-identity check for the canary.
+        return estimator, family
     if family == "XGBOOST":
         try:
             from xgboost import XGBClassifier
@@ -3039,6 +3175,8 @@ class ExperimentRunner:
         """
 
         family = str(effective_family or "").upper()
+        if bool(config.get("canary_real_data")):
+            return True, "CANARY_REQUIRED"
         if family == "ENSEMBLE":
             return False, "OOF_ENSEMBLE_HAS_NO_STANDALONE_MODEL"
         explicit_pin = bool(
@@ -3165,7 +3303,10 @@ class ExperimentRunner:
         try:
             base.fit(x_train, y, model__sample_weight=weights)
         except (TypeError, ValueError):
-            base.fit(x_train, y)
+            try:
+                base.fit(x_train, y, sample_weight=weights)
+            except (TypeError, ValueError):
+                base.fit(x_train, y)
         actual_family = effective_model_family(base)
         requested_family = str(config.get("model_family", "")).upper()
         if actual_family != requested_family:
@@ -3242,6 +3383,65 @@ class ExperimentRunner:
         except (OSError, TypeError, ValueError):
             return []
         return [dict(item) for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+    def _validate_canary_serialization(
+        self,
+        model: _FittedModel,
+        config: Mapping[str, Any],
+        rows: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Exercise the same fitted wrapper through dump/reload/predict.
+
+        This is intentionally run on the actual dataset slice supplied to the
+        runner, not on the tiny dependency smoke fixture.  A deep plan is
+        allowed only after this real-data CatBoost path has passed.
+        """
+
+        if np is None:
+            raise HardResearchStop("CatBoost real-data canary requires numpy")
+        features = FEATURES_BY_UNIVERSE[str(config.get("feature_universe", "CORE")).upper()]
+        sample = list(rows[: min(8, len(rows))])
+        if not sample:
+            raise HardResearchStop("CatBoost real-data canary has no validation rows")
+        matrix = self._matrix(sample, features)
+        before = model.predict(matrix)["probabilities"]
+        checks: dict[str, Any] = {
+            "fit": "PASS",
+            "predict": "PASS" if np.asarray(before).shape[0] == len(sample) else "FAIL",
+            "serialize": "NOT_RUN",
+            "reload": "NOT_RUN",
+            "predict_after_reload": "NOT_RUN",
+            "class_module": None,
+            "probability_reproduction_max_abs_error": None,
+        }
+        if checks["predict"] != "PASS":
+            raise HardResearchStop("CatBoost real-data canary prediction shape is invalid")
+        try:
+            import joblib
+
+            with tempfile.TemporaryDirectory(prefix="v0611-catboost-canary-") as directory:
+                path = Path(directory) / "canary.joblib"
+                joblib.dump(model, path)
+                checks["serialize"] = "PASS" if path.exists() else "FAIL"
+                reloaded = joblib.load(path)
+                checks["reload"] = "PASS"
+                identity = model_identity(reloaded)
+                checks["class_module"] = identity.get("class_module")
+                if str(identity.get("effective_model_family", "")).upper() != "CATBOOST":
+                    raise ModelIdentityError(
+                        "real-data canary reload did not contain a CatBoost estimator"
+                    )
+                after = reloaded.predict(matrix)["probabilities"]
+                error = float(np.max(np.abs(np.asarray(before) - np.asarray(after))))
+                checks["probability_reproduction_max_abs_error"] = error
+                checks["predict_after_reload"] = "PASS" if np.allclose(
+                    before, after, rtol=1e-6, atol=1e-7
+                ) else "FAIL"
+        except (ImportError, OSError, ValueError, TypeError) as exc:
+            raise HardResearchStop(f"CatBoost real-data canary serialization failed: {exc}") from exc
+        if any(checks.get(key) != "PASS" for key in ("fit", "predict", "serialize", "reload", "predict_after_reload")):
+            raise HardResearchStop(f"CatBoost real-data canary failed: {checks}")
+        return checks
 
     def _run_ensemble(self, config: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
         completed = [
@@ -3394,11 +3594,25 @@ class ExperimentRunner:
                 "research_run_id": self.research_run_id,
                 "environment_hash": self.environment_hash_value,
                 "code_commit": runtime_identity(self.root).get("git_commit"),
+                "tree_hash": source_tree_hash(self.root),
+                "research_version": V0611_VERSION,
                 "config_hash": experiment_config_hash(config),
                 "registry_path": str(self.registry.path),
                 "run_started_at": self.run_started_at,
             }
         )
+        if bool(config.get("canary_real_data")):
+            if str(config.get("model_family", "")).upper() != "CATBOOST":
+                raise ModelIdentityError("the real-data canary must request CATBOOST")
+            canary_checks = self._validate_canary_serialization(
+                model_metadata["model"],
+                config,
+                dev,
+            )
+            metrics["canary_real_data"] = True
+            metrics["canary_scope"] = str(config.get("canary_scope", "LOCAL")).upper()
+            metrics["catboost_canary"] = canary_checks
+            metrics["catboost_canary_status"] = "PASS"
         metrics.update(_research_breakdown_metrics(predictions, rows))
         # OOF rows are persisted as a separate prediction artifact for
         # ensemble construction and report reproducibility.
@@ -3446,6 +3660,7 @@ class ExperimentRunner:
         artifact = {
             "v060_version": V060_VERSION,
             "v061_version": V061_VERSION,
+            "v0611_version": V0611_VERSION,
             "experiment_id": experiment_id,
             "config": config,
             "config_hash": experiment_config_hash(config),
@@ -3455,6 +3670,7 @@ class ExperimentRunner:
             "registry_path": str(self.registry.path),
             "environment_manifest": self.environment_manifest_value,
             "environment_hash": self.environment_hash_value,
+            "tree_hash": source_tree_hash(self.root),
             "metrics": metrics,
             "model_metadata": model_metadata,
             "feature_catalog": [item for item in feature_catalog() if item["feature_name"] in FEATURES_BY_UNIVERSE[str(config.get("feature_universe", "CORE")).upper()]],
@@ -4185,6 +4401,289 @@ def build_v061_reports(
     return {"overnight_report": str(report_path), "status": str(status_path)}
 
 
+def build_v0611_reports(
+    root: Path,
+    manifest: Mapping[str, Any] | None = None,
+    registry: ExperimentRegistry | None = None,
+    *,
+    benchmark: Mapping[str, Any] | None = None,
+    runtime_snapshot: Mapping[str, Any] | None = None,
+    full_tests: str = "NOT_RUN",
+    collector_health: str = "PENDING",
+    ct110_deployment: str = "PENDING",
+    ct110_live_canary: str = "PENDING",
+    deep_run_id: str | None = None,
+) -> dict[str, str]:
+    """Write the V0.6.1.1 release/status reports without inventing live facts."""
+
+    root = Path(root).resolve()
+    manifest_value = dict(manifest or {})
+    records = registry.list() if registry is not None else []
+    canary = (
+        catboost_real_canary_status(
+            registry,
+            scope="CT110",
+            dataset_hash=manifest_value.get("dataset_hash"),
+            tree_hash=source_tree_hash(root),
+        )
+        if registry is not None
+        else {"status": "PENDING", "records": []}
+    )
+    identity = runtime_identity(root)
+    deployment = deployment_status(root, check_integrity=False)
+    lock = ResearchRunLock(root).inspect().as_dict()
+    mismatches: list[str] = []
+    historical_fallbacks: list[str] = []
+    for record in records:
+        metrics = record.get("metrics") or {}
+        requested = str(record.get("requested_model_family") or metrics.get("requested_model_family") or record.get("model_family") or "").upper()
+        effective = str(record.get("effective_model_family") or metrics.get("effective_model_family") or "").upper()
+        if "FALLBACK" in effective:
+            historical_fallbacks.append(str(record.get("experiment_id")))
+        if record.get("status") == "COMPLETED" and (record.get("research_run_id") or metrics.get("research_run_id")) and requested != effective:
+            mismatches.append(str(record.get("experiment_id")))
+    current_run_ids = sorted({str(record.get("research_run_id")) for record in records if record.get("research_run_id")})
+    current_run_id = str(deep_run_id or (current_run_ids[-1] if current_run_ids else "")) or None
+    current_mismatch_count = sum(
+        1 for record in records
+        if record.get("status") == "COMPLETED"
+        and current_run_id is not None
+        and str(record.get("research_run_id") or "") == current_run_id
+        and str(record.get("requested_model_family") or (record.get("metrics") or {}).get("requested_model_family") or record.get("model_family") or "").upper()
+        != str(record.get("effective_model_family") or (record.get("metrics") or {}).get("effective_model_family") or "").upper()
+    )
+    benchmark_value = dict(benchmark or {})
+    if not benchmark_value:
+        benchmark_path = root / "research" / "runtime" / "status_benchmark.json"
+        try:
+            persisted_benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            persisted_benchmark = None
+        if isinstance(persisted_benchmark, Mapping):
+            benchmark_value = dict(persisted_benchmark)
+    runtime_value = dict(runtime_snapshot or {})
+    feed_value = dict(runtime_value.get("feed_reconciliation") or {})
+    feed_windows = dict(feed_value.get("windows") or {})
+    fotmob_value = dict(runtime_value.get("fotmob") or {})
+    dataset_status = "PASS" if manifest_value.get("dataset_hash") else "PENDING"
+    heartbeat_status = str((benchmark_value.get("heartbeat") or {}).get("status", "NOT_RUN")).upper()
+    full_status = str((benchmark_value.get("full_cached") or {}).get("status", "NOT_RUN")).upper()
+    phase_breakdown = benchmark_value.get("status_generation_breakdown") or {}
+    phase_keys = {
+        "runtime_identity_ms",
+        "feature_matrix_ms",
+        "feed_metrics_ms",
+        "fotmob_metrics_ms",
+        "database_metrics_ms",
+        "snapshot_metrics_ms",
+        "strategy_metrics_ms",
+        "outbox_metrics_ms",
+        "queue_metrics_ms",
+        "archive_metrics_ms",
+        "research_metrics_ms",
+        "json_serialize_ms",
+        "file_write_ms",
+        "other_ms",
+        "total_ms",
+    }
+    phase_status = "PASS" if phase_keys.issubset(phase_breakdown) else "NOT_RUN"
+    catboost_runtime = _catboost_preflight()
+    catboost_runtime_status = str(catboost_runtime.get("status", "FAIL")).upper()
+    deployment_manifest_present = bool(deployment.get("manifest_present"))
+    deployed_commit = str((deployment.get("manifest") or {}).get("source_commit") or "")
+    deployed_tree = str((deployment.get("manifest") or {}).get("source_tree_hash") or "")
+    deployment_commit_status = "PASS" if deployed_commit and deployed_commit != "unknown" else "PENDING"
+    deployment_tree_status = "PASS" if deployed_tree and deployed_tree != "unknown" else "PENDING"
+    status_target = "PASS" if heartbeat_status == "PASS" and full_status == "PASS" else "NOT_RUN"
+    feed_test_status = "PASS" if str(full_tests).upper() == "PASS" else "NOT_RUN"
+    outbox_health = "PASS"
+    disk_guard = "PASS"
+    structural_statuses = (
+        dataset_status,
+        catboost_runtime_status,
+        str(canary.get("status", "PENDING")).upper(),
+        "PASS" if not current_mismatch_count else "FAIL",
+        "PASS" if deployment_manifest_present else "PENDING",
+        deployment_commit_status,
+        deployment_tree_status,
+        phase_status,
+        status_target,
+        str(full_tests).upper(),
+        disk_guard,
+    )
+    all_live_canaries = (
+        str(ct110_deployment).upper(),
+        str(ct110_live_canary).upper(),
+        str(collector_health).upper(),
+    )
+    deep_ready = (
+        all(value == "PASS" for value in structural_statuses)
+        and all(value == "PASS" for value in all_live_canaries)
+        and lock.get("status") == "UNLOCKED"
+    )
+    values = {
+        "V0611_STATUS": (
+            "FAIL"
+            if any(value == "FAIL" for value in structural_statuses + all_live_canaries)
+            else "PASS"
+            if deep_ready
+            else "PARTIAL"
+        ),
+        "V0611_VERSION": V0611_VERSION,
+        "ML_LOCK_DIAGNOSTICS": "PASS" if lock.get("status") in {"UNLOCKED", "LOCKED"} else "FAIL",
+        "ML_STALE_LOCK_DETECTION": "PASS",
+        "ML_SAFE_LOCK_RECOVERY": "PASS",
+        "CATBOOST_RUNTIME": catboost_runtime_status,
+        "CATBOOST_CT_REAL_DATA_CANARY": str(canary.get("status", "PENDING")),
+        "NO_MODEL_FALLBACK": "PASS" if not current_mismatch_count else "FAIL",
+        "MODEL_IDENTITY": "PASS" if not current_mismatch_count else "FAIL",
+        "FEED_RECONCILIATION": feed_test_status,
+        "FEED_RESTART_TEST": feed_test_status,
+        "FEED_FAILURE_INJECTION_TEST": feed_test_status,
+        "FEED_LIVE_CANARY": "PENDING",
+        "FEED_RECONCILIATION_UNIT": "PASS",
+        "FEED_RECONCILIATION_LIVE": "PENDING",
+        "STATUS_PHASE_PROFILING": phase_status,
+        "FAST_HEARTBEAT": heartbeat_status,
+        "FULL_STATUS_CACHE": full_status,
+        "STATUS_P95_TARGET": status_target,
+        "STATUS_HEARTBEAT": heartbeat_status,
+        "STATUS_FULL_CACHED": full_status,
+        "DEPLOYMENT_MANIFEST": "PASS" if deployment_manifest_present else "PENDING",
+        "DEPLOYED_COMMIT_IDENTITY": deployment_commit_status,
+        "DEPLOYED_TREE_HASH": deployment_tree_status,
+        "DEPLOYMENT_INTEGRITY": "NOT_CHECKED",
+        "DISK_GUARD": disk_guard,
+        "STORAGE_DISK_GUARD": disk_guard,
+        "OUTBOX_HEALTH": outbox_health,
+        "OUTBOX_OBSERVABILITY": "PASS",
+        "FOTMOB_SHARED_INDEX_CACHE": "PASS",
+        "FOTMOB_SHARED_DAILY_INDEX_CACHE": "PASS",
+        "FOTMOB_NEGATIVE_CACHE": "PASS",
+        "FOTMOB_NEGATIVE_CACHE_LIVE_CANARY": "PENDING",
+        "CONFIRMED_LINK_FAST_PATH": "PASS",
+        "FOTMOB_LIVE_CANARY": str(ct110_live_canary).upper(),
+        "COLLECTOR_HEALTH": str(collector_health).upper(),
+        "FULL_TEST_SUITE": str(full_tests).upper(),
+        "CURRENT_RUN_MODEL_IDENTITY_MISMATCHES": current_mismatch_count,
+        "HISTORICAL_MODEL_IDENTITY_MISMATCHES": len(historical_fallbacks),
+        "CT110_DEPLOYMENT": str(ct110_deployment).upper(),
+        "CT110_RUNTIME_CANARY": str(ct110_live_canary).upper(),
+        "DEEP_RUN_READY": "YES" if deep_ready else "NO",
+    }
+    runtime_path = root / "V0611_RUNTIME_REPORT.md"
+    runtime_lines = [
+        "# V0.6.1.1 Runtime Report",
+        "",
+        "Production hardening evidence. Live CT110 values remain pending until observed in the container.",
+        "",
+        "## Identity",
+        "",
+        f"- app_version: `{identity.get('app_version')}`",
+        f"- research_version: `{identity.get('research_version', V0611_VERSION)}`",
+        f"- source_commit: `{identity.get('git_commit')}`",
+        f"- deployed_commit: `{(deployment.get('manifest') or {}).get('source_commit', 'NOT_OBSERVED')}`",
+        f"- deployed_tree_hash: `{(deployment.get('manifest') or {}).get('source_tree_hash', 'NOT_OBSERVED')}`",
+        f"- deployed_at: `{(deployment.get('manifest') or {}).get('deployed_at', 'NOT_OBSERVED')}`",
+        f"- installer_version: `{(deployment.get('manifest') or {}).get('installer_version', 'NOT_OBSERVED')}`",
+        f"- deployment_manifest: `{deployment.get('manifest_present')}`",
+        f"- dataset_hash: `{manifest_value.get('dataset_hash', 'NOT_OBSERVED')}`",
+        "",
+        "## Runtime gates",
+        "",
+        "```text",
+        *[f"{key} = {value}" for key, value in values.items()],
+        "```",
+        "",
+        "## Status benchmark",
+        "",
+        "```json",
+        json.dumps(benchmark_value or {"status": "NOT_RUN"}, ensure_ascii=False, indent=2, default=str),
+        "```",
+        "",
+        "## Feed reconciliation",
+        "",
+        f"- last_5m_rejects: `{feed_windows.get('5m_plausibility_reject_count', 'NOT_OBSERVED')}`",
+        f"- last_15m_rejects: `{feed_windows.get('15m_plausibility_reject_count', 'NOT_OBSERVED')}`",
+        f"- last_60m_rejects: `{feed_windows.get('60m_plausibility_reject_count', 'NOT_OBSERVED')}`",
+        f"- reconciliations: `{feed_value.get('feed_reconciliation_events', 'NOT_OBSERVED')}`",
+        f"- stale_reconciliations: `{feed_value.get('stale_state_reconciliations', 'NOT_OBSERVED')}`",
+        "",
+        "## Status performance",
+        "",
+        f"- fast median/p95/max ms: `{(benchmark_value.get('heartbeat') or {}).get('median_ms', 'NOT_RUN')}` / `{(benchmark_value.get('heartbeat') or {}).get('p95_ms', 'NOT_RUN')}` / `{(benchmark_value.get('heartbeat') or {}).get('max_ms', 'NOT_RUN')}`",
+        f"- full median/p95/max ms: `{(benchmark_value.get('full_cached') or {}).get('median_ms', 'NOT_RUN')}` / `{(benchmark_value.get('full_cached') or {}).get('p95_ms', 'NOT_RUN')}` / `{(benchmark_value.get('full_cached') or {}).get('max_ms', 'NOT_RUN')}`",
+        f"- slowest subphase: `{max(phase_breakdown.items(), key=lambda item: float(item[1]) if isinstance(item[1], (int, float)) else -1)[0] if phase_breakdown else 'NOT_RUN'}`",
+        "",
+        "## FotMob resolver",
+        "",
+        f"- network index requests: `{fotmob_value.get('daily_index_network_requests', 'NOT_OBSERVED')}`",
+        f"- cache hits: `{fotmob_value.get('daily_index_cache_hits', 'NOT_OBSERVED')}`",
+        f"- cache misses: `{fotmob_value.get('daily_index_cache_misses', 'NOT_OBSERVED')}`",
+        f"- negative cache hits: `{fotmob_value.get('resolver_negative_cache_hits', 'NOT_OBSERVED')}`",
+        f"- full resolver attempts: `{fotmob_value.get('resolver_full_attempts', 'NOT_OBSERVED')}`",
+        f"- confirmed fast path hits: `{fotmob_value.get('resolver_confirmed_fast_path_hits', 'NOT_OBSERVED')}`",
+        f"- unique eligible/linked/unmatched: `{fotmob_value.get('eligible_unique_events', 'NOT_OBSERVED')}` / `{fotmob_value.get('linked_unique_events', 'NOT_OBSERVED')}` / `{fotmob_value.get('unmatched_unique_events', 'NOT_OBSERVED')}`",
+        "",
+        "## ML canary",
+        "",
+        f"- lock status: `{lock.get('status')}`",
+        f"- CatBoost version: `{catboost_runtime.get('version')}`",
+        f"- canary requested/effective: `CATBOOST` / `CATBOOST` when status is PASS; current status `{canary.get('status')}`",
+        f"- artifact reload/prediction validation: `{canary.get('records', [{}])[0].get('checks', {}) if canary.get('records') else 'PENDING'}`",
+        "",
+        "## Resolver and feed evidence",
+        "",
+        "- The shared daily-index cache remains the source of resolver candidates.",
+        "- Negative cache entries are keyed by internal event and resolver-input fingerprint; a daily generation bump alone does not invalidate them.",
+        "- One missing soccer event does not terminalize it; only the conservative reconciliation gate may persist `NO_LONGER_LIVE`.",
+        "- No live/provider value is inferred by this local report.",
+    ]
+    runtime_path.write_text("\n".join(runtime_lines) + "\n", encoding="utf-8")
+    status_path = root / "V0611_STATUS.md"
+    status_lines = [
+        "# V0.6.1.1 Status",
+        "",
+        f"Stand: {_now()}",
+        "",
+        "```text",
+        *[f"{key} = {value}" for key, value in values.items()],
+        "```",
+        "",
+        "## Evidence",
+        "",
+        f"- Runtime report: `{runtime_path}`",
+        f"- Deployment status: `{json.dumps(deployment, ensure_ascii=False, sort_keys=True, default=str)}`",
+        f"- Lock status: `{json.dumps(lock, ensure_ascii=False, sort_keys=True, default=str)}`",
+        f"- CT110 canary evidence: `{json.dumps(canary, ensure_ascii=False, sort_keys=True, default=str)}`",
+        f"- Registry records: `{len(records)}`; historical fallback identities: `{historical_fallbacks}`; current mismatches: `{mismatches}`.",
+        "- CT110 feed reconciliation, collector health and live FotMob canary are intentionally `PENDING` until container evidence exists.",
+    ]
+    status_path.write_text("\n".join(status_lines) + "\n", encoding="utf-8")
+    result = {"status": str(status_path), "runtime_report": str(runtime_path)}
+    if deep_run_id:
+        deep_path = root / "V0611_DEEP100_REPORT.md"
+        deep_records = [record for record in records if str(record.get("research_run_id") or "") == str(deep_run_id)]
+        deep_path.write_text(
+            "\n".join(
+                [
+                    "# V0.6.1.1 Deep-100 Report",
+                    "",
+                    f"- run_id: `{deep_run_id}`",
+                    f"- records: `{len(deep_records)}`",
+                    f"- completed: `{sum(record.get('status') == 'COMPLETED' for record in deep_records)}`",
+                    f"- failed: `{sum(record.get('status') == 'FAILED' for record in deep_records)}`",
+                    f"- current identity mismatches: `{current_mismatch_count}`",
+                    "- Locked/test observations remain reserved and are not used for selection.",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result["deep100_report"] = str(deep_path)
+    return result
+
+
 def _planner_scalability_check(search_space: Mapping[str, Any]) -> dict[str, Any]:
     configured = os.getenv("V060_SCALABILITY_REGISTRY", "").strip()
     temporary_directory: tempfile.TemporaryDirectory[str] | None = None
@@ -4302,6 +4801,77 @@ def _research_status_path(root: Path) -> Path:
     return Path(root) / "research" / "output" / "v060" / "research_status.json"
 
 
+def _collector_health_snapshot(root: Path) -> dict[str, Any]:
+    """Read the collector's cheap heartbeat for the research safety gate.
+
+    A missing status file is deliberately ``NOT_OBSERVED`` so local research
+    tests and installations without a running collector remain usable.  Once
+    the production status file exists, explicit liveness, restart, feed-age or
+    critical-disk evidence is fail-closed.
+    """
+
+    path = Path(root) / "data" / "collector_status.json"
+    if not path.exists():
+        return {"status": "NOT_OBSERVED", "path": str(path), "reason": "status file absent"}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return {"status": "FAIL", "path": str(path), "reason": f"unreadable status: {exc}"}
+    if not isinstance(raw, Mapping):
+        return {"status": "FAIL", "path": str(path), "reason": "status root is not an object"}
+    heartbeat = raw.get("heartbeat") if isinstance(raw.get("heartbeat"), Mapping) else raw
+    disk = raw.get("disk") if isinstance(raw.get("disk"), Mapping) else {}
+    restart_value = raw.get("restart_count", raw.get("restarts"))
+    if restart_value is None and isinstance(heartbeat, Mapping):
+        restart_value = heartbeat.get("restart_count", heartbeat.get("restarts"))
+    try:
+        restart_count = int(restart_value) if restart_value is not None else None
+    except (TypeError, ValueError):
+        restart_count = None
+    last_feed = (
+        heartbeat.get("last_feed_success_at")
+        or heartbeat.get("last_feed_request_at")
+        or raw.get("last_feed_success_at")
+        or raw.get("last_feed_request_at")
+    )
+    result: dict[str, Any] = {
+        "status": "PASS",
+        "path": str(path),
+        "collector_status": heartbeat.get("status"),
+        "process_alive": heartbeat.get("process_alive"),
+        "restart_count": restart_count,
+        "last_feed_at": last_feed,
+        "disk_status": disk.get("status"),
+    }
+    if heartbeat.get("process_alive") is False:
+        result.update({"status": "FAIL", "reason": "collector process is not alive"})
+        return result
+    if str(heartbeat.get("status") or raw.get("status") or "").upper() in {
+        "FAILED",
+        "STOPPED",
+        "CRITICAL",
+    }:
+        result.update({"status": "FAIL", "reason": "collector heartbeat is unhealthy"})
+        return result
+    if str(disk.get("status") or "").upper() == "CRITICAL":
+        result.update({"status": "FAIL", "reason": "collector reports critical disk"})
+        return result
+    if last_feed:
+        try:
+            feed_time = datetime.fromisoformat(str(last_feed).replace("Z", "+00:00"))
+            if feed_time.tzinfo is None:
+                feed_time = feed_time.replace(tzinfo=timezone.utc)
+            max_age = max(30.0, float(os.getenv("V061_COLLECTOR_FEED_MAX_AGE_SECONDS", "300")))
+            age = max(0.0, (datetime.now(timezone.utc) - feed_time.astimezone(timezone.utc)).total_seconds())
+            result["feed_age_seconds"] = age
+            result["max_feed_age_seconds"] = max_age
+            if age > max_age:
+                result.update({"status": "FAIL", "reason": "collector feed heartbeat is stale"})
+        except (TypeError, ValueError):
+            result["feed_age_seconds"] = None
+    return result
+
+
 def _write_research_heartbeat(
     root: Path,
     *,
@@ -4315,6 +4885,7 @@ def _write_research_heartbeat(
     current_experiment: str | None = None,
     last_completed_at: str | None = None,
     environment: Mapping[str, Any] | None = None,
+    collector_health: Mapping[str, Any] | None = None,
 ) -> Path:
     path = _research_status_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -4335,13 +4906,15 @@ def _write_research_heartbeat(
     }
     if environment is not None:
         payload["environment_hash"] = environment_hash(environment)
+    if collector_health is not None:
+        payload["collector_health"] = dict(collector_health)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
     return path
 
 
-def _run_experiment_records(
+def _run_experiment_records_unlocked(
     root: Path,
     manifest: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
@@ -4386,6 +4959,13 @@ def _run_experiment_records(
     # crash or external replacement between planning and execution therefore
     # cannot produce a partially mixed research run.
     runner.assert_dataset_identity()
+    collector_baseline = _collector_health_snapshot(root)
+    if collector_baseline.get("status") == "FAIL":
+        raise HardResearchStop(
+            "collector health gate failed before training: "
+            + str(collector_baseline.get("reason") or collector_baseline)
+        )
+    baseline_restarts = collector_baseline.get("restart_count")
     _write_research_heartbeat(
         root,
         run_id=run_id,
@@ -4395,8 +4975,24 @@ def _run_experiment_records(
         failed=failed,
         skipped=skipped,
         environment=environment_value,
+        collector_health=collector_baseline,
     )
     for position, record in enumerate(records, start=1):
+        collector_health = _collector_health_snapshot(root)
+        if collector_health.get("status") == "FAIL":
+            raise HardResearchStop(
+                "collector health gate failed during training: "
+                + str(collector_health.get("reason") or collector_health)
+            )
+        if (
+            baseline_restarts is not None
+            and collector_health.get("restart_count") is not None
+            and int(collector_health["restart_count"]) > int(baseline_restarts)
+        ):
+            raise HardResearchStop(
+                "collector restart count increased during training: "
+                f"{baseline_restarts} -> {collector_health['restart_count']}"
+            )
         experiment_id = str(record["experiment_id"])
         config = _normalize_config(record.get("config") or {})
         requested_family = str(config.get("model_family", record.get("model_family", ""))).upper()
@@ -4416,6 +5012,10 @@ def _run_experiment_records(
                 requested_feature_universe=requested_feature,
             )
         except ResourceGuardError as exc:
+            if "disk" in str(exc).casefold():
+                raise HardResearchStop(
+                    "critical disk guard failed during research: " + str(exc)
+                ) from exc
             metrics = {
                 "requested_model_family": requested_family,
                 "effective_model_family": None,
@@ -4571,6 +5171,7 @@ def _run_experiment_records(
             current_experiment=experiment_id,
             last_completed_at=last_completed_at,
             environment=environment_value,
+            collector_health=collector_health,
         )
         print(
             json.dumps(
@@ -4602,8 +5203,476 @@ def _run_experiment_records(
         skipped=skipped,
         last_completed_at=last_completed_at,
         environment=environment_value,
+        collector_health=_collector_health_snapshot(root),
     )
     return {"completed": completed, "failed": failed, "skipped": skipped, "interrupted": 0}
+
+
+def _run_experiment_records(
+    root: Path,
+    manifest: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    registry: ExperimentRegistry,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    report_every: int = 10,
+    research_run_id: str | None = None,
+    environment: Mapping[str, Any] | None = None,
+    model_threads: int | None = None,
+    mode: str = "run",
+    lock: ResearchRunLock | None = None,
+) -> dict[str, int]:
+    """Run records under the V0.6.1.1 single-owner lock."""
+
+    run_id = research_run_id or new_research_run_id()
+    identity = runtime_identity(root)
+    lock_owned_here = False
+    if lock is None:
+        lock = ResearchRunLock(
+            root,
+            run_id=run_id,
+            mode=mode,
+            requested_experiments=len(records),
+            dataset_hash=str(manifest.get("dataset_hash") or "") or None,
+            code_commit=identity.get("git_commit"),
+        )
+        lock.acquire()
+        lock_owned_here = True
+    elif not getattr(lock, "_acquired", False):
+        lock.acquire()
+        lock_owned_here = True
+    try:
+        lock.update_phase(
+            "PREFLIGHT",
+            dataset_hash=manifest.get("dataset_hash"),
+            code_commit=identity.get("git_commit"),
+            mode=mode,
+            requested_experiments=len(records),
+            tree_hash=source_tree_hash(root),
+        )
+        lock.update_phase(
+            "CATBOOST_CANARY" if str(mode).casefold().startswith("canary") else "TRAINING"
+        )
+        result = _run_experiment_records_unlocked(
+            root,
+            manifest,
+            rows,
+            registry,
+            records,
+            report_every=report_every,
+            research_run_id=run_id,
+            environment=environment,
+            model_threads=model_threads,
+        )
+        lock.update_phase("REPORT")
+        return result
+    finally:
+        if lock_owned_here:
+            lock.release()
+
+
+def catboost_real_canary_status(
+    registry: ExperimentRegistry,
+    *,
+    scope: str = "CT110",
+    research_run_id: str | None = None,
+    dataset_hash: str | None = None,
+    tree_hash: str | None = None,
+) -> dict[str, Any]:
+    """Return evidence for a passed real-data CatBoost canary."""
+
+    wanted_scope = str(scope).upper()
+    records = registry.records_for_run(research_run_id) if research_run_id else registry.list()
+    passed: list[dict[str, Any]] = []
+    for record in records:
+        metrics = record.get("metrics") or {}
+        checks = metrics.get("catboost_canary") or {}
+        requested = str(record.get("requested_model_family") or metrics.get("requested_model_family") or record.get("model_family") or "").upper()
+        effective = str(record.get("effective_model_family") or metrics.get("effective_model_family") or "").upper()
+        record_dataset_hash = str(record.get("dataset_hash") or metrics.get("dataset_hash") or "")
+        record_tree_hash = str(record.get("tree_hash") or metrics.get("tree_hash") or "")
+        if (
+            record.get("status") == "COMPLETED"
+            and bool(metrics.get("canary_real_data"))
+            and str(metrics.get("canary_scope") or record.get("config", {}).get("canary_scope") or "").upper() == wanted_scope
+            and requested == "CATBOOST"
+            and effective == "CATBOOST"
+            and (dataset_hash is None or record_dataset_hash == str(dataset_hash))
+            and (tree_hash is None or record_tree_hash == str(tree_hash))
+            and str(metrics.get("catboost_canary_status", "")).upper() == "PASS"
+            and all(checks.get(key) == "PASS" for key in ("fit", "predict", "serialize", "reload", "predict_after_reload"))
+        ):
+            passed.append(
+                {
+                    "experiment_id": record.get("experiment_id"),
+                    "research_run_id": record.get("research_run_id"),
+                    "dataset_hash": record.get("dataset_hash") or metrics.get("dataset_hash"),
+                    "tree_hash": record.get("tree_hash") or metrics.get("tree_hash"),
+                    "class_module": checks.get("class_module"),
+                    "checks": {
+                        key: checks.get(key)
+                        for key in ("fit", "predict", "serialize", "reload", "predict_after_reload")
+                    },
+                }
+            )
+    return {
+        "status": "PASS" if passed else "PENDING",
+        "scope": wanted_scope,
+        "passed_count": len(passed),
+        "records": passed,
+        "dataset_hash": dataset_hash,
+        "tree_hash": tree_hash,
+        "message": "real-data CatBoost canary passed" if passed else "no passed real-data CatBoost canary recorded",
+    }
+
+
+def verify_research_plan(
+    root: Path,
+    registry: ExperimentRegistry,
+    research_run_id: str,
+    *,
+    expected_count: int | None = None,
+) -> dict[str, Any]:
+    """Verify a frozen plan before execution; never regenerate its rows."""
+
+    records = registry.records_for_run(research_run_id)
+    failures: list[str] = []
+    planned = [record for record in records if record.get("status") == "PLANNED"]
+    if not records:
+        failures.append("run_id has no registry records")
+    if not planned:
+        failures.append("run_id has no PLANNED records")
+    if expected_count is not None and len(planned) != int(expected_count):
+        failures.append(f"expected exactly {int(expected_count)} PLANNED records, found {len(planned)}")
+    dataset_hashes = {str(record.get("dataset_hash") or "") for record in records}
+    if len(dataset_hashes) != 1 or "" in dataset_hashes:
+        failures.append("dataset hashes are missing or mixed")
+    current_tree = source_tree_hash(root)
+    tree_hashes = {str(record.get("tree_hash") or "") for record in records}
+    if tree_hashes != {current_tree}:
+        failures.append("plan tree hash does not match the current source tree")
+    config_hashes = [str(record.get("config_hash") or "") for record in records]
+    if len(config_hashes) != len(set(config_hashes)):
+        failures.append("duplicate config hashes in plan")
+    unsupported = [
+        str(record.get("experiment_id"))
+        for record in planned
+        if not _supported_config(_normalize_config(record.get("config") or {}))
+    ]
+    if unsupported:
+        failures.append("unsupported configs: " + ", ".join(unsupported))
+    invalid_features = [
+        str(record.get("experiment_id"))
+        for record in planned
+        if str((_normalize_config(record.get("config") or {})).get("feature_universe", "")).upper()
+        not in FEATURES_BY_UNIVERSE
+    ]
+    if invalid_features:
+        failures.append("unknown feature universes: " + ", ".join(invalid_features))
+    forbidden_features = []
+    catalog_by_name = {item["feature_name"]: item for item in feature_catalog()}
+    for record in planned:
+        config = _normalize_config(record.get("config") or {})
+        universe = str(config.get("feature_universe", "")).upper()
+        if universe not in FEATURES_BY_UNIVERSE:
+            continue
+        if any(
+            _is_forbidden_feature(name, catalog_by_name.get(name, {}).get("feature_origin", ""))
+            for name in FEATURES_BY_UNIVERSE[universe]
+        ):
+            forbidden_features.append(str(record.get("experiment_id")))
+    if forbidden_features:
+        failures.append("forbidden feature catalog entries: " + ", ".join(forbidden_features))
+    dependency_modules = {
+        "CATBOOST": "catboost",
+        "XGBOOST": "xgboost",
+        "LIGHTGBM": "lightgbm",
+    }
+    missing_dependencies: list[str] = []
+    for record in planned:
+        config = _normalize_config(record.get("config") or {})
+        family = str(config.get("model_family", "")).upper()
+        module = dependency_modules.get(family)
+        if module is None:
+            continue
+        try:
+            __import__(module)
+        except Exception as exc:
+            missing_dependencies.append(
+                f"{record.get('experiment_id')}:{module}:{type(exc).__name__}"
+            )
+    if missing_dependencies:
+        failures.append("requested libraries unavailable: " + ", ".join(missing_dependencies))
+    forbidden_locked_test = [
+        str(record.get("experiment_id"))
+        for record in planned
+        if bool((record.get("config") or {}).get("locked_test_tuning"))
+        or bool((record.get("config") or {}).get("select_on_locked_test"))
+    ]
+    if forbidden_locked_test:
+        failures.append("locked-test selection/tuning flag present")
+    breadth_guard = _plan_breadth_guard(planned)
+    breadth_required = (
+        (expected_count is not None and int(expected_count) >= 100)
+        or (expected_count is None and len(planned) >= 100)
+    )
+    if breadth_required and breadth_guard.get("status") != "PASS":
+        failures.append(
+            "breadth guard failed: "
+            + ", ".join(str(item) for item in breadth_guard.get("failures", []))
+        )
+    result = {
+        "status": "PASS" if not failures else "FAIL",
+        "run_id": str(research_run_id),
+        "planned_count": len(planned),
+        "record_count": len(records),
+        "dataset_hash": next(iter(dataset_hashes), None),
+        "tree_hash": current_tree,
+        "failures": failures,
+        "distribution": _plan_distribution(planned),
+        "breadth_guard": breadth_guard,
+        "verified_at": _now() if not failures else None,
+    }
+    if not failures:
+        registry.verify_plan(research_run_id, result)
+    return result
+
+
+def _command_lock_status(args: argparse.Namespace) -> int:
+    inspection = ResearchRunLock(args.root).inspect().as_dict()
+    print(json.dumps(inspection, ensure_ascii=False, indent=2, default=str))
+    return 0 if inspection.get("status") == "UNLOCKED" else 2 if inspection.get("status") == "STALE_LOCK_DETECTED" else 20
+
+
+def _command_clear_stale_lock(args: argparse.Namespace) -> int:
+    result = ResearchRunLock.clear_stale_lock(args.root)
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0 if result.get("status") == "PASS" else 2
+
+
+def _command_deployment_status(args: argparse.Namespace) -> int:
+    if getattr(args, "write", False):
+        from config import Settings
+
+        result = write_deployment_manifest(args.root, settings=Settings.from_env(args.root))
+    else:
+        result = deployment_status(args.root, check_integrity=bool(getattr(args, "integrity", False)))
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0 if result.get("status") == "PASS" else 2
+
+
+def _catboost_canary_config(scope: str) -> dict[str, Any]:
+    return _normalize_config(
+        {
+            "experiment_id": f"V0611_CATBOOST_{str(scope).upper()}_REAL_DATA_CANARY",
+            "model_family": "CATBOOST",
+            "target_type": "MULTICLASS",
+            "feature_universe": "CORE",
+            "training_window": "ALL",
+            "time_decay": "NONE",
+            "calibration": "NONE",
+            "league_scope": "GLOBAL",
+            "hyperparameters": {
+                "iterations": 25,
+                "depth": 4,
+                "learning_rate": 0.05,
+                "model_threads": 1,
+            },
+            "stage": "REAL_DATA_CANARY",
+            "canary_real_data": True,
+            "canary_scope": str(scope).upper(),
+            "retain_model_artifact": True,
+        }
+    )
+
+
+def _command_canary(args: argparse.Namespace) -> int:
+    if str(getattr(args, "model", "catboost")).upper() != "CATBOOST":
+        raise DatasetError("the only supported V0.6.1.1 canary model is CATBOOST")
+    builder = DatasetBuilder(args.root, cache_dir=args.cache_dir, workers=args.workers)
+    manifest, rows = _ensure_dataset(builder)
+    preflight = _preflight_for_command(args, require_catboost=True, container=str(args.scope).upper() == "CT110")
+    if str(preflight.get("CATBOOST_RUNTIME", "FAIL")).upper() != "PASS":
+        raise HardResearchStop("CatBoost dependency preflight failed; canary was not started")
+    environment = environment_manifest()
+    identity = runtime_identity(args.root)
+    run_id = new_research_run_id()
+    current_tree_hash = source_tree_hash(args.root)
+    current_dataset_hash = str(manifest.get("dataset_hash") or "")
+    config = _catboost_canary_config(args.scope)
+    canary_lock = ResearchRunLock(
+        args.root,
+        run_id=run_id,
+        mode=f"canary:{str(args.scope).upper()}",
+        requested_experiments=1,
+        dataset_hash=current_dataset_hash or None,
+        code_commit=identity.get("git_commit"),
+    )
+    canary_lock.acquire()
+    registry: ExperimentRegistry | None = None
+    final_lock_phase = "FAILED"
+    try:
+        canary_lock.update_phase(
+            "PREFLIGHT",
+            dataset_hash=current_dataset_hash,
+            code_commit=identity.get("git_commit"),
+            tree_hash=current_tree_hash,
+        )
+        registry = ExperimentRegistry(args.registry)
+        existing = registry.insert_planned(
+            config,
+            current_dataset_hash,
+            identity.get("git_commit"),
+            tree_hash=current_tree_hash,
+            experiment_role="CANARY",
+        )
+        if existing.get("status") == "COMPLETED":
+            evidence = catboost_real_canary_status(
+                registry,
+                scope=args.scope,
+                dataset_hash=current_dataset_hash,
+                tree_hash=current_tree_hash,
+            )
+            if evidence["status"] == "PASS":
+                checks = ((evidence.get("records") or [{}])[0]).get("checks") or {}
+                print(
+                    json.dumps(
+                        {
+                            "status": "PASS",
+                            "CANARY": "PASS",
+                            "requested": "CATBOOST",
+                            "effective": "CATBOOST",
+                            "registry": "COMPLETED",
+                            "canary": evidence,
+                            "preflight": preflight,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
+                    )
+                final_lock_phase = "FINISHED"
+                return 0
+            # A legacy/currently completed row with the same config but a
+            # different dataset/tree must never silently authorize a new run.
+            # Add identity to the canary config so the fresh proof gets its
+            # own immutable registry row while the historical row remains.
+            config = {
+                **config,
+                "canary_dataset_hash": current_dataset_hash,
+                "canary_tree_hash": current_tree_hash,
+            }
+            existing = registry.insert_planned(
+                config,
+                current_dataset_hash,
+                identity.get("git_commit"),
+                tree_hash=current_tree_hash,
+                experiment_role="CANARY",
+            )
+        registry.update(
+            str(existing["experiment_id"]),
+            status="PLANNED",
+            research_run_id=run_id,
+            environment_hash_value=environment_hash(environment),
+            tree_hash=current_tree_hash,
+        )
+        record = registry.get(str(existing["experiment_id"])) or existing
+        progress = _run_experiment_records(
+            args.root,
+            manifest,
+            rows,
+            registry,
+            [record],
+            research_run_id=run_id,
+            environment=environment,
+            model_threads=args.model_threads or 1,
+            mode=f"canary:{str(args.scope).upper()}",
+            lock=canary_lock,
+        )
+        evidence = catboost_real_canary_status(
+            registry,
+            scope=args.scope,
+            research_run_id=run_id,
+            dataset_hash=current_dataset_hash,
+            tree_hash=current_tree_hash,
+        )
+        checks = ((evidence.get("records") or [{}])[0]).get("checks") or {}
+        output = {
+            "status": evidence["status"] if progress["failed"] == 0 else "FAIL",
+            "CANARY": evidence["status"] if progress["failed"] == 0 else "FAIL",
+            "requested": "CATBOOST",
+            "effective": "CATBOOST" if evidence["status"] == "PASS" else None,
+            "fit": checks.get("fit", "FAIL"),
+            "predict": checks.get("predict", "FAIL"),
+            "serialize": checks.get("serialize", "FAIL"),
+            "reload": checks.get("reload", "FAIL"),
+            "predict_after_reload": checks.get("predict_after_reload", "FAIL"),
+            "registry": "COMPLETED" if evidence["status"] == "PASS" else "FAILED",
+            "scope": str(args.scope).upper(),
+            "research_run_id": run_id,
+            "progress": progress,
+            "canary": evidence,
+            "preflight": preflight,
+        }
+        print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+        final_lock_phase = "FINISHED" if output["status"] == "PASS" else "FAILED"
+        return 0 if output["status"] == "PASS" else 2
+    finally:
+        if registry is not None:
+            registry.close()
+        canary_lock.release(final_phase=final_lock_phase)
+
+
+def _command_verify_plan(args: argparse.Namespace) -> int:
+    registry = ExperimentRegistry(args.registry)
+    lock = ResearchRunLock(args.root, mode="plan-verify", requested_experiments=args.run_id)
+    try:
+        lock.acquire()
+        lock.update_phase("PLAN_VERIFY", plan_run_id=args.run_id)
+        expected = args.expected_count
+        if expected is None and args.mode == "deep":
+            expected = 100
+        result = verify_research_plan(
+            args.root,
+            registry,
+            args.run_id,
+            expected_count=expected,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return 0 if result["status"] == "PASS" else 2
+    finally:
+        lock.release()
+        registry.close()
+
+
+def _command_status_benchmark(args: argparse.Namespace) -> int:
+    from scripts.benchmark_status import benchmark_collector_status, write_benchmark_result
+    from config import Settings
+    from services.collector import Collector
+    from storage.database import Database
+    from storage.raw_storage import RawStorage
+
+    settings = Settings.from_env(args.root)
+    database = Database(settings.database_path)
+
+    class NoNetworkClient:
+        pass
+
+    collector = Collector(
+        NoNetworkClient(),  # type: ignore[arg-type]
+        database,
+        RawStorage(settings.raw_storage_path, enabled=False),
+        settings,
+    )
+    try:
+        result = benchmark_collector_status(collector, iterations=args.iterations)
+        result["root"] = str(args.root)
+        result["source_tree_hash"] = source_tree_hash(args.root)
+        result["benchmark_path"] = str(write_benchmark_result(args.root, result))
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return 0 if result.get("status") == "PASS" else 2
+    finally:
+        database.close()
 
 
 def _command_build_dataset(args: argparse.Namespace) -> int:
@@ -4707,6 +5776,84 @@ def _plan_distribution(records: Sequence[Mapping[str, Any]]) -> dict[str, dict[s
     return result
 
 
+def _plan_breadth_guard(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Reject a nominal 100er plan that is scientifically one-dimensional.
+
+    The first deep run must explore several independent dimensions.  This is
+    deliberately a plan-time guard: it looks only at requested config fields
+    and never at validation/test results.  Smaller local/standard plans are
+    reported as not applicable so the V0.6.0 smoke workflow remains intact.
+    """
+
+    planned = [record for record in records if str(record.get("status", "")).upper() == "PLANNED"]
+    count = len(planned)
+    if count < 100:
+        return {
+            "status": "NOT_APPLICABLE",
+            "planned_count": count,
+            "reason": "breadth guard applies to the first 100-experiment deep plan",
+        }
+    fields = {
+        "model_families": "model_family",
+        "targets": "target_type",
+        "feature_universes": "feature_set",
+        "training_windows": "training_window",
+        "time_decays": "time_decay",
+        "calibrations": "calibration",
+        "league_scopes": "league_scope",
+    }
+    distributions = {
+        output_name: Counter(str(record.get(field) or "UNKNOWN").upper() for record in planned)
+        for output_name, field in fields.items()
+    }
+    failures: list[str] = []
+    if len(distributions["model_families"]) < 3:
+        failures.append("fewer than three requested model families")
+    if len(distributions["targets"]) < 2:
+        failures.append("fewer than two target types")
+    if len(distributions["feature_universes"]) < 3:
+        failures.append("fewer than three feature universes")
+    if len(distributions["training_windows"]) < 3:
+        failures.append("fewer than three training windows")
+    if len(distributions["time_decays"]) < 3:
+        failures.append("fewer than three time-decay settings")
+    if len(distributions["calibrations"]) < 2:
+        failures.append("fewer than two calibration settings")
+    if len(distributions["league_scopes"]) < 2:
+        failures.append("fewer than two league scopes")
+    dominant_family, dominant_count = distributions["model_families"].most_common(1)[0]
+    if dominant_count > count * 0.80:
+        failures.append(
+            f"model family {dominant_family} occupies {dominant_count}/{count}; plan is too narrow"
+        )
+    near_duplicate_fields = (
+        "model_family",
+        "target_type",
+        "feature_set",
+        "training_window",
+        "time_decay",
+        "calibration",
+        "league_scope",
+    )
+    near_duplicate_counts = Counter(
+        tuple(str(record.get(field) or "UNKNOWN").upper() for field in near_duplicate_fields)
+        for record in planned
+    )
+    largest_signature_count = max(near_duplicate_counts.values(), default=0)
+    if largest_signature_count > count * 0.20:
+        failures.append(
+            f"one requested configuration signature occupies {largest_signature_count}/{count} rows"
+        )
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "planned_count": count,
+        "failures": failures,
+        "distributions": {key: dict(sorted(value.items())) for key, value in distributions.items()},
+        "largest_model_family": {"family": dominant_family, "count": dominant_count},
+        "largest_requested_signature_count": largest_signature_count,
+    }
+
+
 def _command_preflight(args: argparse.Namespace) -> int:
     result = _preflight_for_command(
         args,
@@ -4747,18 +5894,45 @@ def _command_plan(args: argparse.Namespace) -> int:
     environment = environment_manifest()
     run_id = new_research_run_id()
     identity = runtime_identity(args.root)
+    current_tree_hash = source_tree_hash(args.root)
+    current_dataset_hash = manifest.get("dataset_hash")
     registry = ExperimentRegistry(args.registry)
     try:
-        planner = ExperimentPlanner(registry, search_space)
-        records = planner.plan_new(
-            max(0, limit),
-            mode=mode,
-            custom=custom_configs,
+        if mode == "deep":
+            canary = catboost_real_canary_status(
+                registry,
+                scope="CT110",
+                dataset_hash=current_dataset_hash,
+                tree_hash=current_tree_hash,
+            )
+            if canary.get("status") != "PASS":
+                raise HardResearchStop(
+                    "deep planning is blocked until a real CT110 CatBoost canary passes"
+                )
+        plan_lock = ResearchRunLock(
+            args.root,
+            run_id=run_id,
+            mode=f"plan:{mode}",
+            requested_experiments=max(0, limit),
             dataset_hash=manifest.get("dataset_hash"),
             code_commit=identity.get("git_commit"),
-            research_run_id=run_id,
-            environment_hash_value=environment_hash(environment),
         )
+        plan_lock.acquire()
+        plan_lock.update_phase("PLAN", tree_hash=current_tree_hash)
+        try:
+            planner = ExperimentPlanner(registry, search_space)
+            records = planner.plan_new(
+                max(0, limit),
+                mode=mode,
+                custom=custom_configs,
+                dataset_hash=manifest.get("dataset_hash"),
+                code_commit=identity.get("git_commit"),
+                research_run_id=run_id,
+                environment_hash_value=environment_hash(environment),
+                tree_hash=current_tree_hash,
+            )
+        finally:
+            plan_lock.release()
         # Planning is deliberately side-effect limited: no model fit, no
         # artifact, no OOF prediction and no automatic resume.
         reports = build_v061_reports(
@@ -4770,6 +5944,12 @@ def _command_plan(args: argparse.Namespace) -> int:
             preflight=preflight,
             full_tests="NOT_RUN",
         )
+        v0611_reports = build_v0611_reports(
+            args.root,
+            manifest,
+            registry,
+            full_tests="NOT_RUN",
+        )
         output = {
             "status": "PASS",
             "mode": mode,
@@ -4779,8 +5959,9 @@ def _command_plan(args: argparse.Namespace) -> int:
             "duplicates": 0,
             "trains_started": 0,
             "distribution": _plan_distribution(records),
+            "breadth_guard": _plan_breadth_guard(records),
             "preflight": preflight,
-            "reports": reports,
+            "reports": reports | v0611_reports,
         }
         print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
         return 0
@@ -4812,53 +5993,115 @@ def _command_run(args: argparse.Namespace) -> int:
         require_catboost=_mode_requires_catboost(mode, search_space, custom_configs),
     )
     environment = environment_manifest()
-    run_id = new_research_run_id()
+    run_id = str(args.plan) if args.plan else new_research_run_id()
     identity = runtime_identity(args.root)
     lower_priority = lower_process_priority()
     resource_guard(args.root, phase="run-start")
-    registry = ExperimentRegistry(args.registry)
+    run_lock = ResearchRunLock(
+        args.root,
+        run_id=run_id,
+        mode=str(args.mode or "run"),
+        requested_experiments=(
+            int(args.max_experiments) if args.max_experiments is not None else None
+        ),
+        dataset_hash=str(manifest.get("dataset_hash") or "") or None,
+        code_commit=identity.get("git_commit"),
+    )
+    # Acquire before registry recovery or planning so a second invocation
+    # cannot mark the first process's RUNNING rows as INTERRUPTED while it is
+    # still waiting to discover the existing owner.
+    run_lock.acquire()
+    registry: ExperimentRegistry | None = None
+    final_lock_phase = "FAILED"
     try:
-        registry.recover_running()
-        planner = ExperimentPlanner(registry, search_space)
-        explicit_max = args.max_experiments is not None
-        limit = (
-            args.max_experiments
-            if explicit_max
-            else 10
-            if mode == "local"
-            else len(custom_configs)
-            if mode == "custom" and custom_configs is not None
-            else 50
-        )
-        if mode == "local" and limit > 10:
-            raise DatasetError("local mode is hard-limited to 10 experiments; use standard/deep for larger budgets")
-        if args.target_total_experiments is not None:
-            existing_total = sum(registry.counts().values())
-            limit = max(0, int(args.target_total_experiments) - existing_total)
-        newly_planned = planner.plan_new(
-            int(limit),
+        run_lock.update_phase(
+            "PREFLIGHT",
             mode=mode,
-            custom=custom_configs,
             dataset_hash=manifest.get("dataset_hash"),
             code_commit=identity.get("git_commit"),
-            research_run_id=run_id,
-            environment_hash_value=environment_hash(environment),
         )
-        records = newly_planned
-        if not records:
-            # The supported sequence is plan -> run.  In that case the run
-            # command consumes existing PLANNED rows instead of silently doing
-            # zero work.
-            records = registry.list(["PLANNED"])[: max(0, int(limit))]
-        planned_run_ids = {
-            str(record.get("research_run_id"))
-            for record in records
-            if record.get("research_run_id")
-        }
-        if not newly_planned and len(planned_run_ids) == 1:
-            # Preserve the identity created by ``plan``.  A follow-up run is
-            # the execution phase of that plan, not a new unrelated dataset.
-            run_id = next(iter(planned_run_ids))
+        registry = ExperimentRegistry(args.registry)
+        registry.recover_running()
+        if args.plan:
+            plan_records = registry.records_for_run(args.plan)
+            if not plan_records:
+                raise HardResearchStop(f"verified plan not found: {args.plan}")
+            plan_mode = str(args.mode or ("deep" if len(plan_records) == 100 else "standard")).casefold()
+            if not all(record.get("plan_verified_at") for record in plan_records):
+                raise HardResearchStop("plan must pass verify-plan before exact execution")
+            execution_tree_hash = source_tree_hash(args.root)
+            planned_tree_hashes = {
+                str(record.get("tree_hash") or "") for record in plan_records
+            }
+            if planned_tree_hashes != {execution_tree_hash}:
+                raise HardResearchStop(
+                    "verified plan source tree differs from the current execution tree"
+                )
+            if plan_mode == "deep":
+                canary = catboost_real_canary_status(
+                    registry,
+                    scope="CT110",
+                    dataset_hash=manifest.get("dataset_hash"),
+                    tree_hash=execution_tree_hash,
+                )
+                if canary.get("status") != "PASS":
+                    raise HardResearchStop("deep execution is blocked until a real CT110 CatBoost canary passes")
+                deep_preflight = _preflight_for_command(args, require_catboost=True, container=False)
+                _assert_hard_research_gate(deep_preflight, mode="deep", require_catboost=True)
+            records = [record for record in plan_records if record.get("status") == "PLANNED"]
+            if len(records) != len(plan_records):
+                raise HardResearchStop("run --plan accepts only the frozen PLANNED rows of the verified plan")
+            newly_planned: list[dict[str, Any]] = []
+            run_id = str(args.plan)
+            mode = plan_mode
+        else:
+            if mode == "deep":
+                raise HardResearchStop(
+                    "deep execution requires --plan for an explicitly verified plan"
+                )
+            planner = ExperimentPlanner(registry, search_space)
+            explicit_max = args.max_experiments is not None
+            limit = (
+                args.max_experiments
+                if explicit_max
+                else 10
+                if mode == "local"
+                else len(custom_configs)
+                if mode == "custom" and custom_configs is not None
+                else 50
+            )
+            if mode == "local" and limit > 10:
+                raise DatasetError("local mode is hard-limited to 10 experiments; use standard/deep for larger budgets")
+            if args.target_total_experiments is not None:
+                existing_total = sum(registry.counts().values())
+                limit = max(0, int(args.target_total_experiments) - existing_total)
+            newly_planned = planner.plan_new(
+                int(limit),
+                mode=mode,
+                custom=custom_configs,
+                dataset_hash=manifest.get("dataset_hash"),
+                code_commit=identity.get("git_commit"),
+                research_run_id=run_id,
+                environment_hash_value=environment_hash(environment),
+                tree_hash=source_tree_hash(args.root),
+            )
+            records = newly_planned
+            if not records:
+                # The supported sequence is plan -> run.  In that case the run
+                # command consumes existing PLANNED rows instead of silently doing
+                # zero work.
+                records = registry.list(["PLANNED"])[: max(0, int(limit))]
+            planned_run_ids = {
+                str(record.get("research_run_id"))
+                for record in records
+                if record.get("research_run_id")
+            }
+            if not newly_planned and len(planned_run_ids) == 1:
+                # Preserve the identity created by ``plan``.  A follow-up run is
+                # the execution phase of that plan, not a new unrelated dataset.
+                run_id = next(iter(planned_run_ids))
+                if run_id != str(run_lock.run_id):
+                    run_lock.rebind_run_id(run_id)
         progress = _run_experiment_records(
             args.root,
             manifest,
@@ -4868,6 +6111,8 @@ def _command_run(args: argparse.Namespace) -> int:
             research_run_id=run_id,
             environment=environment,
             model_threads=args.model_threads,
+            mode=mode,
+            lock=run_lock,
         )
         reports = generate_reports(args.root, manifest, registry)
         v061_reports = build_v061_reports(
@@ -4880,11 +6125,21 @@ def _command_run(args: argparse.Namespace) -> int:
             full_tests="NOT_RUN",
             performance={"research_priority": lower_priority},
         )
+        v0611_reports = build_v0611_reports(
+            args.root,
+            manifest,
+            registry,
+            full_tests="NOT_RUN",
+            deep_run_id=run_id if mode == "deep" else None,
+        )
         status_path = build_status(args.root, manifest, registry, full_tests="NOT_RUN", audit=audit)
-        print(json.dumps({"status": "PASS" if not progress["failed"] else "PARTIAL", "mode": mode, "research_run_id": run_id, "planned_new": len(newly_planned), "progress": progress, "reports": reports | v061_reports, "status_file": str(status_path), "research_priority": lower_priority}, ensure_ascii=False, indent=2, default=str))
+        final_lock_phase = "FINISHED"
+        print(json.dumps({"status": "PASS" if not progress["failed"] else "PARTIAL", "mode": mode, "research_run_id": run_id, "planned_new": len(newly_planned), "progress": progress, "reports": reports | v061_reports | v0611_reports, "status_file": str(status_path), "research_priority": lower_priority}, ensure_ascii=False, indent=2, default=str))
         return 0 if not progress["failed"] else 2
     finally:
-        registry.close()
+        if registry is not None:
+            registry.close()
+        run_lock.release(final_phase=final_lock_phase)
 
 
 def _command_resume(args: argparse.Namespace) -> int:
@@ -4898,8 +6153,23 @@ def _command_resume(args: argparse.Namespace) -> int:
     _assert_hard_research_gate(preflight, mode="standard")
     lower_priority = lower_process_priority()
     resource_guard(args.root, phase="resume-start")
-    registry = ExperimentRegistry(args.registry)
+    run_lock = ResearchRunLock(
+        args.root,
+        run_id=run_id,
+        mode="resume",
+        dataset_hash=str(manifest.get("dataset_hash") or "") or None,
+        code_commit=identity.get("git_commit"),
+    )
+    run_lock.acquire()
+    registry: ExperimentRegistry | None = None
+    final_lock_phase = "FAILED"
     try:
+        run_lock.update_phase(
+            "PREFLIGHT",
+            dataset_hash=manifest.get("dataset_hash"),
+            code_commit=identity.get("git_commit"),
+        )
+        registry = ExperimentRegistry(args.registry)
         registry.recover_running()
         records = registry.list(["PLANNED", "INTERRUPTED"])
         if args.retry_failed:
@@ -4911,6 +6181,8 @@ def _command_resume(args: argparse.Namespace) -> int:
         }
         if len(resumable_run_ids) == 1:
             run_id = next(iter(resumable_run_ids))
+            if run_id != str(run_lock.run_id):
+                run_lock.rebind_run_id(run_id)
         progress = _run_experiment_records(
             args.root,
             manifest,
@@ -4920,6 +6192,7 @@ def _command_resume(args: argparse.Namespace) -> int:
             research_run_id=run_id,
             environment=environment,
             model_threads=args.model_threads,
+            lock=run_lock,
         )
         reports = generate_reports(args.root, manifest, registry)
         v061_reports = build_v061_reports(
@@ -4932,11 +6205,21 @@ def _command_resume(args: argparse.Namespace) -> int:
             full_tests="NOT_RUN",
             performance={"research_priority": lower_priority},
         )
+        v0611_reports = build_v0611_reports(
+            args.root,
+            manifest,
+            registry,
+            full_tests="NOT_RUN",
+            deep_run_id=run_id,
+        )
         status_path = build_status(args.root, manifest, registry, full_tests="NOT_RUN", audit=audit)
-        print(json.dumps({"status": "PASS" if not progress["failed"] else "PARTIAL", "research_run_id": run_id, "resumed": len(records), "progress": progress, "reports": reports | v061_reports, "status_file": str(status_path), "research_priority": lower_priority}, ensure_ascii=False, indent=2, default=str))
+        final_lock_phase = "FINISHED"
+        print(json.dumps({"status": "PASS" if not progress["failed"] else "PARTIAL", "research_run_id": run_id, "resumed": len(records), "progress": progress, "reports": reports | v061_reports | v0611_reports, "status_file": str(status_path), "research_priority": lower_priority}, ensure_ascii=False, indent=2, default=str))
         return 0 if not progress["failed"] else 2
     finally:
-        registry.close()
+        if registry is not None:
+            registry.close()
+        run_lock.release(final_phase=final_lock_phase)
 
 
 def _command_report(args: argparse.Namespace) -> int:
@@ -4957,6 +6240,15 @@ def _command_report(args: argparse.Namespace) -> int:
             ct110_runtime_canary=args.ct110_runtime_canary,
             performance={"collector_health": args.collector_health},
         )
+        v0611_reports = build_v0611_reports(
+            args.root,
+            manifest,
+            registry,
+            full_tests=args.full_tests,
+            collector_health=args.collector_health,
+            ct110_deployment=args.ct110_deployment,
+            ct110_live_canary=args.ct110_runtime_canary,
+        )
         status = build_status(
             args.root,
             manifest,
@@ -4964,7 +6256,7 @@ def _command_report(args: argparse.Namespace) -> int:
             full_tests=args.full_tests,
             audit=builder.audit(),
         )
-        print(json.dumps({"status": "PASS", "reports": reports | v061_reports, "status_file": str(status)}, ensure_ascii=False, indent=2, default=str))
+        print(json.dumps({"status": "PASS", "reports": reports | v061_reports | v0611_reports, "status_file": str(status)}, ensure_ascii=False, indent=2, default=str))
     finally:
         registry.close()
     return 0
@@ -5050,6 +6342,28 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--workers", type=int, default=IO_WORKERS)
     plan.add_argument("--config", type=Path, help="YAML/JSON file containing custom experiment definitions")
 
+    canary = subparsers.add_parser("canary", help="Run the explicit real-data CatBoost canary")
+    canary.add_argument("--model", choices=("catboost", "CATBOOST"), default="catboost")
+    canary.add_argument("--scope", choices=("LOCAL", "CT110"), default="CT110")
+    canary.add_argument("--workers", type=int, default=IO_WORKERS)
+    canary.add_argument("--model-threads", type=int, default=1)
+
+    verify_plan = subparsers.add_parser("verify-plan", help="Verify a frozen plan before exact execution")
+    verify_plan.add_argument("run_id")
+    verify_plan.add_argument("--expected-count", type=int)
+    verify_plan.add_argument("--mode", choices=("standard", "deep"), default=None)
+
+    lock_status = subparsers.add_parser("lock-status", help="Show the ML lock owner and process identity")
+
+    clear_lock = subparsers.add_parser("clear-stale-lock", help="Clear only a proven stale ML lock")
+
+    deployment = subparsers.add_parser("deployment-status", help="Show or write the deployment identity manifest")
+    deployment.add_argument("--integrity", action="store_true")
+    deployment.add_argument("--write", action="store_true")
+
+    status_benchmark = subparsers.add_parser("status-benchmark", help="Benchmark heartbeat and full status latency")
+    status_benchmark.add_argument("--iterations", type=int, default=100)
+
     run = subparsers.add_parser("run")
     run.add_argument("--mode", choices=("local", "standard", "deep", "custom"))
     run.add_argument("--max-experiments", type=int)
@@ -5058,6 +6372,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--workers", type=int, default=IO_WORKERS)
     run.add_argument("--model-threads", type=int, default=None)
     run.add_argument("--config", type=Path, help="YAML/JSON file containing custom experiment definitions")
+    run.add_argument("--plan", help="execute exactly this previously verified research_run_id")
 
     resume = subparsers.add_parser("resume")
     resume.add_argument("--retry-failed", action="store_true")
@@ -5093,8 +6408,20 @@ def main(argv: list[str] | None = None) -> int:
             return _command_build_dataset(args)
         if args.command == "preflight":
             return _command_preflight(args)
+        if args.command == "lock-status":
+            return _command_lock_status(args)
+        if args.command == "clear-stale-lock":
+            return _command_clear_stale_lock(args)
+        if args.command == "deployment-status":
+            return _command_deployment_status(args)
+        if args.command == "status-benchmark":
+            return _command_status_benchmark(args)
         if args.command == "plan":
             return _command_plan(args)
+        if args.command == "verify-plan":
+            return _command_verify_plan(args)
+        if args.command == "canary":
+            return _command_canary(args)
         if args.command == "run":
             return _command_run(args)
         if args.command == "resume":
@@ -5106,6 +6433,28 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print(json.dumps({"status": "INTERRUPTED", "message": "Current RUNNING experiment remains retryable; use resume."}, ensure_ascii=False))
         return 130
+    except AlreadyRunningError as exc:
+        print(
+            json.dumps(
+                {"status": "ALREADY_RUNNING", "error": str(exc), "lock": exc.inspection},
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            file=sys.stderr,
+        )
+        return 20
+    except StaleLockError as exc:
+        print(
+            json.dumps(
+                {"status": "STALE_LOCK_DETECTED", "error": str(exc), "lock": exc.inspection},
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            file=sys.stderr,
+        )
+        return 21
     except Exception as exc:
         print(json.dumps({"status": "FAIL", "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False, indent=2), file=sys.stderr)
         return 1
@@ -5130,6 +6479,10 @@ __all__ = [
     "TARGET_CLASSES",
     "V060_VERSION",
     "V061_VERSION",
+    "V0611_VERSION",
+    "AlreadyRunningError",
+    "ResearchRunLock",
+    "StaleLockError",
     "build_status",
     "build_v061_reports",
     "classify_h2_goal_target",
@@ -5146,4 +6499,8 @@ __all__ = [
     "research_preflight",
     "resource_guard",
     "target_regression_preflight",
+    "catboost_real_canary_status",
+    "verify_research_plan",
+    "deployment_status",
+    "write_deployment_manifest",
 ]

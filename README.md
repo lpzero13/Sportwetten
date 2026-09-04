@@ -171,6 +171,53 @@ Die Nachtlaufdateien `V061_STATUS.md` und `V061_OVERNIGHT_REPORT.md` werden im
 Projektroot erzeugt. CT110-Canary und Collector-Beobachtung müssen dort
 separat ausgeführt werden.
 
+### V0.6.1.1 Production Hardening und ML-Run-Gates
+
+V0.6.1.1 ergänzt die bestehende Research-Engine um einen diagnostizierbaren
+exklusiven ML-Lock, Feed-Reconciliation, getrennte Heartbeat-/Full-Statuspfade,
+den negativen FotMob-Resolver-Cache und eine install-time Deployment-Identität.
+Installation, Neustart und `plan` trainieren weiterhin nicht automatisch.
+
+Die Statuslatenz kann ohne Netzwerkzugriff reproduzierbar geprüft werden:
+
+~~~powershell
+python -m research.ml_v060 lock-status
+python -m research.ml_v060 deployment-status
+python -m research.ml_v060 status-benchmark --iterations 100
+~~~
+
+Der Proxmox-Installer erzeugt `DEPLOYMENT_MANIFEST.json` aus genau dem
+installierten Quellbaum. Auf einem Produktionscontainer sind anschließend
+`source_commit` und `source_tree_hash` mit `deployment-status --integrity`
+prüfbar. Ein verwaister Lock wird nie blind gelöscht:
+
+~~~bash
+python -m research.ml_v060 clear-stale-lock
+~~~
+
+Der erste echte CT110-Lauf bleibt eine bewusste manuelle Sequenz. Ein
+verifizierter Plan wird beim Training nicht neu erzeugt:
+
+~~~bash
+python -m research.ml_v060 deployment-status --integrity
+python -m research.ml_v060 lock-status
+python -m research.ml_v060 preflight --container
+python -m research.ml_v060 canary --model catboost
+python -m research.ml_v060 plan --mode deep --max-experiments 100
+python -m research.ml_v060 verify-plan <RUN_ID>
+python -m research.ml_v060 run --plan <RUN_ID>
+python -m research.ml_v060 report --full-tests PASS
+~~~
+
+`canary` muss auf dem realen CT110-Dataset `requested=CATBOOST` und
+`effective=CATBOOST` sowie Fit, Predict, Serialize, Reload und Predict nach
+Reload nachweisen. Ein einzelnes fehlgeschlagenes Experiment wird als
+`FAILED` registriert und kann weiterlaufen; strukturelle Fehler, kritischer
+Datenträgerplatz oder ein ungesunder Collector stoppen den Lauf. Es gibt für
+den ersten 100er-Lauf keinen Scheduler. `V0611_STATUS.md` und
+`V0611_RUNTIME_REPORT.md` markieren nicht lokal beobachtbare CT110-/Live-
+Canaries ausdrücklich als `PENDING` und behaupten keinen lokalen PASS.
+
 ## Bedienung
 
 Die Navigation besteht aus **Live**, **Upcoming**, **Halftime Scanner**,

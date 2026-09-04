@@ -154,6 +154,10 @@ class FotMobService:
             and self.automated_usage == "ACCEPTABLE_FOR_PROJECT"
         )
         self._runtime_metrics_lock = threading.RLock()
+        self._resolver_unique_events: set[str] = set()
+        self._resolver_eligible_events: set[str] = set()
+        self._resolver_linked_events: set[str] = set()
+        self._resolver_unmatched_events: set[str] = set()
         self._runtime_metrics: dict[str, int] = {
             "link_attempts": 0,
             "resolver_attempts": 0,
@@ -161,6 +165,12 @@ class FotMobService:
             "resolver_negative_cache_hits": 0,
             "resolver_negative_cache_invalidations": 0,
             "confirmed_link_fast_path": 0,
+            "resolver_confirmed_fast_path_hits": 0,
+            "resolver_full_attempts": 0,
+            "resolver_result_exact": 0,
+            "resolver_result_high_confidence": 0,
+            "resolver_result_ambiguous": 0,
+            "resolver_result_unmatched": 0,
             "prematch_link_attempts": 0,
             "ht_priority_retries": 0,
             "links_exact": 0,
@@ -261,7 +271,7 @@ class FotMobService:
         with self._runtime_metrics_lock:
             self._last_runtime_error[key] = str(error) if error else "unknown error"
 
-    def record_link_resolution(self, result: Any) -> None:
+    def record_link_resolution(self, result: Any, *, event_id: str | None = None) -> None:
         """Record one resolver outcome, including safe non-link decisions."""
 
         match_result = getattr(result, "match_result", result)
@@ -273,6 +283,22 @@ class FotMobService:
             "AMBIGUOUS": "links_ambiguous",
         }.get(status, "links_unmatched")
         self._increment_runtime(counter)
+        result_counter = {
+            "EXACT": "resolver_result_exact",
+            "HIGH_CONFIDENCE": "resolver_result_high_confidence",
+            "AMBIGUOUS": "resolver_result_ambiguous",
+        }.get(status, "resolver_result_unmatched")
+        self._increment_runtime(result_counter)
+        if event_id:
+            unique_id = str(event_id)
+            with self._runtime_metrics_lock:
+                self._resolver_unique_events.add(unique_id)
+                if status in AUTO_LINK_STATUSES:
+                    self._resolver_linked_events.add(unique_id)
+                    self._resolver_eligible_events.add(unique_id)
+                elif status in {"UNMATCHED", "NO_CANDIDATE", "NO_DATA", "NO_PROVIDER_DATA", "AMBIGUOUS", "INVALIDATED"}:
+                    self._resolver_unmatched_events.add(unique_id)
+                    self._resolver_eligible_events.add(unique_id)
         if status in AUTO_LINK_STATUSES:
             self._mark_runtime_success("last_auto_link_success")
 
@@ -280,6 +306,7 @@ class FotMobService:
         """Record an actual identity-resolution pass, excluding fast paths."""
 
         self._increment_runtime("resolver_attempts")
+        self._increment_runtime("resolver_full_attempts")
         if candidate_scan:
             self._increment_runtime("resolver_candidate_scans")
         normalized_trigger = str(trigger or "").upper()
@@ -296,6 +323,7 @@ class FotMobService:
 
     def record_confirmed_link_fast_path(self) -> None:
         self._increment_runtime("confirmed_link_fast_path")
+        self._increment_runtime("resolver_confirmed_fast_path_hits")
 
     def _record_detail_started(self) -> None:
         self._increment_runtime("detail_requests")
@@ -321,6 +349,33 @@ class FotMobService:
     def runtime_metrics(self) -> dict[str, Any]:
         with self._runtime_metrics_lock:
             result: dict[str, Any] = dict(self._runtime_metrics)
+            unique_events = len(self._resolver_unique_events)
+            eligible_events = len(self._resolver_eligible_events)
+            linked_events = len(self._resolver_linked_events)
+            unmatched_events = len(self._resolver_unmatched_events)
+            result["resolver_unique_events"] = unique_events
+            result["eligible_unique_events"] = eligible_events
+            result["linked_unique_events"] = linked_events
+            result["unmatched_unique_events"] = unmatched_events
+            result["link_success_rate"] = (
+                linked_events / eligible_events if eligible_events else 0.0
+            )
+            result["resolver_result_counts"] = {
+                "EXACT": int(self._runtime_metrics.get("links_exact", 0)),
+                "HIGH_CONFIDENCE": int(self._runtime_metrics.get("links_high_confidence", 0)),
+                "AMBIGUOUS": int(self._runtime_metrics.get("links_ambiguous", 0)),
+                "UNMATCHED": int(self._runtime_metrics.get("links_unmatched", 0)),
+            }
+            result["resolver_cache_policy"] = {
+                "negative_cache_key": "internal_event_id+resolver_input_fingerprint",
+                "generation_invalidates_negative_cache": False,
+                "confirmed_first": True,
+            }
+            resolver = getattr(self, "resolver", None)
+            if resolver is not None:
+                result["resolver_negative_cache"] = getattr(
+                    resolver, "negative_cache_status", lambda: {}
+                )()
             result.update(self._last_runtime_success)
             result.update(self._last_runtime_error)
             result["slow_operations"] = self._slow_telemetry.snapshot()

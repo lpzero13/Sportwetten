@@ -8,9 +8,12 @@ closed or restarted.
 from __future__ import annotations
 
 import heapq
+import copy
 import json
 import logging
+import os
 import re
+import shutil
 import threading
 import time
 from collections import Counter, deque
@@ -321,6 +324,9 @@ class Collector:
         self._collection_metrics_runtime_ms = 0.0
         self._archive_size_cache: int | None = None
         self._archive_size_cache_at: float | None = None
+        self._full_status_cache: dict[str, Any] | None = None
+        self._full_status_cache_at: float | None = None
+        self._last_heartbeat_runtime_ms = 0.0
         self._universe_detail_requests_avoided = 0
         self._fotmob_detail_requests_avoided = 0
         self._last_universe_decisions: dict[str, LiveUniverseDecision] = {}
@@ -409,8 +415,12 @@ class Collector:
             float(
                 getattr(
                     self.settings,
-                    "status_heavy_metrics_ttl_seconds",
-                    getattr(self.settings, "collection_metrics_cache_ttl_seconds", 30.0),
+                    "status_archive_metrics_ttl_seconds",
+                    getattr(
+                        self.settings,
+                        "status_heavy_metrics_ttl_seconds",
+                        getattr(self.settings, "collection_metrics_cache_ttl_seconds", 30.0),
+                    ),
                 )
             ),
         )
@@ -425,6 +435,63 @@ class Collector:
             self._archive_size_cache_at = time.monotonic()
             age = 0.0
         return int(self._archive_size_cache or 0), age, cached
+
+    def _disk_observability(self) -> dict[str, Any]:
+        try:
+            usage = shutil.disk_usage(self.settings.root_dir)
+            free_bytes = int(usage.free)
+            free_gb = free_bytes / (1024 ** 3)
+            warn_gb = float(getattr(self.settings, "disk_warn_free_gb", 5.0))
+            critical_gb = float(getattr(self.settings, "disk_critical_free_gb", 2.0))
+            state = "CRITICAL" if free_gb < critical_gb else "WARN" if free_gb < warn_gb else "PASS"
+            return {
+                "status": state,
+                "free_bytes": free_bytes,
+                "free_gb": round(free_gb, 3),
+                "warn_threshold_gb": warn_gb,
+                "critical_threshold_gb": critical_gb,
+                "path": str(self.settings.root_dir),
+            }
+        except OSError as exc:
+            return {"status": "UNKNOWN", "error": str(exc), "path": str(self.settings.root_dir)}
+
+    def heartbeat(self) -> dict[str, Any]:
+        """Return cheap liveness fields for the frequent status tick."""
+
+        started = time.perf_counter()
+        research_status: dict[str, Any] = {}
+        research_path = self.settings.root_dir / "research" / "output" / "v060" / "research_status.json"
+        try:
+            if research_path.exists():
+                value = json.loads(research_path.read_text(encoding="utf-8"))
+                if isinstance(value, dict):
+                    for key in (
+                        "run_id", "status", "updated_at", "planned", "completed",
+                        "failed", "skipped", "remaining", "current_experiment",
+                    ):
+                        if key in value:
+                            research_status[key] = value[key]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            research_status = {"status": "UNREADABLE"}
+        feed_result = self._last_feed_result
+        payload = {
+            "status": "RUNNING" if self._running else "COMPLETED",
+            "generated_at": _now_iso(),
+            "process_alive": True,
+            "pid": os.getpid(),
+            "active_event_count": len(getattr(self.event_service, "events", ()) or ()),
+            "observed_event_count": len(self._observed_events),
+            "queue_depth": self.queue_depth,
+            "queue_due": sum(1 for item in self._queue if item[0] <= time.monotonic()),
+            "last_feed_success_at": getattr(self.event_service, "last_success_at", None),
+            "last_feed_error": getattr(self.event_service, "last_error", None),
+            "last_feed_state": getattr(self.event_service, "feed_state", None),
+            "last_feed_request_at": getattr(getattr(feed_result, "metrics", None), "response_received_at", None),
+            "research": research_status,
+        }
+        self._last_heartbeat_runtime_ms = (time.perf_counter() - started) * 1000.0
+        payload["runtime_ms"] = round(self._last_heartbeat_runtime_ms, 3)
+        return payload
 
     def _collection_metrics(self, *, force_refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
         now = time.monotonic()
@@ -1393,19 +1460,65 @@ class Collector:
 
     def status(self, *, force_refresh: bool = False) -> dict:
         status_started = time.perf_counter()
-        queue = self._queue_diagnostics()
-        coverage, coverage_meta = self._collection_metrics(force_refresh=force_refresh)
-        archive_size, archive_age, archive_cached = self._archive_size(
-            force_refresh=force_refresh
+        cache_age = (
+            max(0.0, time.monotonic() - self._full_status_cache_at)
+            if self._full_status_cache_at is not None
+            else None
         )
-        matrix = feature_runtime_matrix(
-            self.settings,
-            fotmob_service=self.fotmob_service,
-            database=self.database,
+        cache_ttl = max(1.0, float(getattr(self.settings, "status_full_refresh_ttl_seconds", 10.0)))
+        if not force_refresh and self._full_status_cache is not None and cache_age is not None and cache_age < cache_ttl:
+            cached = copy.deepcopy(self._full_status_cache)
+            cached["heartbeat"] = self.heartbeat()
+            cached["updated_at"] = _now_iso()
+            # The cached full payload is itself the evidence that the
+            # collection metrics were served from the in-memory cache.  Keep
+            # this compatibility field truthful for callers that distinguish
+            # a fresh DB read from a cached status response.
+            cached["collection_metrics_cached"] = True
+            cached["status_cache"] = {
+                "generated_at": cached.get("full_status_generated_at"),
+                "age_seconds": cache_age,
+                "ttl_seconds": cache_ttl,
+                "cached": True,
+            }
+            return cached
+        breakdown: dict[str, float] = {}
+
+        def phase(name: str, function: Callable[[], Any]) -> Any:
+            started = time.perf_counter()
+            value = function()
+            breakdown[name] = (time.perf_counter() - started) * 1000.0
+            return value
+
+        queue = phase("queue_metrics_ms", self._queue_diagnostics)
+        feed_summary, feed_reconciliation = phase(
+            "feed_metrics_ms",
+            lambda: (
+                self.feed_stats.summary(),
+                getattr(self.event_service, "reconciliation_status", lambda: {})(),
+            ),
+        )
+        snapshot_counts = phase("snapshot_metrics_ms", lambda: dict(self.snapshot_counts))
+        coverage, coverage_meta = phase(
+            "database_metrics_ms",
+            lambda: self._collection_metrics(force_refresh=force_refresh),
+        )
+        archive_size, archive_age, archive_cached = phase(
+            "archive_metrics_ms",
+            lambda: self._archive_size(force_refresh=force_refresh),
+        )
+        matrix = phase(
+            "feature_matrix_ms",
+            lambda: feature_runtime_matrix(
+                self.settings,
+                fotmob_service=self.fotmob_service,
+                database=self.database,
+            ),
         )
         health = feature_health(matrix)
         warnings = runtime_warnings(matrix)
         fotmob_runtime: dict[str, Any] = {}
+        fotmob_started = time.perf_counter()
         if self.fotmob_service is not None:
             fotmob_runtime.update(
                 getattr(self.fotmob_service, "runtime_metrics", lambda: {})()
@@ -1427,6 +1540,8 @@ class Collector:
                 )
             except (AttributeError, TypeError, ValueError):
                 fotmob_runtime["enhanced_ml_allowed_count"] = 0
+        breakdown["fotmob_metrics_ms"] = (time.perf_counter() - fotmob_started) * 1000.0
+        outbox_started = time.perf_counter()
         outbox = (
             self.database.snapshot_outbox_status()
             if hasattr(self.database, "snapshot_outbox_status")
@@ -1437,11 +1552,21 @@ class Collector:
                 "last_error": None,
             }
         )
+        breakdown["outbox_metrics_ms"] = (time.perf_counter() - outbox_started) * 1000.0
+        strategy_started = time.perf_counter()
+        strategy_sql = (
+            self.database.strategy_sql_observability()
+            if hasattr(self.database, "strategy_sql_observability")
+            else {}
+        )
+        breakdown["strategy_metrics_ms"] = (time.perf_counter() - strategy_started) * 1000.0
+        wal_started = time.perf_counter()
         wal_metrics = (
             self.database.wal_observability()
             if hasattr(self.database, "wal_observability")
             else {}
         )
+        breakdown["storage_metrics_ms"] = (time.perf_counter() - wal_started) * 1000.0
         event_slow = getattr(self.event_service, "_slow_telemetry", None)
         slow_operations = self._slow_telemetry.snapshot()
         if fotmob_runtime.get("slow_operations"):
@@ -1571,6 +1696,12 @@ class Collector:
             "working_tree_dirty": self._runtime_identity["working_tree_dirty"],
             "build_time": self._runtime_identity["build_time"],
             "deploy_time": self._runtime_identity["deploy_time"],
+            "deployed_commit": self._runtime_identity.get("deployed_commit"),
+            "deployed_tree_hash": self._runtime_identity.get("deployed_tree_hash"),
+            "installer_version": self._runtime_identity.get("installer_version"),
+            "deployment_manifest_present": self._runtime_identity.get(
+                "deployment_manifest_present", False
+            ),
             "config_fingerprint": self._config_fingerprint,
             "runtime": dict(self._runtime_identity) | {
                 "config_fingerprint": self._config_fingerprint,
@@ -1580,6 +1711,7 @@ class Collector:
             "started_at": self._started_at,
             "finished_at": self._finished_at,
             "updated_at": _now_iso(),
+            "heartbeat": self.heartbeat(),
             "queue_depth": queue["queue_depth"],
             "queue_due": queue["queue_due"],
             "queue_future": queue["queue_future"],
@@ -1587,7 +1719,7 @@ class Collector:
             "queue_by_snapshot_type": queue["queue_by_snapshot_type"],
             "active_detail_requests": len(self._futures),
             "queue": queue,
-            "snapshot_counts": dict(self.snapshot_counts),
+            "snapshot_counts": snapshot_counts,
             "retries": self.retries,
             "reopens_detected": self.reopens_detected,
             "halftime_disappearance_count": self.halftime_disappearance_count,
@@ -1615,7 +1747,8 @@ class Collector:
                 "LOCAL_PROVIDER": "NOT_RUN",
                 "CT110_LIVE_CANARY": "PENDING",
             },
-            "feed": self.feed_stats.summary(),
+            "feed": feed_summary,
+            "feed_reconciliation": feed_reconciliation,
             "prematch": self.prematch_stats.summary(),
             "detail": self.detail_stats.summary(),
             "archive": {
@@ -1623,17 +1756,23 @@ class Collector:
                 "size_bytes": archive_size,
                 "size_age_seconds": archive_age,
                 "size_cached": archive_cached,
+                "size_cache_generated_at": getattr(self.archive, "size_cache_at", None),
                 "last_export_at": self.archive.last_export_at,
                 "last_error": self.archive.last_error,
                 "pending": int(outbox.get("pending") or 0),
                 "oldest_outbox_age_seconds": _iso_age_seconds(outbox.get("oldest_created_at")),
                 "last_export_at_db": outbox.get("last_export_at"),
                 "last_export_error": outbox.get("last_error"),
+                "outbox_health": outbox.get("health"),
+                "oldest_pending_age_seconds": outbox.get("oldest_pending_age_seconds"),
             },
             "outbox_pending": int(outbox.get("pending") or 0),
-            "oldest_outbox_age_seconds": _iso_age_seconds(outbox.get("oldest_created_at")),
+            "oldest_outbox_age_seconds": outbox.get("oldest_pending_age_seconds")
+            if outbox.get("oldest_pending_age_seconds") is not None
+            else _iso_age_seconds(outbox.get("oldest_created_at")),
             "last_export_at": self.archive.last_export_at or outbox.get("last_export_at"),
             "last_export_error": self.archive.last_error or outbox.get("last_error"),
+            "outbox_health": outbox.get("health", "HEALTHY"),
             "fotmob": fotmob_status,
             "coverage": coverage,
             "collection_metrics_age_seconds": coverage_meta["collection_metrics_age_seconds"],
@@ -1653,6 +1792,7 @@ class Collector:
                 ),
                 "last_timing_ms": dict(getattr(self.event_service, "last_timing", {})),
                 "last_sql_metrics": dict(getattr(self.event_service, "last_sql_metrics", {})),
+                "reconciliation": feed_reconciliation,
             },
             "database_transactions": (
                 self.database.transaction_metrics()
@@ -1660,13 +1800,10 @@ class Collector:
                 else {}
             ),
             "database_wal": wal_metrics,
-            "database_strategy_sql": (
-                self.database.strategy_sql_observability()
-                if hasattr(self.database, "strategy_sql_observability")
-                else {}
-            ),
+            "database_strategy_sql": strategy_sql,
             "slow_operations": slow_operations,
             "smart_live_universe": universe_summary,
+            "disk": self._disk_observability(),
             "timings_ms": {
                 "feed_network": (
                     self._last_feed_result.network_ms
@@ -1691,7 +1828,27 @@ class Collector:
                 "collection_metrics": coverage_meta["collection_metrics_runtime_ms"],
             },
         }
-        result["status_runtime_ms"] = (time.perf_counter() - status_started) * 1000.0
+        breakdown.setdefault("runtime_identity_ms", 0.0)
+        breakdown.setdefault("research_metrics_ms", 0.0)
+        breakdown.setdefault("json_serialize_ms", 0.0)
+        breakdown.setdefault("file_write_ms", 0.0)
+        breakdown["other_ms"] = max(
+            0.0,
+            (time.perf_counter() - status_started) * 1000.0 - sum(breakdown.values()),
+        )
+        breakdown["total_ms"] = (time.perf_counter() - status_started) * 1000.0
+        result["status_runtime_ms"] = breakdown["total_ms"]
+        result["status_generation_breakdown"] = {
+            key: round(value, 3) for key, value in breakdown.items()
+        }
+        result["full_status_generated_at"] = _now_iso()
+        result["status_cache"] = {
+            "generated_at": result["full_status_generated_at"],
+            "age_seconds": 0.0,
+            "ttl_seconds": cache_ttl,
+            "cached": False,
+        }
+        self._slow_telemetry.record_status_generation_breakdown(breakdown)
         self._slow_telemetry.record(
             "status_generation",
             result["status_runtime_ms"],
@@ -1700,24 +1857,57 @@ class Collector:
                 "active_requests": result["active_detail_requests"],
                 "metric_age_seconds": result["metric_age_seconds"],
                 "wal_size_bytes": wal_metrics.get("wal_size_bytes"),
+                "status_generation_breakdown": result["status_generation_breakdown"],
             },
         )
         result["slow_operations"] = self._slow_telemetry.snapshot() | {
             "db_persistence": event_slow.snapshot() if event_slow is not None else {},
         }
+        self._full_status_cache = copy.deepcopy(result)
+        self._full_status_cache_at = time.monotonic()
         return result
 
     def _write_status(self, *, force: bool = False) -> None:
         now = time.monotonic()
-        if not force and now - self._last_status_write_at < 2.0:
+        heartbeat_interval = max(
+            0.1,
+            float(getattr(self.settings, "status_heartbeat_interval_seconds", 2.0)),
+        )
+        if not force and now - self._last_status_write_at < heartbeat_interval:
             return
         path = self.settings.collector_status_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(self.status(force_refresh=force), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+        heartbeat = self.heartbeat()
+        full_ttl = max(
+            1.0,
+            float(getattr(self.settings, "status_full_refresh_ttl_seconds", 10.0)),
         )
+        full_age = (
+            now - self._full_status_cache_at
+            if self._full_status_cache_at is not None
+            else None
+        )
+        if force or self._full_status_cache is None or full_age is None or full_age >= full_ttl:
+            payload = self.status(force_refresh=True)
+        else:
+            payload = copy.deepcopy(self._full_status_cache)
+            payload["updated_at"] = _now_iso()
+            payload["heartbeat"] = heartbeat
+            payload["status_cache"] = {
+                "generated_at": payload.get("full_status_generated_at"),
+                "age_seconds": max(0.0, float(full_age)),
+                "ttl_seconds": full_ttl,
+                "cached": True,
+            }
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        temporary.write_text(serialized, encoding="utf-8")
+        try:
+            with temporary.open("r+b") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            pass
         temporary.replace(path)
         self._last_status_write_at = now
 

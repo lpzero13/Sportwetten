@@ -2713,12 +2713,42 @@ class Database:
             latest = self.connection.execute(
                 "SELECT MAX(exported_at) AS last_export_at FROM snapshots"
             ).fetchone()
+        pending_count = int(pending["pending"] or 0) if pending else 0
+        oldest = pending["oldest_created_at"] if pending else None
+        last_error = pending["last_error"] if pending else None
+        oldest_age: float | None = None
+        if oldest:
+            try:
+                created = datetime.fromisoformat(str(oldest).replace("Z", "+00:00"))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                oldest_age = max(0.0, (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds())
+            except ValueError:
+                oldest_age = None
+        # Pending rows are normal durable work.  Only a recorded export error
+        # degrades health; a small pending count alone is never reported as a
+        # failure.
+        health = "DEGRADED" if last_error else "HEALTHY"
         return {
-            "pending": int(pending["pending"] or 0) if pending else 0,
-            "oldest_created_at": pending["oldest_created_at"] if pending else None,
+            "pending": pending_count,
+            "oldest_created_at": oldest,
+            "oldest_pending_age_seconds": oldest_age,
             "last_export_at": latest["last_export_at"] if latest else None,
-            "last_error": pending["last_error"] if pending else None,
+            "last_export_success": latest["last_export_at"] if latest else None,
+            "last_error": last_error,
+            "last_export_error": last_error,
+            "health": health,
         }
+
+    def explain_query_plan(self, statement: str, parameters: Iterable[Any] = ()) -> list[dict[str, Any]]:
+        """Return SQLite's read-only plan for a status/query investigation."""
+
+        query = str(statement).strip()
+        if not query.upper().startswith("SELECT"):
+            raise ValueError("explain_query_plan accepts SELECT statements only")
+        with self._lock:
+            rows = self.connection.execute(f"EXPLAIN QUERY PLAN {query}", tuple(parameters)).fetchall()
+        return [dict(row) for row in rows]
 
     def mark_snapshot_outbox_error(self, snapshot_ids: Iterable[int], error: str) -> None:
         ids = [int(item) for item in snapshot_ids]

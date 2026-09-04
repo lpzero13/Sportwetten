@@ -151,6 +151,7 @@ class FotMobTipicoResolver:
         )
         self.mappings = mappings
         self._negative_cache: dict[tuple[str, str], tuple[float, ResolverResult, int]] = {}
+        self._negative_cache_metadata: dict[tuple[str, str], dict[str, Any]] = {}
         self._negative_cache_lock = threading.RLock()
 
     def _daily_index_generation(self) -> int:
@@ -186,9 +187,29 @@ class FotMobTipicoResolver:
             "NO_CANDIDATE": "fotmob_negative_resolve_no_candidate_ttl_seconds",
             "AMBIGUOUS": "fotmob_negative_resolve_ambiguous_ttl_seconds",
             "NO_DATA": "fotmob_negative_resolve_no_data_ttl_seconds",
+            "NO_PROVIDER_DATA": "fotmob_negative_resolve_no_data_ttl_seconds",
         }.get(state, "fotmob_negative_resolve_no_candidate_ttl_seconds")
         defaults = {"NO_CANDIDATE": 600.0, "AMBIGUOUS": 300.0, "NO_DATA": 1800.0}
         return max(0.0, float(getattr(self.service.settings, setting_name, defaults.get(state, 600.0))))
+
+    def negative_cache_status(self) -> dict[str, Any]:
+        """Expose bounded cache metadata without exposing provider payloads."""
+
+        now = time.time()
+        with self._negative_cache_lock:
+            # Expiry is checked here as well as on lookup so the diagnostics
+            # do not report dead entries as an apparently growing cache.
+            for key, metadata in list(self._negative_cache_metadata.items()):
+                if float(metadata.get("expires_at", 0.0) or 0.0) <= now:
+                    self._negative_cache.pop(key, None)
+                    self._negative_cache_metadata.pop(key, None)
+            entries = []
+            for key, metadata in self._negative_cache_metadata.items():
+                item = dict(metadata)
+                item["expired"] = float(item.get("expires_at", 0.0)) <= now
+                item["expires_in_seconds"] = max(0.0, float(item.get("expires_at", 0.0)) - now)
+                entries.append(item)
+        return {"count": len(entries), "entries": entries}
 
     def _invalidate_material_changes(self, internal_id: str, fingerprint: str) -> None:
         removed = 0
@@ -196,6 +217,7 @@ class FotMobTipicoResolver:
             for key in list(self._negative_cache):
                 if key[0] == internal_id and key[1] != fingerprint:
                     self._negative_cache.pop(key, None)
+                    self._negative_cache_metadata.pop(key, None)
                     removed += 1
         recorder = getattr(self.service, "record_resolver_cache_invalidation", None)
         if removed and callable(recorder):
@@ -220,15 +242,13 @@ class FotMobTipicoResolver:
             if value is None:
                 return None
             expires_at, result, cached_generation = value
-            if expires_at <= time.monotonic() or (
-                generation > 0 and cached_generation < generation
-            ):
+            if expires_at <= time.monotonic():
                 self._negative_cache.pop((internal_id, fingerprint), None)
-                if cached_generation < generation:
-                    recorder = getattr(self.service, "record_resolver_cache_invalidation", None)
-                    if callable(recorder):
-                        recorder()
+                self._negative_cache_metadata.pop((internal_id, fingerprint), None)
                 return None
+            metadata = self._negative_cache_metadata.get((internal_id, fingerprint))
+            if metadata is not None:
+                metadata["last_hit_at"] = time.time()
         recorder = getattr(self.service, "record_resolver_cache_hit", None)
         if callable(recorder):
             recorder()
@@ -263,6 +283,18 @@ class FotMobTipicoResolver:
                     value,
                     self._daily_index_generation(),
                 )
+                self._negative_cache_metadata[(internal_id, fingerprint)] = {
+                    "internal_match_id": internal_id,
+                    "fingerprint": fingerprint,
+                    "state": "NO_PROVIDER_DATA" if state == "NO_DATA" else state,
+                    "result_status": str(result.match_result.status or "UNMATCHED").upper(),
+                    "reason": list(result.match_result.reasons or []),
+                    "created_at": time.time(),
+                    "expires_at": time.time() + ttl,
+                    "generation": self._daily_index_generation(),
+                    "attempt": int(getattr(self.service, "runtime_metrics", lambda: {})().get("resolver_attempts", 0) or 0),
+                    "attempt_count": int(getattr(self.service, "runtime_metrics", lambda: {})().get("resolver_attempts", 0) or 0),
+                }
         return value
 
     def _stored_identity_changed(self, existing: Any, event: Any) -> bool:
@@ -304,7 +336,12 @@ class FotMobTipicoResolver:
     def _record_resolution(self, result: ResolverResult) -> ResolverResult:
         recorder = getattr(self.service, "record_link_resolution", None)
         if callable(recorder):
-            recorder(result.match_result)
+            try:
+                recorder(result.match_result, event_id=result.internal_match_id)
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
+                recorder(result.match_result)
         return result
 
     def seed_default_competition_links(self) -> int:
@@ -611,15 +648,6 @@ class FotMobTipicoResolver:
                 )
             )
 
-        cached = self._negative_cache_get(
-            internal_id,
-            fingerprint,
-            trigger=trigger,
-            generation=self._daily_index_generation(),
-        )
-        if cached is not None and not force:
-            return self._record_resolution(cached)
-
         mapping = self.mapping_for_event(event)
         # A known mapping that fails its country/name guard is a hard reject;
         # otherwise a competition may be new to Tipico and still be safely
@@ -630,6 +658,17 @@ class FotMobTipicoResolver:
             if competition_id is not None
             else None
         )
+        # Eligibility/mapping checks deliberately precede the negative cache:
+        # an old negative result must not bypass a current scope decision.
+        cached = self._negative_cache_get(
+            internal_id,
+            fingerprint,
+            trigger=trigger,
+            generation=self._daily_index_generation(),
+        )
+        if cached is not None and not force:
+            return self._record_resolution(cached)
+
         if mapping is None and known_mapping is not None:
             result = MatchMatchResult(
                 status="UNMATCHED",

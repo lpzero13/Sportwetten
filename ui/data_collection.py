@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,7 +62,20 @@ def render_data_collection(
 
     st.title("Data Collection")
     status = _load_status(settings.collector_status_path)
-    coverage = database.collection_metrics_for_date()
+    # Older/partially initialized databases may return an empty metrics
+    # object.  The Data view must remain usable while the collector is still
+    # warming up; storage diagnostics are not allowed to crash on a missing
+    # optional ``date`` field.
+    raw_coverage = database.collection_metrics_for_date()
+    coverage = dict(raw_coverage) if isinstance(raw_coverage, Mapping) else {}
+    today_default = datetime.now(timezone.utc).date().isoformat()
+    coverage.setdefault("date", today_default)
+    for key in (
+        "outbox_pending", "snapshots_today", "matches_today", "paper_trades_today",
+        "events_with_prematch_snapshot", "events_with_halftime_snapshot",
+        "events_with_core_live_tracking", "events_with_final_result",
+    ):
+        coverage.setdefault(key, 0)
     canonical = database.canonical_metrics_for_date()
     snapshot_counts = status.get("snapshot_counts", {})
     feed = status.get("feed", {})
@@ -200,10 +214,7 @@ def render_data_collection(
     db_size = database.database_size_bytes
     parquet_size = archive.total_size_bytes
     raw_size = _directory_size_bytes(settings.raw_storage_path)
-    today = str(
-        coverage.get("date")
-        or datetime.now(timezone.utc).date().isoformat()
-    )
+    today = str(coverage.get("date") or today_default)
     archive_today = archive.size_for_date(today)
     raw_today = _directory_size_bytes(settings.raw_storage_path / today)
     growth_today = archive_today + raw_today
@@ -213,11 +224,11 @@ def render_data_collection(
     storage_columns[0].metric("SQLite gesamt", _size_label(db_size))
     storage_columns[1].metric("Parquet gesamt", _size_label(parquet_size))
     storage_columns[2].metric("Raw-Archiv gesamt", _size_label(raw_size))
-    storage_columns[3].metric("Outbox pending", coverage["outbox_pending"])
+    storage_columns[3].metric("Outbox pending", coverage.get("outbox_pending", 0))
     storage_columns = st.columns(4)
-    storage_columns[0].metric("Snapshots heute", coverage["snapshots_today"])
-    storage_columns[1].metric("Matches heute", coverage["matches_today"])
-    storage_columns[2].metric("Paper Trades heute", coverage["paper_trades_today"])
+    storage_columns[0].metric("Snapshots heute", coverage.get("snapshots_today", 0))
+    storage_columns[1].metric("Matches heute", coverage.get("matches_today", 0))
+    storage_columns[2].metric("Paper Trades heute", coverage.get("paper_trades_today", 0))
     storage_columns[3].metric(
         "Ø Snapshots / Finished Match",
         f"{coverage['average_snapshots_per_finished_match']:.2f}",

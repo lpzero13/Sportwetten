@@ -97,6 +97,12 @@ COLLECTION_METRICS_CACHE_TTL_SECONDS = 30.0
 # V0.6.1: shared FotMob/index and runtime-observability controls.
 SLOW_OPERATION_THRESHOLD_MS = 500.0
 STATUS_HEAVY_METRICS_TTL_SECONDS = 15.0
+# V0.6.1.1: keep the heartbeat cheap while allowing the full status to be
+# cached independently from queue/feed liveness.
+STATUS_HEARTBEAT_INTERVAL_SECONDS = 2.0
+STATUS_FULL_REFRESH_TTL_SECONDS = 10.0
+STATUS_ARCHIVE_METRICS_TTL_SECONDS = 60.0
+STATUS_BENCHMARK_ITERATIONS = 100
 COLLECTOR_SQL_TRACE_ENABLED = False
 MAX_LIVE_ODDS_AGE_SECONDS = 10
 DEFAULT_TOTAL_STAKE_EUR = 30
@@ -210,6 +216,14 @@ FOTMOB_COVERAGE_FULL_RATIO = 0.90
 FOTMOB_COVERAGE_NO_DATA_RATIO = 0.10
 TIPICO_MARKET_CAPABILITY_MIN_SAMPLE_SIZE = 5
 TIPICO_MARKET_CAPABILITY_MIN_RATIO = 0.50
+# Feed reconciliation is intentionally conservative.  Operators may lower
+# the observation/time thresholds for a test fixture, but production defaults
+# require independent structurally valid responses before stale state can be
+# reconciled.
+FEED_STALE_RECONCILIATION_MIN_OBSERVATIONS = 3
+FEED_STALE_RECONCILIATION_MIN_SECONDS = 60.0
+DISK_WARN_FREE_GB = 5.0
+DISK_CRITICAL_FREE_GB = 2.0
 
 
 @dataclass(slots=True)
@@ -247,6 +261,10 @@ class Settings:
     collection_metrics_cache_ttl_seconds: float = COLLECTION_METRICS_CACHE_TTL_SECONDS
     slow_operation_threshold_ms: float = SLOW_OPERATION_THRESHOLD_MS
     status_heavy_metrics_ttl_seconds: float = STATUS_HEAVY_METRICS_TTL_SECONDS
+    status_heartbeat_interval_seconds: float = STATUS_HEARTBEAT_INTERVAL_SECONDS
+    status_full_refresh_ttl_seconds: float = STATUS_FULL_REFRESH_TTL_SECONDS
+    status_archive_metrics_ttl_seconds: float = STATUS_ARCHIVE_METRICS_TTL_SECONDS
+    status_benchmark_iterations: int = STATUS_BENCHMARK_ITERATIONS
     collector_sql_trace_enabled: bool = COLLECTOR_SQL_TRACE_ENABLED
     max_live_odds_age_seconds: int = MAX_LIVE_ODDS_AGE_SECONDS
     default_total_stake_eur: int = DEFAULT_TOTAL_STAKE_EUR
@@ -332,6 +350,10 @@ class Settings:
     fotmob_coverage_no_data_ratio: float = FOTMOB_COVERAGE_NO_DATA_RATIO
     tipico_market_capability_min_sample_size: int = TIPICO_MARKET_CAPABILITY_MIN_SAMPLE_SIZE
     tipico_market_capability_min_ratio: float = TIPICO_MARKET_CAPABILITY_MIN_RATIO
+    feed_stale_reconciliation_min_observations: int = FEED_STALE_RECONCILIATION_MIN_OBSERVATIONS
+    feed_stale_reconciliation_min_seconds: float = FEED_STALE_RECONCILIATION_MIN_SECONDS
+    disk_warn_free_gb: float = DISK_WARN_FREE_GB
+    disk_critical_free_gb: float = DISK_CRITICAL_FREE_GB
 
     @property
     def database_path(self) -> Path:
@@ -463,6 +485,30 @@ class Settings:
                     "STATUS_HEAVY_METRICS_TTL_SECONDS",
                     STATUS_HEAVY_METRICS_TTL_SECONDS,
                 ),
+            ),
+            status_heartbeat_interval_seconds=max(
+                0.1,
+                _env_float(
+                    "STATUS_HEARTBEAT_INTERVAL_SECONDS",
+                    STATUS_HEARTBEAT_INTERVAL_SECONDS,
+                ),
+            ),
+            status_full_refresh_ttl_seconds=max(
+                1.0,
+                _env_float(
+                    "STATUS_FULL_REFRESH_TTL_SECONDS",
+                    STATUS_FULL_REFRESH_TTL_SECONDS,
+                ),
+            ),
+            status_archive_metrics_ttl_seconds=max(
+                1.0,
+                _env_float(
+                    "STATUS_ARCHIVE_METRICS_TTL_SECONDS",
+                    STATUS_ARCHIVE_METRICS_TTL_SECONDS,
+                ),
+            ),
+            status_benchmark_iterations=_env_int(
+                "STATUS_BENCHMARK_ITERATIONS", STATUS_BENCHMARK_ITERATIONS
             ),
             collector_sql_trace_enabled=_env_bool(
                 "COLLECTOR_SQL_TRACE_ENABLED", COLLECTOR_SQL_TRACE_ENABLED
@@ -743,6 +789,25 @@ class Settings:
                         TIPICO_MARKET_CAPABILITY_MIN_RATIO,
                     ),
                 ),
+            ),
+            feed_stale_reconciliation_min_observations=_env_int(
+                "FEED_STALE_RECONCILIATION_MIN_OBSERVATIONS",
+                FEED_STALE_RECONCILIATION_MIN_OBSERVATIONS,
+            ),
+            feed_stale_reconciliation_min_seconds=max(
+                0.0,
+                _env_float(
+                    "FEED_STALE_RECONCILIATION_MIN_SECONDS",
+                    FEED_STALE_RECONCILIATION_MIN_SECONDS,
+                ),
+            ),
+            disk_warn_free_gb=max(
+                0.0,
+                _env_float("DISK_WARN_FREE_GB", DISK_WARN_FREE_GB),
+            ),
+            disk_critical_free_gb=max(
+                0.0,
+                _env_float("DISK_CRITICAL_FREE_GB", DISK_CRITICAL_FREE_GB),
             ),
         )
 

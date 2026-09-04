@@ -11,13 +11,20 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import subprocess
+import time
 from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
 
 APP_VERSION = "0.5.9.1"
+RESEARCH_VERSION = "0.6.1.1"
+
+
+_IDENTITY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_IDENTITY_CACHE_TTL_SECONDS = 30.0
 
 
 def _json_value(value: Any) -> Any:
@@ -50,21 +57,112 @@ def _git(root_dir: Path, *args: str) -> str | None:
 def runtime_identity(root_dir: Path) -> dict[str, Any]:
     """Return deploy identity without failing when the source is not a git checkout."""
 
-    root = Path(root_dir)
-    commit = _git(root, "rev-parse", "HEAD") or os.getenv("WETTEN_GIT_COMMIT") or "unknown"
-    branch = _git(root, "branch", "--show-current") or os.getenv("WETTEN_GIT_BRANCH") or "unknown"
+    root = Path(root_dir).resolve()
+    cache_key = str(root)
+    cached = _IDENTITY_CACHE.get(cache_key)
+    manifest_path = root / "DEPLOYMENT_MANIFEST.json"
+    manifest_appeared_since_cache = bool(
+        cached is not None
+        and not cached[1].get("deployment_manifest_present")
+        and manifest_path.exists()
+    )
+    if (
+        cached is not None
+        and not manifest_appeared_since_cache
+        and time.monotonic() - cached[0] < _IDENTITY_CACHE_TTL_SECONDS
+    ):
+        return dict(cached[1])
+    manifest: dict[str, Any] = {}
+    try:
+        parsed = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict):
+            manifest = parsed
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        manifest = {}
+    inside_work_tree = _git(root, "rev-parse", "--is-inside-work-tree") is not None
+    commit = str(
+        manifest.get("source_commit")
+        or _git(root, "rev-parse", "HEAD")
+        or os.getenv("WETTEN_GIT_COMMIT")
+        or "unknown"
+    )
+    branch = str(
+        manifest.get("source_branch")
+        or _git(root, "branch", "--show-current")
+        or os.getenv("WETTEN_GIT_BRANCH")
+        or "unknown"
+    )
     # Include untracked source files as well: a clean commit with an extra
     # local module is not the same runtime identity as the GitHub checkout.
-    porcelain = _git(root, "status", "--porcelain")
-    dirty: bool | None = None if porcelain is None else bool(porcelain)
-    return {
-        "app_version": os.getenv("WETTEN_APP_VERSION", APP_VERSION),
+    porcelain = _git(root, "status", "--porcelain") if inside_work_tree else None
+    dirty: bool | str = bool(porcelain) if inside_work_tree else "NOT_APPLICABLE"
+    identity = {
+        "app_version": os.getenv("WETTEN_APP_VERSION", manifest.get("app_version", APP_VERSION)),
+        "research_version": os.getenv("WETTEN_RESEARCH_VERSION", manifest.get("research_version", RESEARCH_VERSION)),
         "git_commit": commit,
         "git_branch": branch,
         "working_tree_dirty": dirty,
         "build_time": os.getenv("WETTEN_BUILD_TIME") or None,
-        "deploy_time": os.getenv("WETTEN_DEPLOY_TIME") or None,
+        "deploy_time": os.getenv("WETTEN_DEPLOY_TIME") or manifest.get("deployed_at"),
+        "deployed_commit": manifest.get("source_commit"),
+        "deployed_branch": manifest.get("source_branch"),
+        "deployed_tree_hash": manifest.get("source_tree_hash"),
+        "artifact_hash": manifest.get("artifact_hash"),
+        "installer_version": manifest.get("installer_version"),
+        "deployment_manifest_path": str(manifest_path),
+        "deployment_manifest_present": bool(manifest),
+        "python_version": manifest.get("python_version") or platform.python_version(),
     }
+    _IDENTITY_CACHE[cache_key] = (time.monotonic(), dict(identity))
+    return identity
+
+
+def deployment_manifest_path(root_dir: Path) -> Path:
+    """Return the install-time identity manifest path."""
+
+    return Path(root_dir).resolve() / "DEPLOYMENT_MANIFEST.json"
+
+
+def source_tree_hash(root_dir: Path) -> str:
+    """Compute the deterministic source hash used by the deployment manifest."""
+
+    # Keep the implementation in the runtime module as the dashboard also
+    # needs to expose the same identity without importing the research factory.
+    from research.v0611_runtime import source_tree_hash as _source_tree_hash
+
+    return _source_tree_hash(root_dir)
+
+
+def load_deployment_manifest(root_dir: Path) -> dict[str, Any] | None:
+    path = deployment_manifest_path(root_dir)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    return dict(value) if isinstance(value, dict) else None
+
+
+def write_deployment_manifest(
+    root_dir: Path,
+    *,
+    settings: Any | None = None,
+    installer_version: str = "v0611",
+    research_version: str = RESEARCH_VERSION,
+) -> dict[str, Any]:
+    from research.v0611_runtime import write_deployment_manifest as _write_manifest
+
+    return _write_manifest(
+        root_dir,
+        settings=settings,
+        installer_version=installer_version,
+        research_version=research_version,
+    )
+
+
+def deployment_status(root_dir: Path, *, check_integrity: bool = False) -> dict[str, Any]:
+    from research.v0611_runtime import deployment_status as _deployment_status
+
+    return _deployment_status(root_dir, check_integrity=check_integrity)
 
 
 def config_fingerprint(settings: Any) -> str:
@@ -238,9 +336,15 @@ def runtime_warnings(matrix: list[dict[str, Any]]) -> list[str]:
 
 __all__ = [
     "APP_VERSION",
+    "RESEARCH_VERSION",
     "config_fingerprint",
+    "deployment_manifest_path",
+    "deployment_status",
     "feature_health",
     "feature_runtime_matrix",
+    "load_deployment_manifest",
     "runtime_identity",
     "runtime_warnings",
+    "source_tree_hash",
+    "write_deployment_manifest",
 ]
