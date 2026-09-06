@@ -1,0 +1,21 @@
+[Unit]
+Description=Sportwetten FotMob result reconciliation
+Wants=network-online.target
+After=network-online.target wetten-collector.service
+
+[Service]
+Type=oneshot
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=-/etc/default/tipico-observer
+Environment=WETTEN_ARCHIVE_PATH=/var/lib/wetten/archive
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__INSTALL_DIR__/.venv/bin/python __INSTALL_DIR__/scripts/result_backfill.py --root __INSTALL_DIR__ --apply --mode worker --refresh-index
+TimeoutStartSec=30min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=__INSTALL_DIR__/data __INSTALL_DIR__/logs /var/lib/wetten
+UMask=0027

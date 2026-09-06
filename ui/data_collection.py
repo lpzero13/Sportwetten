@@ -288,6 +288,34 @@ def render_data_collection(
     persistence_columns[1].metric("Match Results", database.count_rows("match_results"))
     persistence_columns[2].metric("Paper Trades", database.count_rows("paper_trades"))
     persistence_columns[3].metric("Current Events", database.count_rows("current_event_state"))
+    result_backfill = database.result_backfill_status()
+    result_queue = result_backfill.get("queue", {}) or {}
+    result_sources = result_backfill.get("result_sources", {}) or {}
+    st.subheader("Ergebnis-Nachpflege")
+    result_columns = st.columns(4)
+    result_columns[0].metric(
+        "Finale fehlen",
+        result_backfill.get("missing_final_results", 0),
+        help="Tipico-Events ohne vollständiges FT-Ergebnis; FotMob-Backfill arbeitet diese täglich ab.",
+    )
+    result_columns[1].metric("Durch FotMob ergänzt", result_sources.get("FOTMOB_BACKFILL", 0))
+    result_columns[2].metric(
+        "Retry / Prüfung",
+        sum(
+            int(value or 0)
+            for key, value in result_queue.items()
+            if key not in {"APPLIED", "CONFIRMED", "CONFLICT", "CANCELLED", "EXCLUDED_NON_REGULATION"}
+        ),
+    )
+    result_columns[3].metric("Evidenz-Zeilen", result_backfill.get("evidence_rows", 0))
+    st.caption(
+        "Der Ergebnis-Backfill ergänzt nur fehlende Endstände. FotMob-Evidenz, "
+        "Match-Zuordnung, Scope und Prüfstatus bleiben separat nachvollziehbar; "
+        "vollständige Tipico-Ergebnisse werden nicht überschrieben."
+    )
+    if result_queue:
+        with st.expander("Backfill-Queue", expanded=False):
+            st.write(result_queue)
     market_type_rows = database.market_type_counts()
     if market_type_rows:
         with st.expander("Beobachtete Market Types", expanded=False):

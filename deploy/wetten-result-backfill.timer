@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Sportwetten FotMob result reconciliation
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=wetten-result-backfill.service
+
+[Install]
+WantedBy=timers.target

@@ -199,6 +199,13 @@ FOTMOB_NETWORK_MODE_VALUES = ("off", "manual", "worker")
 FOTMOB_ARCHIVE_ROOT = ""
 FOTMOB_HISTORY_LEAGUE_ID = "54"
 FOTMOB_HT_ENRICHMENT_ENABLED = True
+# V0.6.4: daily result reconciliation.  This is a result-label worker only;
+# it does not collect Tipico odds or overwrite complete Tipico results.
+RESULT_BACKFILL_ENABLED = True
+RESULT_BACKFILL_GRACE_HOURS = 3.0
+RESULT_BACKFILL_LIMIT = 500
+RESULT_BACKFILL_WORKERS = 10
+RESULT_BACKFILL_ALLOW_UNKNOWN_SCOPE = False
 # V0.5.7: selected-match live display only.  These settings control the
 # volatile UI path and do not enable any historical or halftime worker.
 DEFAULT_FOTMOB_LIVE_REFRESH_SECONDS = 10
@@ -338,6 +345,11 @@ class Settings:
     fotmob_archive_root: str = FOTMOB_ARCHIVE_ROOT
     fotmob_history_league_id: str = FOTMOB_HISTORY_LEAGUE_ID
     fotmob_ht_enrichment_enabled: bool = FOTMOB_HT_ENRICHMENT_ENABLED
+    result_backfill_enabled: bool = RESULT_BACKFILL_ENABLED
+    result_backfill_grace_hours: float = RESULT_BACKFILL_GRACE_HOURS
+    result_backfill_limit: int = RESULT_BACKFILL_LIMIT
+    result_backfill_workers: int = RESULT_BACKFILL_WORKERS
+    result_backfill_allow_unknown_scope: bool = RESULT_BACKFILL_ALLOW_UNKNOWN_SCOPE
     fotmob_live_refresh_seconds: int = DEFAULT_FOTMOB_LIVE_REFRESH_SECONDS
     fotmob_live_cache_ttl_seconds: int = FOTMOB_LIVE_CACHE_TTL_SECONDS
     fotmob_live_pending_minute: int = FOTMOB_LIVE_PENDING_MINUTE
@@ -358,6 +370,25 @@ class Settings:
     @property
     def database_path(self) -> Path:
         return self.root_dir / "data" / "tipico.db"
+
+    @property
+    def tipico_backtest_source_path(self) -> Path:
+        """Configured research source, or the copied local DB when present."""
+
+        configured = os.getenv("TIPICO_BACKTEST_SOURCE_DB", "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        copied = self.root_dir / "Tipico DB" / "tipico.db"
+        return copied if copied.is_file() else self.database_path
+
+    @property
+    def tipico_backtest_output_path(self) -> Path:
+        configured = os.getenv("TIPICO_BACKTEST_OUTPUT", "").strip()
+        return (
+            Path(configured).expanduser()
+            if configured
+            else self.root_dir / "research" / "output" / "tipico_backtest"
+        )
 
     @property
     def raw_storage_path(self) -> Path:
@@ -718,6 +749,23 @@ class Settings:
             or FOTMOB_HISTORY_LEAGUE_ID,
             fotmob_ht_enrichment_enabled=_env_bool(
                 "FOTMOB_HT_ENRICHMENT_ENABLED", FOTMOB_HT_ENRICHMENT_ENABLED
+            ),
+            result_backfill_enabled=_env_bool(
+                "RESULT_BACKFILL_ENABLED", RESULT_BACKFILL_ENABLED
+            ),
+            result_backfill_grace_hours=max(
+                0.0,
+                _env_float("RESULT_BACKFILL_GRACE_HOURS", RESULT_BACKFILL_GRACE_HOURS),
+            ),
+            result_backfill_limit=_env_int(
+                "RESULT_BACKFILL_LIMIT", RESULT_BACKFILL_LIMIT
+            ),
+            result_backfill_workers=_env_int(
+                "RESULT_BACKFILL_WORKERS", RESULT_BACKFILL_WORKERS
+            ),
+            result_backfill_allow_unknown_scope=_env_bool(
+                "RESULT_BACKFILL_ALLOW_UNKNOWN_SCOPE",
+                RESULT_BACKFILL_ALLOW_UNKNOWN_SCOPE,
             ),
             fotmob_live_refresh_seconds=_env_int(
                 "FOTMOB_LIVE_REFRESH_SECONDS", DEFAULT_FOTMOB_LIVE_REFRESH_SECONDS

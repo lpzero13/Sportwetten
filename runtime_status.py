@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 
-APP_VERSION = "0.6.2"
+APP_VERSION = "0.6.4"
 RESEARCH_VERSION = "0.6.1.1"
 
 
@@ -259,6 +259,9 @@ def feature_runtime_matrix(
         getattr(settings, "fotmob_enabled", False)
         and getattr(settings, "fotmob_ht_enrichment_enabled", False)
     )
+    result_backfill_configured = bool(
+        getattr(settings, "result_backfill_enabled", False)
+    )
     smart_configured = bool(getattr(settings, "smart_universe_enabled", False))
     return [
         entry("tipico_live", True, True, None, "Tipico-Livefeed ist im integrierten Collector aktiv"),
@@ -300,6 +303,13 @@ def feature_runtime_matrix(
         entry("fotmob_controlled_discovery", bool(getattr(settings, "fotmob_enabled", False)), bool(getattr(settings, "fotmob_enabled", False)) and worker_allowed, worker_gate if getattr(settings, "fotmob_enabled", False) and not worker_allowed else None, worker_reason if getattr(settings, "fotmob_enabled", False) else "FotMob deaktiviert"),
         entry("fotmob_selected_live", bool(getattr(settings, "fotmob_enabled", False)), bool(getattr(settings, "fotmob_enabled", False)) and manual_allowed, manual_gate if getattr(settings, "fotmob_enabled", False) and not manual_allowed else None, manual_reason if getattr(settings, "fotmob_enabled", False) else "FotMob deaktiviert"),
         entry("fotmob_ht_enrichment", ht_configured, ht_configured and worker_allowed, worker_gate if ht_configured and not worker_allowed else None, worker_reason if ht_configured else "FOTMOB_HT_ENRICHMENT_ENABLED=false oder FotMob deaktiviert"),
+        entry(
+            "fotmob_result_backfill",
+            result_backfill_configured,
+            result_backfill_configured and worker_allowed,
+            worker_gate if result_backfill_configured and not worker_allowed else None,
+            worker_reason if result_backfill_configured else "RESULT_BACKFILL_ENABLED=false",
+        ),
         entry("smart_live_universe", smart_configured, smart_configured, "SMART_UNIVERSE_ENABLED" if not smart_configured else None, "Smart-Universe aktiv" if smart_configured else "SMART_UNIVERSE_ENABLED=false"),
         entry("paper_trading", True, True, None, "Paper-Trading läuft ohne externen Schreibzugriff"),
         entry("archive_export", True, True, None, "Collector-Archiv und Outbox sind konfiguriert"),

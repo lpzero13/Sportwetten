@@ -8,6 +8,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -386,11 +387,77 @@ CREATE TABLE IF NOT EXISTS match_results (
     final_status TEXT NOT NULL,
     finished_at TEXT NOT NULL,
     extra_time INTEGER,
-    penalties INTEGER
+    penalties INTEGER,
+    result_source TEXT,
+    result_evidence_id TEXT,
+    result_confidence REAL,
+    result_scope_status TEXT,
+    result_resolved_at TEXT,
+    result_revision INTEGER NOT NULL DEFAULT 0,
+    result_last_checked_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_match_results_finished_at
     ON match_results(finished_at, event_id);
+
+-- V0.6.4: additive Tipico result reconciliation.  FotMob evidence is kept
+-- separate from the canonical result row so a provider check can never
+-- silently replace an existing Tipico result.
+CREATE TABLE IF NOT EXISTS result_backfill_queue (
+    event_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    last_attempt_at TEXT,
+    last_provider_match_id TEXT,
+    identity_status TEXT,
+    validation_status TEXT,
+    last_error TEXT,
+    resolved_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_result_backfill_queue_due
+    ON result_backfill_queue(status, next_attempt_at, updated_at);
+
+CREATE TABLE IF NOT EXISTS result_backfill_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'FOTMOB',
+    provider_match_id TEXT,
+    fetched_at TEXT NOT NULL,
+    response_status INTEGER,
+    provider_endpoint TEXT,
+    payload_hash TEXT,
+    match_confidence REAL,
+    identity_status TEXT NOT NULL,
+    validation_status TEXT NOT NULL,
+    validation_flags_json TEXT NOT NULL DEFAULT '[]',
+    provider_status TEXT,
+    scope_status TEXT,
+    ht_home INTEGER,
+    ht_away INTEGER,
+    ft_home INTEGER,
+    ft_away INTEGER,
+    second_half_goals INTEGER,
+    second_half_goal_class TEXT,
+    competition_id TEXT,
+    competition_name TEXT,
+    competition_country TEXT,
+    home_team TEXT,
+    away_team TEXT,
+    kickoff_at TEXT,
+    source_context TEXT NOT NULL,
+    raw_payload_path TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(event_id, provider, provider_match_id, payload_hash, validation_status)
+);
+
+CREATE INDEX IF NOT EXISTS idx_result_backfill_evidence_event
+    ON result_backfill_evidence(event_id, fetched_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_result_backfill_evidence_validation
+    ON result_backfill_evidence(validation_status, fetched_at DESC);
 
 CREATE TABLE IF NOT EXISTS market_presence (
     presence_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1187,6 +1254,16 @@ class Database:
         self._ensure_column("paper_trades", "family", "TEXT")
         self._ensure_column("snapshots", "extra_time", "INTEGER")
         self._ensure_column("snapshots", "penalties", "INTEGER")
+        for column, definition in (
+            ("result_source", "TEXT"),
+            ("result_evidence_id", "TEXT"),
+            ("result_confidence", "REAL"),
+            ("result_scope_status", "TEXT"),
+            ("result_resolved_at", "TEXT"),
+            ("result_revision", "INTEGER NOT NULL DEFAULT 0"),
+            ("result_last_checked_at", "TEXT"),
+        ):
+            self._ensure_column("match_results", column, definition)
         self._ensure_column("paper_market_state", "raw_payload_json", "TEXT")
         for column, definition in (
             ("connection_pool_size", "INTEGER"),
@@ -2881,9 +2958,25 @@ class Database:
             "home_team", "away_team", "kickoff_at", "ht_home", "ht_away",
             "ft_home", "ft_away", "first_half_goals", "second_half_goals",
             "second_half_goal_class", "final_status", "finished_at", "extra_time",
-            "penalties",
+            "penalties", "result_source", "result_evidence_id",
+            "result_confidence", "result_scope_status", "result_resolved_at",
+            "result_revision", "result_last_checked_at",
         )
-        params = tuple(values.get(column) for column in columns)
+        result_values = dict(values)
+        # This method is the canonical Tipico collector write path.  A later
+        # Tipico final observation must supersede a previously imported
+        # FotMob result and clear its provider-only provenance.
+        result_values["result_source"] = str(
+            result_values.get("result_source") or "TIPICO_ORIGINAL"
+        )
+        result_values["result_resolved_at"] = (
+            result_values.get("result_resolved_at") or result_values.get("finished_at")
+        )
+        result_values["result_last_checked_at"] = (
+            result_values.get("result_last_checked_at") or result_values.get("finished_at")
+        )
+        result_values.setdefault("result_revision", 0)
+        params = tuple(result_values.get(column) for column in columns)
         with self._lock:
             with self.connection:
                 self.connection.execute(
@@ -2907,7 +3000,14 @@ class Database:
                         final_status = excluded.final_status,
                         finished_at = excluded.finished_at,
                         extra_time = excluded.extra_time,
-                        penalties = excluded.penalties
+                        penalties = excluded.penalties,
+                        result_source = excluded.result_source,
+                        result_evidence_id = excluded.result_evidence_id,
+                        result_confidence = excluded.result_confidence,
+                        result_scope_status = excluded.result_scope_status,
+                        result_resolved_at = excluded.result_resolved_at,
+                        result_revision = COALESCE(match_results.result_revision, 0),
+                        result_last_checked_at = excluded.result_last_checked_at
                     """,
                     params,
                 )
@@ -2925,6 +3025,328 @@ class Database:
                 "SELECT * FROM match_results WHERE event_id = ?",
                 (str(event_id),),
             ).fetchone()
+
+    def result_backfill_candidates(
+        self,
+        *,
+        before: str,
+        now: str | None = None,
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        """Return old Tipico events whose final result is absent or incomplete.
+
+        The queue is deliberately consulted here rather than in the worker's
+        Python code.  That makes daily retries cheap and keeps terminal
+        ``APPLIED``/``CONFIRMED`` rows out of every later scan.
+        """
+
+        current = str(now or _now_iso())
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT e.*, q.status AS backfill_status,
+                           COALESCE(q.attempt_count, 0) AS backfill_attempt_count,
+                           q.next_attempt_at, q.last_provider_match_id,
+                           q.identity_status AS backfill_identity_status,
+                           q.validation_status AS backfill_validation_status,
+                           q.last_error AS backfill_last_error
+                    FROM events e
+                    LEFT JOIN match_results r ON r.event_id = e.event_id
+                    LEFT JOIN result_backfill_queue q ON q.event_id = e.event_id
+                    WHERE lower(e.sport) = 'soccer'
+                      AND e.kickoff_time IS NOT NULL
+                      AND e.kickoff_time <= ?
+                      AND (
+                          r.event_id IS NULL
+                          OR r.ft_home IS NULL
+                          OR r.ft_away IS NULL
+                      )
+                      AND (
+                          q.event_id IS NULL
+                          OR (
+                              q.status NOT IN ('APPLIED', 'CONFIRMED')
+                              AND q.next_attempt_at IS NOT NULL
+                              AND q.next_attempt_at <= ?
+                          )
+                      )
+                    ORDER BY e.kickoff_time ASC, e.event_id ASC
+                    LIMIT ?
+                    """,
+                    (str(before), current, max(1, int(limit))),
+                ).fetchall()
+            )
+
+    def result_backfill_status(self) -> dict[str, Any]:
+        """Return compact queue/evidence coverage for UI and operations."""
+
+        with self._lock:
+            queue_rows = self.connection.execute(
+                "SELECT status, COUNT(*) AS n FROM result_backfill_queue GROUP BY status"
+            ).fetchall()
+            evidence_rows = self.connection.execute(
+                """
+                SELECT validation_status, COUNT(*) AS n
+                FROM result_backfill_evidence
+                GROUP BY validation_status
+                """
+            ).fetchall()
+            missing = self.connection.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM events e
+                LEFT JOIN match_results r ON r.event_id = e.event_id
+                WHERE lower(e.sport) = 'soccer'
+                  AND (r.event_id IS NULL OR r.ft_home IS NULL OR r.ft_away IS NULL)
+                """
+            ).fetchone()
+            source_rows = self.connection.execute(
+                """
+                SELECT COALESCE(result_source, 'TIPICO_ORIGINAL') AS source,
+                       COUNT(*) AS n
+                FROM match_results
+                GROUP BY COALESCE(result_source, 'TIPICO_ORIGINAL')
+                ORDER BY source
+                """
+            ).fetchall()
+        return {
+            "queue": {str(row["status"]): int(row["n"] or 0) for row in queue_rows},
+            "evidence": {
+                str(row["validation_status"]): int(row["n"] or 0)
+                for row in evidence_rows
+            },
+            "missing_final_results": int(missing["n"] or 0) if missing else 0,
+            "result_sources": {
+                str(row["source"]): int(row["n"] or 0) for row in source_rows
+            },
+            "evidence_rows": sum(int(row["n"] or 0) for row in evidence_rows),
+        }
+
+    def persist_result_backfill_outcome(
+        self,
+        evidence: Mapping[str, Any],
+        queue: Mapping[str, Any],
+        *,
+        result_values: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Append provider evidence and update one queue row atomically.
+
+        ``result_values`` is applied only when the existing canonical row has
+        no final score, or when it is absent.  A complete Tipico result is
+        never overwritten by this method.  A caller may still record a
+        ``RESULT_CONFLICT`` evidence row for a manual review.
+        """
+
+        evidence_columns = (
+            "evidence_id", "event_id", "provider", "provider_match_id",
+            "fetched_at", "response_status", "provider_endpoint", "payload_hash",
+            "match_confidence", "identity_status", "validation_status",
+            "validation_flags_json", "provider_status", "scope_status",
+            "ht_home", "ht_away", "ft_home", "ft_away", "second_half_goals",
+            "second_half_goal_class", "competition_id", "competition_name",
+            "competition_country", "home_team", "away_team", "kickoff_at",
+            "source_context", "raw_payload_path", "created_at",
+        )
+        evidence_values = dict(evidence)
+        flags = evidence_values.get("validation_flags_json", "[]")
+        if not isinstance(flags, str):
+            flags = _json(flags)
+        evidence_values["validation_flags_json"] = flags
+        evidence_values.setdefault("provider", "FOTMOB")
+        evidence_values.setdefault("created_at", _now_iso())
+        evidence_values.setdefault("source_context", "TIPICO_RESULT_BACKFILL")
+        evidence_values.setdefault("identity_status", "UNMATCHED")
+        evidence_values.setdefault("validation_status", "INVALID")
+        evidence_values.setdefault("evidence_id", str(uuid.uuid4()))
+        evidence_values.setdefault("event_id", str(queue.get("event_id") or ""))
+        evidence_params = tuple(evidence_values.get(column) for column in evidence_columns)
+
+        event_id = str(queue.get("event_id") or evidence_values.get("event_id") or "")
+        if not event_id:
+            raise ValueError("result backfill outcome has no event_id")
+        queue_status = str(queue.get("status") or "ERROR").upper()
+        queue_columns = (
+            "event_id", "status", "attempt_count", "next_attempt_at",
+            "last_attempt_at", "last_provider_match_id", "identity_status",
+            "validation_status", "last_error", "resolved_at", "updated_at",
+        )
+        queue_values = {
+            "event_id": event_id,
+            "status": queue_status,
+            "attempt_count": max(0, int(queue.get("attempt_count") or 0)),
+            "next_attempt_at": queue.get("next_attempt_at"),
+            "last_attempt_at": queue.get("last_attempt_at") or _now_iso(),
+            "last_provider_match_id": queue.get("last_provider_match_id"),
+            "identity_status": queue.get("identity_status"),
+            "validation_status": queue.get("validation_status"),
+            "last_error": queue.get("last_error"),
+            "resolved_at": queue.get("resolved_at"),
+            "updated_at": queue.get("updated_at") or _now_iso(),
+        }
+        queue_params = tuple(queue_values.get(column) for column in queue_columns)
+
+        applied = False
+        result_action = "NOT_APPLIED"
+        with self._lock, self.connection:
+            self.connection.execute(
+                f"""
+                INSERT OR IGNORE INTO result_backfill_evidence
+                    ({', '.join(evidence_columns)})
+                VALUES ({', '.join('?' for _ in evidence_columns)})
+                """,
+                evidence_params,
+            )
+
+            if result_values is not None and queue_status in {"APPLIED", "CONFIRMED"}:
+                result = self.connection.execute(
+                    "SELECT * FROM match_results WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()
+                incoming_ft = (
+                    result_values.get("ft_home"), result_values.get("ft_away")
+                )
+                existing_ft = (
+                    (result["ft_home"], result["ft_away"])
+                    if result is not None
+                    else (None, None)
+                )
+                if result is not None and all(value is not None for value in existing_ft):
+                    if existing_ft != incoming_ft:
+                        result_action = "RESULT_CONFLICT"
+                    else:
+                        self.connection.execute(
+                            """
+                            UPDATE match_results
+                            SET result_source = CASE
+                                    WHEN result_source IS NULL THEN 'CROSS_PROVIDER_CONFIRMED'
+                                    ELSE result_source
+                                END,
+                                result_evidence_id = COALESCE(result_evidence_id, ?),
+                                result_confidence = COALESCE(result_confidence, ?),
+                                result_scope_status = COALESCE(result_scope_status, ?),
+                                result_last_checked_at = ?,
+                                result_revision = COALESCE(result_revision, 0)
+                            WHERE event_id = ?
+                            """,
+                            (
+                                evidence_values.get("evidence_id"),
+                                evidence_values.get("match_confidence"),
+                                evidence_values.get("scope_status"),
+                                evidence_values.get("fetched_at") or _now_iso(),
+                                event_id,
+                            ),
+                        )
+                        applied = True
+                        result_action = "CONFIRMED_EXISTING"
+                elif result is None:
+                    columns = (
+                        "event_id", "competition_id", "competition_name",
+                        "competition_country", "home_team", "away_team",
+                        "kickoff_at", "ht_home", "ht_away", "ft_home", "ft_away",
+                        "first_half_goals", "second_half_goals",
+                        "second_half_goal_class", "final_status", "finished_at",
+                        "extra_time", "penalties", "result_source",
+                        "result_evidence_id", "result_confidence", "result_scope_status",
+                        "result_resolved_at", "result_revision", "result_last_checked_at",
+                    )
+                    values = dict(result_values)
+                    values.setdefault("result_source", "FOTMOB_BACKFILL")
+                    values.setdefault("result_evidence_id", evidence_values.get("evidence_id"))
+                    values.setdefault("result_confidence", evidence_values.get("match_confidence"))
+                    values.setdefault("result_scope_status", evidence_values.get("scope_status"))
+                    values.setdefault("result_resolved_at", _now_iso())
+                    values.setdefault("result_revision", 0)
+                    values.setdefault("result_last_checked_at", evidence_values.get("fetched_at"))
+                    self.connection.execute(
+                        f"""
+                        INSERT INTO match_results ({', '.join(columns)})
+                        VALUES ({', '.join('?' for _ in columns)})
+                        """,
+                        tuple(values.get(column) for column in columns),
+                    )
+                    applied = True
+                    result_action = "INSERTED"
+                else:
+                    values = dict(result_values)
+                    self.connection.execute(
+                        """
+                        UPDATE match_results
+                        SET competition_id = COALESCE(competition_id, ?),
+                            competition_name = COALESCE(competition_name, ?),
+                            competition_country = COALESCE(competition_country, ?),
+                            home_team = COALESCE(home_team, ?),
+                            away_team = COALESCE(away_team, ?),
+                            kickoff_at = COALESCE(kickoff_at, ?),
+                            ht_home = COALESCE(ht_home, ?),
+                            ht_away = COALESCE(ht_away, ?),
+                            ft_home = COALESCE(ft_home, ?),
+                            ft_away = COALESCE(ft_away, ?),
+                            first_half_goals = COALESCE(first_half_goals, ?),
+                            second_half_goals = COALESCE(second_half_goals, ?),
+                            second_half_goal_class = COALESCE(second_half_goal_class, ?),
+                            final_status = COALESCE(final_status, ?),
+                            finished_at = COALESCE(finished_at, ?),
+                            extra_time = COALESCE(extra_time, ?),
+                            penalties = COALESCE(penalties, ?),
+                            result_source = COALESCE(result_source, 'FOTMOB_BACKFILL'),
+                            result_evidence_id = COALESCE(result_evidence_id, ?),
+                            result_confidence = COALESCE(result_confidence, ?),
+                            result_scope_status = COALESCE(result_scope_status, ?),
+                            result_resolved_at = COALESCE(result_resolved_at, ?),
+                            result_revision = COALESCE(result_revision, 0),
+                            result_last_checked_at = ?
+                        WHERE event_id = ?
+                        """,
+                        (
+                            values.get("competition_id"), values.get("competition_name"),
+                            values.get("competition_country"), values.get("home_team"),
+                            values.get("away_team"), values.get("kickoff_at"),
+                            values.get("ht_home"), values.get("ht_away"),
+                            values.get("ft_home"), values.get("ft_away"),
+                            values.get("first_half_goals"), values.get("second_half_goals"),
+                            values.get("second_half_goal_class"), values.get("final_status"),
+                            values.get("finished_at"), values.get("extra_time"),
+                            values.get("penalties"), values.get("result_evidence_id"),
+                            values.get("result_confidence"), values.get("result_scope_status"),
+                            values.get("result_resolved_at"), values.get("result_last_checked_at"),
+                            event_id,
+                        ),
+                    )
+                    applied = True
+                    result_action = "FILLED_PARTIAL"
+
+            if result_action == "RESULT_CONFLICT":
+                queue_values["status"] = "CONFLICT"
+                queue_values["resolved_at"] = None
+                queue_values["next_attempt_at"] = None
+                self.connection.execute(
+                    "UPDATE result_backfill_evidence SET validation_status = 'RESULT_CONFLICT' WHERE evidence_id = ?",
+                    (evidence_values.get("evidence_id"),),
+                )
+            self.connection.execute(
+                f"""
+                INSERT INTO result_backfill_queue ({', '.join(queue_columns)})
+                VALUES ({', '.join('?' for _ in queue_columns)})
+                ON CONFLICT(event_id) DO UPDATE SET
+                    status = excluded.status,
+                    attempt_count = excluded.attempt_count,
+                    next_attempt_at = excluded.next_attempt_at,
+                    last_attempt_at = excluded.last_attempt_at,
+                    last_provider_match_id = excluded.last_provider_match_id,
+                    identity_status = excluded.identity_status,
+                    validation_status = excluded.validation_status,
+                    last_error = excluded.last_error,
+                    resolved_at = excluded.resolved_at,
+                    updated_at = excluded.updated_at
+                """,
+                tuple(queue_values.get(column) for column in queue_columns),
+            )
+        return {
+            "evidence_id": evidence_values.get("evidence_id"),
+            "applied": applied,
+            "result_action": result_action,
+            "queue_status": queue_values["status"],
+        }
 
     def add_market_presence(
         self,

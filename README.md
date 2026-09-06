@@ -1,4 +1,4 @@
-# Tipico Market Intelligence Dashboard V0.6.2
+# Tipico Market Intelligence Dashboard V0.6.4
 
 Lokales, read-only Streamlit-Tool zur Beobachtung des öffentlichen Tipico-Live-Fußballfeeds
 mit getrenntem Paper-Trading für die mathematisch definierte `ZERO_OR_2PLUS`-Strategie.
@@ -220,6 +220,38 @@ Die optionalen Einstellungen liegen nach der Installation in
 `git pull` mit Root-Rechten und ein erneuter Aufruf von
 `bash deploy/install_proxmox.sh`.
 
+### Ergebnis-Nachpflege über FotMob
+
+Der tägliche `wetten-result-backfill.timer` sucht Tipico-Fußballspiele ohne
+vollständigen Endstand. Er verwendet zuerst den lokal gespeicherten FotMob-
+Tagesindex, ergänzt fehlende Index-Tage bei Bedarf und ruft danach die
+Detaildaten mit zehn konfigurierten Workern ab.
+Nur abgeschlossene Spiele mit vollständigem Halbzeit- und Endstand sowie
+bestätigtem Regular-Time-Scope werden in `match_results` ergänzt. Die FotMob-
+Zuordnung und jede Prüfung landen zusätzlich in `result_backfill_evidence`; die
+Wiederholungen und offenen Fälle stehen in `result_backfill_queue`. Bestehende
+vollständige Tipico-Ergebnisse bleiben unverändert.
+
+Der Timer wird beim erneuten Aufruf von `deploy/install_proxmox.sh` eingerichtet.
+Ein manueller Lauf ist möglich:
+
+~~~bash
+systemctl start wetten-result-backfill.service
+systemctl status wetten-result-backfill.timer
+journalctl -u wetten-result-backfill.service -n 100 --no-pager
+~~~
+
+Vor einem produktiven Schreiben kann derselbe Ablauf schreibgeschützt geprüft
+werden:
+
+~~~bash
+.venv/bin/python scripts/result_backfill.py --root /opt/tipico-observer --dry-run
+~~~
+
+Ergebnisse ohne expliziten Nachweis für reguläre 90 Minuten werden standardmäßig
+nicht übernommen. Das Verhalten kann nach Prüfung gezielt mit
+`RESULT_BACKFILL_ALLOW_UNKNOWN_SCOPE=true` geändert werden.
+
 ## V0.6.0 Historical HT ML Research Factory
 
 Die Research-Engine ist ein separater, ausdrücklich gestarteter Prozess. Sie
@@ -325,6 +357,41 @@ Datenträgerplatz oder ein ungesunder Collector stoppen den Lauf. Es gibt für
 den ersten 100er-Lauf keinen Scheduler. `V0611_STATUS.md` und
 `V0611_RUNTIME_REPORT.md` markieren nicht lokal beobachtbare CT110-/Live-
 Canaries ausdrücklich als `PENDING` und behaupten keinen lokalen PASS.
+
+### V0.6.3 Tipico Backtest & Pattern Lab
+
+Die Tipico-Forschungsstrecke arbeitet ausschließlich mit einer konsistenten,
+schreibgeschützten SQLite-Kopie. Sie verwendet keine FotMob-Daten, kein ML,
+keine Netzwerkanfragen und keine Echtgeldaktion. Der feste Einstieg ist
+`HT_STABLE_ONCE`; die 18 Varianten und die drei Referenz-Wettformen sind im
+Code vorregistriert und werden nicht aus dem Ergebnis optimiert.
+
+Die Quelle wird standardmäßig unter `Tipico DB/tipico.db` gesucht. Sie ist
+durch `.gitignore` vom Repository ausgeschlossen und darf nicht auf GitHub
+landen. Ein vollständiger Studienlauf erzeugt unter
+`research/output/tipico_backtest/<RUN_ID>/` Audit, kanonisches Dataset,
+P1-/Mustersegmente, Varianten- und Referenzergebnisse, Einzel-Trades,
+`PAPER_CANDIDATES.json` sowie das Hermes-Runbook. `STUDY_REGISTRY.json` hält
+die abgeschlossenen Läufe fest; bestehende Run-IDs werden nie überschrieben.
+
+~~~powershell
+python scripts/tipico_backtest.py audit --source "Tipico DB/tipico.db"
+python scripts/tipico_backtest.py build-dataset --source "Tipico DB/tipico.db"
+python scripts/tipico_backtest.py run-study --source "Tipico DB/tipico.db" --stake 10
+python scripts/tipico_backtest.py report
+python scripts/tipico_backtest.py export-candidates
+python scripts/tipico_backtest.py paper-dry-run --run "research/output/tipico_backtest/<RUN_ID>" --variant P12 --event-id <EVENT_ID>
+~~~
+
+Für eine reproduzierbare Teilperiode können `--from-date`, `--to-date` und
+`--cutoff-utc` verwendet werden. `--cost` und `--quote-haircut` sind explizite
+Sensitivitäten. Der Paper-Befehl ist absichtlich nur ein nicht persistierender
+Entscheidungstest: Er schreibt weder Paper-Trades noch Ledger-/Portfolio-
+Tabellen. Automatische Aktivierung von Kandidaten bleibt deaktiviert.
+
+Die Seite **Tipico Backtest** in Streamlit startet einen Lauf nur über den
+ausdrücklichen Button und zeigt Übersicht, P1-/Muster-Drill-down,
+Variantenvergleich und den eingefrorenen Spielbeleg.
 
 ## Bedienung
 
@@ -784,6 +851,11 @@ Die Defaults stehen in config.py und können per Umgebungsvariable überschriebe
 | FOTMOB_ARCHIVE_ROOT | leer | kanonischer FotMob-Parquet-Root, Proxmox: `/var/lib/wetten/archive/fotmob` |
 | FOTMOB_HISTORY_LEAGUE_ID | 54 | Legacy-Fallback für die alten expliziten Liga-/Season-CLI-Befehle; die Datumsauswahl lädt alle Ligen |
 | FOTMOB_HT_ENRICHMENT_ENABLED | true | separates Live-HZ-Enrichment; kein permanenter Historien-Poller |
+| RESULT_BACKFILL_ENABLED | true | tägliche Nachpflege fehlender Tipico-Endstände über FotMob |
+| RESULT_BACKFILL_GRACE_HOURS | 3 | Mindestalter eines Events, bevor der Endstand geprüft wird |
+| RESULT_BACKFILL_LIMIT | 500 | maximale Queue-Auswahl je täglichem Lauf |
+| RESULT_BACKFILL_WORKERS | 10 | parallele FotMob-Detailanfragen im Ergebnis-Worker |
+| RESULT_BACKFILL_ALLOW_UNKNOWN_SCOPE | false | unbekannten Extra-Time-/Regular-Time-Scope nicht automatisch übernehmen |
 | SMART_UNIVERSE_ENABLED | true | Capability-basierte Detailpfad-Auswahl bei vollständigem Tipico-Radar |
 | SMART_UNIVERSE_CACHE_TTL_SECONDS | 300 | TTL des Smart-Universe-Catalogs |
 | SMART_UNIVERSE_DISCOVERY_PROBE_SECONDS | 900 | Mindestabstand kontrollierter P2-Probes je Wettbewerb |

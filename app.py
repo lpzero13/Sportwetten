@@ -34,6 +34,7 @@ from ui.upcoming import render_upcoming
 from ui.paper_trading import render_paper_trading
 from ui.fotmob import render_fotmob_debug, render_fotmob_tab
 from ui.fotmob_live import render_fotmob_live_panel
+from ui.tipico_backtest import render_tipico_backtest
 
 
 @st.cache_resource(show_spinner=False)
@@ -360,8 +361,8 @@ def main() -> None:
     st.sidebar.caption("TIPICO · FOTMOB · PAPER LAB")
     page = st.sidebar.radio(
         "Ansicht",
-        ["Live", "Upcoming", "Halftime Scanner", "Paper Trading", "Data / Debug"],
-        format_func=lambda value: {"Live": "Live & Analyse", "Upcoming": "Kommende Spiele", "Halftime Scanner": "Halbzeit-Scanner", "Data / Debug": "Daten & System"}.get(value, value),
+        ["Live", "Upcoming", "Halftime Scanner", "Paper Trading", "Tipico Backtest", "Data / Debug"],
+        format_func=lambda value: {"Live": "Live & Analyse", "Upcoming": "Kommende Spiele", "Halftime Scanner": "Halbzeit-Scanner", "Tipico Backtest": "Tipico Backtest", "Data / Debug": "Daten & System"}.get(value, value),
     )
     st.sidebar.caption(f"V{APP_VERSION} · Paper Trading · REST/Polling")
     st.sidebar.caption(f"Gerät: {device.label}")
@@ -392,6 +393,10 @@ def main() -> None:
     if page == "Paper Trading":
         st_autorefresh(interval=30_000, key="paper-autorefresh")
         render_paper_trading(paper_service, database, mobile=device.is_mobile)
+        return
+
+    if page == "Tipico Backtest":
+        render_tipico_backtest(settings)
         return
 
     if page == "Data / Debug":

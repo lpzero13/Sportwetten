@@ -45,6 +45,7 @@ python3 -m venv "$INSTALL_DIR/.venv"
 mkdir -p \
     "$INSTALL_DIR/data/raw" \
     "$INSTALL_DIR/data/halftime_reports" \
+    "$INSTALL_DIR/data/result_backfill" \
     "$INSTALL_DIR/logs" \
     "/var/lib/wetten/archive/fotmob/match_core" \
     "/var/lib/wetten/archive/fotmob/period_stats" \
@@ -113,6 +114,18 @@ sed \
     -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
     "$INSTALL_DIR/deploy/wetten-fotmob.service" \
     > /etc/systemd/system/wetten-fotmob.service
+sed \
+    -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
+    -e "s|__SERVICE_USER__|$SERVICE_USER|g" \
+    -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
+    "$INSTALL_DIR/deploy/wetten-result-backfill.service" \
+    > /etc/systemd/system/wetten-result-backfill.service
+sed \
+    -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
+    -e "s|__SERVICE_USER__|$SERVICE_USER|g" \
+    -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
+    "$INSTALL_DIR/deploy/wetten-result-backfill.timer" \
+    > /etc/systemd/system/wetten-result-backfill.timer
 
 # Reconcile the V0.5.9.1 production FotMob flags even when an older env file
 # already exists.  The helper keeps a timestamped backup and keeps the
@@ -122,7 +135,7 @@ TIPICO_SKIP_SERVICE_RESTART=1 bash "$INSTALL_DIR/deploy/activate_fotmob.sh" "$EN
 # Record the exact source/artifact identity that was installed.  The
 # manifest is runtime state and is intentionally excluded from Git.
 "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/deploy/write_deployment_manifest.py" \
-    --root "$INSTALL_DIR" --installer-version "v062"
+    --root "$INSTALL_DIR" --installer-version "v064"
 chown root:"$SERVICE_GROUP" "$INSTALL_DIR/DEPLOYMENT_MANIFEST.json"
 chmod 0640 "$INSTALL_DIR/DEPLOYMENT_MANIFEST.json"
 
@@ -146,15 +159,17 @@ systemctl daemon-reload
 # standalone/polling FotMob service disabled; a second worker would duplicate
 # provider requests and create conflicting state.
 systemctl disable --now wetten-fotmob.service 2>/dev/null || true
-systemctl enable wetten-ui.service wetten-collector.service wetten-paper.service wetten-cleanup.timer
+systemctl enable wetten-ui.service wetten-collector.service wetten-paper.service \
+    wetten-cleanup.timer wetten-result-backfill.timer
 systemctl restart wetten-ui.service
 systemctl restart wetten-collector.service
 systemctl restart wetten-paper.service
 systemctl start wetten-cleanup.timer
+systemctl start wetten-result-backfill.timer
 
 LXC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo
 echo "Installation abgeschlossen."
 echo "Dashboard: http://${LXC_IP:-<LXC-IP>}:8506"
-echo "Status:    systemctl status wetten-ui wetten-collector wetten-paper"
-echo "Logs:      journalctl -u wetten-ui -u wetten-collector -u wetten-paper -f"
+echo "Status:    systemctl status wetten-ui wetten-collector wetten-paper wetten-result-backfill.timer"
+echo "Logs:      journalctl -u wetten-ui -u wetten-collector -u wetten-paper -u wetten-result-backfill.service -f"
