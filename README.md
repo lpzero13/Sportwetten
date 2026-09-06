@@ -1,7 +1,65 @@
-# Tipico Market Intelligence Dashboard V0.5
+# Tipico Market Intelligence Dashboard V0.6.2
 
 Lokales, read-only Streamlit-Tool zur Beobachtung des öffentlichen Tipico-Live-Fußballfeeds
-mit getrenntem Paper-Trading für die validierte `ZERO_OR_2PLUS`-Strategie.
+mit getrenntem Paper-Trading für die mathematisch definierte `ZERO_OR_2PLUS`-Strategie.
+Eine langfristige Profitabilität ist bisher nicht nachgewiesen.
+
+## V0.6.2: nachvollziehbarer Papertrade vom Einstieg bis zur Abrechnung
+
+Der erste Teil der neuen Roadmap schließt den operativen Papertrading-Ablauf.
+Im Paper-Bereich lassen sich `MARKET_STRUCTURE` (Quotenexperiment ohne P1-Pflicht)
+und `MARKET_ONLY` (Markt-P1 unter dem konfigurierten Grenzwert) als getrennte
+Portfolios anlegen. Vorhandene Portfolios behalten die strengere MARKET_ONLY-Regel.
+Das Einstiegsfenster ist sichtbar einstellbar und gilt nur während der Halbzeitpause.
+
+Der Collector fragt während des aktiven Einstiegsfensters passende HT-Spiele
+höchstens alle zehn Sekunden zusätzlich ab. Diese Abfragen aktualisieren nur den
+Current State. Der Paper-Worker prüft alle fünf Sekunden; langsame Ergebnisabfragen
+laufen in einem eigenen Thread. Beide Dienste müssen aktualisiert werden.
+
+Entscheidungen speichern gemeinsame Marktbeobachtungen, konkrete Markt-/Outcome-IDs,
+Spielstand, Quotenzeit, Strategieversion und Konfigurationshash. Eine Quote wird nicht
+mehr anhand eines ähnlichen Zahlenwerts zugeordnet. Falls RAW_PAPER_ENTRY aktiv ist,
+wird der Original-Payload derselben Beobachtung archiviert; es gibt dafür keinen neuen
+Provider-Request pro Portfolio. Fehlende Raw-Belege werden explizit im Einstieg markiert.
+
+Unter **Paper Trading → Portfolio → Signale** zeigt die Oberfläche BET/NO_BET,
+Ablehnungsgrund, Halbzeitbeobachtung, Marktquellen, P1-Break-even, P1 nach Normalisierung
+und Power-Methode sowie den Ergebnisstand. Quellenüberschneidungen werden angezeigt.
+Ein Covered ROI ist die Rendite im abgedeckten Ausgang, nicht der Erwartungswert.
+
+Ungeklärte Ergebnisse bleiben OPEN; ihr Einsatz bleibt reserviert. Der Worker prüft
+sie erneut, ohne doppelte Auszahlungen. Ein unbekannter Verlängerungs-Scope wird nicht
+als regulärer Endstand angenommen. Eine explizit bestätigte 90-Minuten-Angabe kann
+auch bei Spielen mit Verlängerung verwendet werden. Alte bereits erstattete
+UNRESOLVED-Trades werden als Altbestand angezeigt und nicht rückwirkend umgebucht.
+
+Status im Container, mit demselben Environment wie die Dienste:
+
+```bash
+cd /opt/wetten/app
+set -a
+. /etc/default/tipico-observer
+set +a
+.venv/bin/python scripts/run_paper.py --root /opt/wetten/app --status
+```
+
+Nach Übernahme dieses Quellstands aktualisiert `sudo bash deploy/install_proxmox.sh`
+auch die systemd-Unit auf den Fünf-Sekunden-Takt. Ein reines `git pull` ändert eine
+bereits installierte Unit nicht. Im Dashboard anschließend ein Portfolio anlegen
+oder ein bestehendes passend konfigurieren; es wird kein Experiment ungefragt aktiviert.
+
+Ein separater Live-Test erzeugt ausschließlich in einem neuen Testverzeichnis
+zwei virtuelle Portfolios. Der erste Aufruf verlangt ein gerade verfügbares HT-Spiel:
+
+```bash
+.venv/bin/python scripts/paper_canary.py --root /var/lib/wetten/paper-canary-062
+.venv/bin/python scripts/paper_canary.py --root /var/lib/wetten/paper-canary-062 --phase settlement
+```
+
+Der zweite Aufruf prüft den späteren echten Endstand. PENDING/OPEN bedeutet dabei
+weiterhin ungeklärt. Der Test ist kein Beweis für profitable Strategien.
+Aktueller Abnahmestand und Grenzen: [V062_STATUS.md](V062_STATUS.md).
 
 Der aktuelle Projektumfang umfasst:
 
@@ -62,10 +120,10 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-streamlit run app.py
+.\START_TIPICO.bat
 ~~~
 
-Danach öffnet Streamlit die lokale URL im Browser.
+Danach startet die Anwendung alle drei Dienste und öffnet die lokale URL im Browser.
 
 Zeitstempel in der Oberfläche werden als `TT.MM.JJJJ HH:MM:SS` in der
 Münchner Zeitzone (`Europe/Berlin`) angezeigt. Die unveränderten Tipico-
@@ -74,13 +132,63 @@ Zeitstempel bleiben zusätzlich in den Raw-Daten erhalten.
 ### Ein-Klick-Start unter Windows
 
 Für den normalen Start genügt ein Doppelklick auf `START_TIPICO.bat` im
-Projektordner. Das Skript verwendet automatisch die vorhandene Umgebung unter
-`work\\v01-venv`, startet den Server im Hintergrund, wartet auf die Bereitschaft
-und öffnet den Browser unter `http://127.0.0.1:8506`.
+Projektordner. Es startet **Oberfläche, Collector und Paper-Worker** gemeinsam
+im Hintergrund und öffnet `http://127.0.0.1:8506`, sobald die Oberfläche erreichbar
+ist. Die erste Collector-Runde blockiert das Öffnen nicht mehr; noch ausstehende
+Worker-Statusmeldungen werden als Initialisierung ausgewiesen. Alle drei verwenden
+dieselbe Datenbank `data/tipico.db` dieses Projektordners. Ein aktives Portfolio
+und der globale Paper-Schalter entscheiden unabhängig davon über neue Trades.
 
-Ein erneuter Klick öffnet nur die bereits laufende Instanz. Mit
-`STOP_TIPICO.bat` kann sie beendet werden. Start- und Fehlermeldungen liegen
-unter `logs\\streamlit.out.log` und `logs\\streamlit.err.log`.
+Eine vorhandene Umgebung (`work/v01-venv`, `.venv` oder `venv`) wird verwendet.
+Fehlt sie, wird mit installiertem Python 3.12 eine `.venv` angelegt; fehlende oder
+inkompatible deklarierte Pakete werden beim ersten Start installiert (Internet nötig).
+Mehrfaches bzw. gleichzeitiges Klicken startet keine doppelten Dienste. Auch bei
+bereits offener Oberfläche werden fehlende Worker ergänzt. Die Prozessverwaltung
+startet unerwartet beendete Dienste mit Wiederholungsabstand neu.
+
+- `START_TIPICO.bat`: vollständig starten / bestehende Anwendung öffnen.
+- `STOP_TIPICO.bat`: alle drei Dienste beenden, nicht nur das Browserfenster.
+- `STATUS_TIPICO.bat`: Prozess-IDs, Datenbankpfad und aktuelle Worker-Meldungen.
+
+Beim Stoppen dürfen Worker ihre laufenden Aufgaben abschließen (bis 45 Sekunden).
+Ein nötiges erzwungenes Beenden wird protokolliert. Fremde Anwendungen oder
+Prozesse aus anderen Projektordnern werden nicht beendet; ein belegter fremder
+Port führt zu einer verständlichen Fehlermeldung. Datenbanken werden nicht gelöscht.
+Das Schließen des Browsers beendet die Hintergrunddienste bewusst nicht.
+
+Logs: `logs/local-runtime.err.log`, `logs/collector.err.log`, `logs/paper.err.log`,
+`logs/ui.err.log`, jeweils zusätzlich `.out.log`. Der gemeinsame Status steht in
+`logs/local-runtime.json`. `ready` bestätigt Prozesse und aktuelle Meldungen,
+nicht die Verfügbarkeit jedes Providers oder die Profitabilität einer Strategie.
+
+Für einen Start ohne Browser: `powershell -File start_tipico.ps1 -NoBrowser`.
+Alternativ: `START_TIPICO.bat -NoBrowser`. Die Batch zeigt sofort eine
+Startmeldung und gibt Fehlercodes des Startskripts unverändert zurück.
+Die lokale Oberfläche lauscht nur auf `127.0.0.1`; die Container-Dienste bleiben
+unverändert für den dort konfigurierten Netzwerkzugriff zuständig.
+
+### Neue Analyseansicht
+
+Quoten, Analyse und FotMob wählen einen festen Reiter über den Sitzungszustand;
+die Reiter werden nicht mehr umsortiert. Nur die aktive Ansicht wird berechnet.
+FotMob kann direkt aus der Übersicht öffnen, ohne einen Tipico-Detailabruf
+abzuwarten. Ältere Streamlit-Versionen verwenden dafür eine horizontale Auswahl
+mit demselben Verhalten. Die Übersicht wird nicht zusätzlich im Hintergrund
+neu geladen, während ein Spiel geöffnet ist.
+
+Die Detailansicht zeigt eine verständliche Markteinschätzung, Quotenalter,
+Gewinnfall-Rendite, modellierten Erwartungswert und Markt-Puffer. Drei
+Szenariokarten zeigen die Auszahlung und das Nettoergebnis bei 0, genau 1 und
+2+ Toren einschließlich Teileinsätzen und Quoten. Marktquellen, alternative
+Quoten, IDs und Formeln sind aufklappbar. Fehlende oder veraltete Daten werden
+nicht als positives Einstiegssignal dargestellt. Außerhalb der Halbzeit ist die
+Rechnung ausdrücklich ein Restspielzeit-Szenario, kein HZ-Paper-Einstieg.
+
+Der Szenario-Einsatz verändert nur die Anzeige, keine Portfolio-Regeln oder
+gespeicherten Einstiege. Die Ansicht hat einen direkten Rückweg zur Übersicht,
+stabile Tab-Reihenfolge und responsive Karten für das Handy. Schrift, Abstände,
+Navigation und Farben werden lokal aus `ui/theme.css` geladen; keine externen
+Design-Assets oder Schriftanbieter sind notwendig.
 
 ## Installation auf Proxmox
 

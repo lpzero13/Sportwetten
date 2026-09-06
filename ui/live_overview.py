@@ -10,11 +10,13 @@ import streamlit as st
 from models.event import LiveEvent
 
 
-def _select_event(event_id: str, intent: str) -> None:
+def _select_event(event_id: str, intent: str, event: LiveEvent | None = None) -> None:
     """Persist the clicked event before Streamlit reruns the page."""
 
     st.session_state["selected_event_id"] = event_id
     st.session_state["detail_intent"] = intent
+    if event is not None:
+        st.session_state["selected_event"] = event
 
 
 def _fotmob_data_available(service: Any, event_id: str) -> bool:
@@ -86,7 +88,7 @@ def render_live_overview(
                     width="stretch",
                     type="secondary",
                     on_click=_select_event,
-                    args=(event.event_id, "quotes"),
+                    args=(event.event_id, "quotes", event),
                 ):
                     selected = event.event_id
                 if columns[5].button(
@@ -95,16 +97,18 @@ def render_live_overview(
                     width="stretch",
                     type="primary",
                     on_click=_select_event,
-                    args=(event.event_id, "analysis"),
+                    args=(event.event_id, "analysis", event),
                 ):
                     selected = event.event_id
                 link_service = fotmob_live_service or fotmob_service
-                fotmob_available = _fotmob_data_available(link_service, event.event_id)
                 fotmob_live_usable = bool(
                     fotmob_live_service is not None
                     and getattr(fotmob_live_service, "enabled", False)
                     and getattr(fotmob_live_service, "manual_use_allowed", False)
                 )
+                # When the panel is usable, checking each event's link only
+                # adds N database roundtrips. Resolve the chosen game on click.
+                fotmob_available = False if fotmob_live_usable else _fotmob_data_available(link_service, event.event_id)
                 if columns[6].button(
                     "FotMob Live",
                     key=f"fotmob-event-{event.event_id}",
@@ -125,7 +129,7 @@ def render_live_overview(
                         )
                     ),
                     on_click=_select_event,
-                    args=(event.event_id, "fotmob_live"),
+                    args=(event.event_id, "fotmob_live", event),
                 ):
                     selected = event.event_id
     return selected

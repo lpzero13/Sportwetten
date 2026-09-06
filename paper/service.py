@@ -5,16 +5,15 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Callable, Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 from config import Settings
-from intelligence.strategy import calculate_zero_or_2plus
 from storage.database import Database
 
-from .engine import evaluate_signal, settle_scores
-from .models import PAPER_STRATEGY, PORTFOLIO_STATUSES, PaperPortfolio, SettlementResult
+from .engine import settle_scores
+from .models import PAPER_STRATEGY, PORTFOLIO_STATUSES, STRATEGY_FAMILIES, PaperPortfolio, SettlementResult, decimal_value
 
 
 def _now_iso() -> str:
@@ -99,6 +98,31 @@ class PaperTradingService:
             raise ValueError(f"Unsupported paper portfolio status: {status}")
         return resolved
 
+    @staticmethod
+    def _validate_rules(values: Mapping[str, Any]) -> None:
+        for key in ("starting_bankroll", "fixed_stake", "bankroll_percentage", "min_stake", "max_stake",
+                    "minimum_win_roi", "minimum_p1_buffer", "maximum_tipico_p1", "minimum_q_zero",
+                    "minimum_q_two_plus", "minimum_p1_break_even"):
+            if values.get(key) is not None and decimal_value(values[key]) is None:
+                raise ValueError(f"Ungültiger Zahlenwert: {key}")
+        for key in ("maximum_tipico_p1", "minimum_p1_break_even"):
+            if not 0 <= float(values.get(key, 0)) <= 1:
+                raise ValueError(f"{key} muss zwischen 0 und 100 % liegen.")
+        if not 0 <= int(values["entry_window_start_seconds"]) <= int(values["entry_window_end_seconds"]) <= 1800:
+            raise ValueError("Das Einstiegsfenster muss aufsteigend zwischen 0 und 1800 Sekunden liegen.")
+        if int(values["max_quote_age_seconds"]) < 1:
+            raise ValueError("Das maximale Quotenalter muss mindestens eine Sekunde betragen.")
+        if values.get("stake_mode") not in {"FIXED", "BANKROLL_PERCENTAGE"}:
+            raise ValueError("Ungültiger Einsatzmodus")
+        key = "fixed_stake" if values["stake_mode"] == "FIXED" else "bankroll_percentage"
+        stake = decimal_value(values.get(key))
+        if stake is None or stake <= 0 or key == "bankroll_percentage" and stake > 100:
+            raise ValueError("Der Einsatz muss positiv sein; ein Bankroll-Anteil darf höchstens 100 % betragen.")
+        if any(values.get(key) is not None and float(values[key]) < 0 for key in ("min_stake", "max_stake")):
+            raise ValueError("Einsatzgrenzen dürfen nicht negativ sein.")
+        if values.get("min_stake") is not None and values.get("max_stake") is not None and float(values["min_stake"]) > float(values["max_stake"]):
+            raise ValueError("Der minimale Einsatz liegt über dem maximalen Einsatz.")
+
     def create_portfolio(
         self,
         *,
@@ -122,20 +146,24 @@ class PaperTradingService:
         allow_all_competitions: bool = True,
         selected_competition_ids: list[str] | tuple[str, ...] = (),
         status: str = "ACTIVE",
+        family: str = "MARKET_ONLY",
+        minimum_p1_break_even: float | Decimal = 0.0,
     ) -> PaperPortfolio:
         resolved_name = str(name).strip()
         if not resolved_name:
             raise ValueError("Portfolio name is required")
         if strategy_type != PAPER_STRATEGY:
             raise ValueError("V0.4 supports only ZERO_OR_2PLUS")
+        if family not in STRATEGY_FAMILIES:
+            raise ValueError("Unsupported strategy family")
         resolved_mode = str(stake_mode).upper().strip()
         if resolved_mode not in {"FIXED", "BANKROLL_PERCENTAGE"}:
             raise ValueError("Stake mode must be FIXED or BANKROLL_PERCENTAGE")
-        start = Decimal(str(starting_bankroll))
-        if start <= 0:
+        start = decimal_value(starting_bankroll)
+        if start is None or start <= 0:
             raise ValueError("Starting bankroll must be positive")
-        start_seconds = max(0, int(entry_window_start_seconds))
-        end_seconds = max(start_seconds, int(entry_window_end_seconds))
+        start_seconds = int(entry_window_start_seconds)
+        end_seconds = int(entry_window_end_seconds)
         now = _now_iso()
         portfolio_id = f"pf-{uuid.uuid4().hex[:12]}"
         values = {
@@ -162,7 +190,10 @@ class PaperTradingService:
             "allow_all_competitions": int(bool(allow_all_competitions)),
             "status": self._validated_status(status),
             "version": 1,
+            "family": family,
+            "minimum_p1_break_even": float(minimum_p1_break_even),
         }
+        self._validate_rules(values)
         self.database.insert_paper_portfolio(values, selected_competition_ids)
         portfolio = self.portfolio(portfolio_id)
         if portfolio is None:
@@ -178,6 +209,15 @@ class PaperTradingService:
     ) -> PaperPortfolio | None:
         if "status" in values:
             values["status"] = self._validated_status(values["status"])
+        if "family" in values and values["family"] not in STRATEGY_FAMILIES:
+            raise ValueError("Unsupported strategy family")
+        current = self.portfolio(portfolio_id)
+        if current is None:
+            return None
+        self._validate_rules({**current.config(), **values})
+        rule_change = any(key not in {"name", "status", "updated_at"} for key in values) or selected_competition_ids is not None
+        if rule_change:
+            values["version"] = current.version + 1
         values["updated_at"] = _now_iso()
         row = self.database.update_paper_portfolio(
             portfolio_id, values, selected_competition_ids
@@ -238,254 +278,13 @@ class PaperTradingService:
                 self.database.connection.rollback()
                 raise
 
-    @staticmethod
-    def _quote_row(
-        rows: list[Any],
-        quote: float | None,
-    ) -> Any | None:
-        if not rows:
-            return None
-        if quote is None:
-            return rows[0]
-        return min(rows, key=lambda row: abs(float(row["odds"]) - quote))
-
-    def _entry_quotes(self, evaluation: Any) -> tuple[Any | None, Any | None]:
-        event_id = str(evaluation["event_id"])
-        observed_at = str(evaluation["observed_at"])
-        zero_rows = self.database.current_canonical_quotes_for_evaluation(
-            event_id,
-            ("REMAINING_TOTAL_UNDER", "NEXT_GOAL_NONE", "MATCH_TOTAL_UNDER"),
-        )
-        if not zero_rows:
-            zero_rows = self.database.canonical_quotes_for_evaluation(
-            event_id,
-            observed_at,
-            ("REMAINING_TOTAL_UNDER", "NEXT_GOAL_NONE", "MATCH_TOTAL_UNDER"),
-            )
-        two_rows = self.database.current_canonical_quotes_for_evaluation(
-            event_id,
-            ("REMAINING_TOTAL_OVER", "MATCH_TOTAL_OVER"),
-        )
-        if not two_rows:
-            two_rows = self.database.canonical_quotes_for_evaluation(
-            event_id,
-            observed_at,
-            ("REMAINING_TOTAL_OVER", "MATCH_TOTAL_OVER"),
-            )
-        return (
-            self._quote_row(zero_rows, _float(evaluation["q_zero"])),
-            self._quote_row(two_rows, _float(evaluation["q_two_plus"])),
-        )
-
-    def _entry_window_age(self, evaluation: Any, now: datetime) -> float | None:
-        anchor = _parse_iso(self.database.first_halftime_observed_at(str(evaluation["event_id"])))
-        if anchor is None:
-            # Direct/manual analyses may not have an event-state row. Their
-            # evaluation timestamp is the only honest entry anchor available.
-            anchor = _parse_iso(evaluation["observed_at"])
-        if anchor is None:
-            return None
-        return (now - anchor).total_seconds()
-
-    def _log_signal(
-        self,
-        portfolio: PaperPortfolio,
-        evaluation: Any,
-        decision: str,
-        reason: str,
-        details: Mapping[str, Any] | None = None,
-    ) -> None:
-        self.database.log_paper_signal(
-            {
-                "portfolio_id": portfolio.portfolio_id,
-                "event_id": str(evaluation["event_id"]),
-                "evaluation_id": evaluation["evaluation_id"] or 0,
-                "observed_at": str(evaluation["observed_at"]),
-                "decision": decision,
-                "reason": reason,
-                "details": dict(details or {}),
-            }
-        )
-
     def process_signals(
-        self,
-        *,
-        now: datetime | None = None,
-        evaluation_limit: int = 500,
+        self, *, now: datetime | None = None, evaluation_limit: int = 500,
     ) -> dict[str, int]:
-        """Evaluate recent HT rows and create at most one trade per event/portfolio."""
+        from .entries import process_entries
 
-        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        result = {"evaluations_seen": 0, "signals_accepted": 0, "trades_created": 0, "rejected": 0}
-        if not self.is_enabled():
-            return result
-        portfolios = [item for item in self.portfolios(include_archived=False) if item.status == "ACTIVE"]
-        if not portfolios:
-            return result
-        max_window = max(item.entry_window_end_seconds for item in portfolios)
-        since = (current - timedelta(seconds=max_window + 900)).isoformat()
-        evaluations = self.database.recent_strategy_evaluations(
-            strategy_type=PAPER_STRATEGY,
-            since=since,
-            limit=evaluation_limit,
-        )
-        # The default V0.4 entry policy is first-valid, not latest-valid.
-        # The database query is newest-first for UI use, so restore chronology
-        # before the idempotent entry check below.
-        evaluations = sorted(
-            evaluations,
-            key=lambda row: (
-                str(row["observed_at"]),
-                int(row["evaluation_id"] or 0),
-            ),
-        )
-        result["evaluations_seen"] = len(evaluations)
-        for evaluation in evaluations:
-            observed = _parse_iso(evaluation["observed_at"])
-            if observed is None:
-                continue
-            for portfolio in portfolios:
-                if (
-                    not portfolio.allow_all_competitions
-                    and str(evaluation["competition_id"] or "")
-                    not in portfolio.selected_competition_ids
-                ):
-                    self._log_signal(portfolio, evaluation, "REJECTED", "COMPETITION_NOT_ALLOWED")
-                    result["rejected"] += 1
-                    continue
-                age = self._entry_window_age(evaluation, current)
-                if age is None:
-                    self._log_signal(portfolio, evaluation, "REJECTED", "HALF_TIME_ANCHOR_UNKNOWN")
-                    result["rejected"] += 1
-                    continue
-                if age < portfolio.entry_window_start_seconds:
-                    self._log_signal(portfolio, evaluation, "REJECTED", "ENTRY_WINDOW_NOT_OPEN", {"age_seconds": age})
-                    result["rejected"] += 1
-                    continue
-                if age > portfolio.entry_window_end_seconds:
-                    self._log_signal(portfolio, evaluation, "REJECTED", "ENTRY_WINDOW_EXPIRED", {"age_seconds": age})
-                    result["rejected"] += 1
-                    continue
-                zero_quote, two_quote = self._entry_quotes(evaluation)
-                quote_age_zero = max(0.0, (current - (_parse_iso(zero_quote["observed_at"]) or current)).total_seconds()) if zero_quote else None
-                quote_age_two = max(0.0, (current - (_parse_iso(two_quote["observed_at"]) or current)).total_seconds()) if two_quote else None
-                available = self.database.paper_balance(portfolio.portfolio_id)
-                decision = evaluate_signal(
-                    portfolio,
-                    evaluation,
-                    quote_age_zero_seconds=quote_age_zero,
-                    quote_age_two_plus_seconds=quote_age_two,
-                    available_bankroll=available,
-                )
-                if not decision.accepted or decision.stake is None:
-                    self._log_signal(portfolio, evaluation, "REJECTED", decision.reason, decision.details)
-                    result["rejected"] += 1
-                    continue
-                result["signals_accepted"] += 1
-                q_zero = _float(evaluation["q_zero"])
-                q_two = _float(evaluation["q_two_plus"])
-                strategy = calculate_zero_or_2plus(
-                    q_zero, q_two, total_stake=float(decision.stake),
-                    p1_tipico=_float(evaluation["p1_tipico"]),
-                    source_zero=str(evaluation["source_zero"] or "Tipico"),
-                    source_two_plus=str(evaluation["source_two_plus"] or "Tipico"),
-                )
-                entry_raw_path: str | None = None
-                if self.settings.raw_paper_entry and self.entry_raw_store is not None:
-                    try:
-                        entry_raw_path = self.entry_raw_store(str(evaluation["event_id"]))
-                    except Exception as exc:  # raw audit must not block the trade
-                        self.logger.warning(
-                            "Paper entry raw capture failed for %s: %s",
-                            evaluation["event_id"],
-                            exc,
-                        )
-                snapshot = {
-                    "paper_trade_id": f"pt-{uuid.uuid4().hex[:16]}",
-                    "portfolio_id": portfolio.portfolio_id,
-                    "event_id": str(evaluation["event_id"]),
-                    "competition_id": evaluation["competition_id"],
-                    "competition_name": str(evaluation["competition_name"] or "Unbekannter Wettbewerb"),
-                    "competition_country": evaluation["competition_country"],
-                    "created_at": current.isoformat(),
-                    "strategy_evaluation_id": (
-                        int(evaluation["evaluation_id"])
-                        if evaluation["evaluation_id"] is not None
-                        else None
-                    ),
-                    "strategy_type": str(evaluation["strategy_type"]),
-                    "strategy_version": str(evaluation["strategy_version"]),
-                    "normalizer_version": str(evaluation["normalizer_version"]),
-                    "home_team": str(evaluation["home_team"] or "Unbekannt"),
-                    "away_team": str(evaluation["away_team"] or "Unbekannt"),
-                    "ht_score_home": _int(evaluation["event_ht_score_home"]),
-                    "ht_score_away": _int(evaluation["event_ht_score_away"]),
-                    "zero_market_id": zero_quote["market_id"] if zero_quote else None,
-                    "zero_outcome_id": zero_quote["outcome_id"] if zero_quote else None,
-                    "zero_market_type": zero_quote["raw_market_type"] if zero_quote else None,
-                    "zero_market_caption": zero_quote["raw_market_caption"] if zero_quote else None,
-                    "zero_outcome_caption": zero_quote["raw_outcome_caption"] if zero_quote else None,
-                    "q_zero": q_zero,
-                    "zero_quote_observed_at": zero_quote["observed_at"] if zero_quote else evaluation["observed_at"],
-                    "zero_quote_age_seconds": decision.quote_age_zero_seconds,
-                    "two_plus_market_id": two_quote["market_id"] if two_quote else None,
-                    "two_plus_outcome_id": two_quote["outcome_id"] if two_quote else None,
-                    "two_plus_market_type": two_quote["raw_market_type"] if two_quote else None,
-                    "two_plus_market_caption": two_quote["raw_market_caption"] if two_quote else None,
-                    "two_plus_outcome_caption": two_quote["raw_outcome_caption"] if two_quote else None,
-                    "q_two_plus": q_two,
-                    "two_plus_quote_observed_at": two_quote["observed_at"] if two_quote else evaluation["observed_at"],
-                    "two_plus_quote_age_seconds": decision.quote_age_two_plus_seconds,
-                    "stake_total": strategy.total_stake,
-                    "stake_zero": strategy.stake_zero,
-                    "stake_two_plus": strategy.stake_two_plus,
-                    "payout_zero": strategy.payout_zero,
-                    "payout_two_plus": strategy.payout_two_plus,
-                    "p_zero": _float(evaluation["p_zero"]),
-                    "p_one": _float(evaluation["p_one"] or evaluation["p1_tipico"]),
-                    "p_two_plus": _float(evaluation["p_two_plus"]),
-                    "p1_max": strategy.p1_max,
-                    "p1_tipico": strategy.p1_tipico,
-                    "p1_buffer": strategy.p1_buffer,
-                    "win_roi": strategy.win_roi,
-                    "entry_raw_payload_path": entry_raw_path,
-                    "bankroll_before": available,
-                    "bankroll_after": available - float(decision.stake),
-                    "rank": 1,
-                    "status": "OPEN",
-                    "reservation_transaction_id": f"tx-{uuid.uuid4().hex}",
-                    "reservation_idempotency_key": f"reserve:{portfolio.portfolio_id}:{evaluation['event_id']}:{evaluation['strategy_type']}",
-                }
-                snapshot["entry_snapshot"] = {
-                    key: value for key, value in snapshot.items()
-                    if key not in {"reservation_transaction_id", "reservation_idempotency_key", "entry_snapshot"}
-                }
-                created, _, reason = self.database.reserve_paper_trade(snapshot)
-                self._log_signal(
-                    portfolio,
-                    evaluation,
-                    "ACCEPTED" if created else "SKIPPED",
-                    reason,
-                    {"stake": float(decision.stake), "age_seconds": age},
-                )
-                if created:
-                    entry_evaluation_id = self.database.record_strategy_evaluation_event(
-                        dict(evaluation),
-                        trigger_type="PAPER_TRADE_ENTRY",
-                        is_eligible=True,
-                    )
-                    self.database.attach_strategy_evaluation_to_paper_trade(
-                        str(snapshot["paper_trade_id"]),
-                        entry_evaluation_id,
-                    )
-                    self.database.mark_strategy_entry_evaluation(
-                        str(evaluation["event_id"]),
-                        str(evaluation["strategy_type"]),
-                        entry_evaluation_id,
-                        str(evaluation["observed_at"]),
-                    )
-                    result["trades_created"] += 1
-        return result
+        # Current HT state is bounded by time; never silently truncate games.
+        return process_entries(self, now=now)
 
     def _settlement_for_trade(
         self,
@@ -496,6 +295,9 @@ class PaperTradingService:
         status: str | None,
         extra_time: bool | None,
         penalties: bool | None,
+        regulation_home: int | None = None,
+        regulation_away: int | None = None,
+        regulation_confirmed: bool = False,
     ) -> SettlementResult:
         return settle_scores(
             halftime_home=_int(trade["ht_score_home"]),
@@ -505,6 +307,8 @@ class PaperTradingService:
             status=status,
             extra_time=extra_time,
             penalties=penalties,
+            regulation_home=regulation_home, regulation_away=regulation_away,
+            regulation_confirmed=regulation_confirmed,
         )
 
     def settle_trade(
@@ -517,6 +321,10 @@ class PaperTradingService:
         extra_time: bool | None = False,
         penalties: bool | None = False,
         settled_at: str | None = None,
+        regulation_home: int | None = None,
+        regulation_away: int | None = None,
+        regulation_confirmed: bool = False,
+        evidence: Mapping[str, Any] | None = None,
     ) -> Any:
         trade = self.database.paper_trade_row(paper_trade_id)
         if trade is None:
@@ -528,6 +336,8 @@ class PaperTradingService:
             status=status,
             extra_time=extra_time,
             penalties=penalties,
+            regulation_home=regulation_home, regulation_away=regulation_away,
+            regulation_confirmed=regulation_confirmed,
         )
         if result.status == "WIN_ZERO":
             return_amount = Decimal(str(trade["payout_zero"] or 0))
@@ -548,61 +358,30 @@ class PaperTradingService:
             "transaction_id": f"tx-{uuid.uuid4().hex}",
             "idempotency_key": f"settle:{paper_trade_id}",
         }
+        from .journal import PaperJournal
+        PaperJournal(self.database).settlement_audit(paper_trade_id, payload, dict(evidence or {
+            "final_home": final_score_home, "final_away": final_score_away,
+            "status": status, "extra_time": extra_time, "penalties": penalties,
+            "regulation_home": regulation_home, "regulation_away": regulation_away,
+            "regulation_confirmed": regulation_confirmed,
+        }))
         _, row = self.database.settle_paper_trade(paper_trade_id, payload)
         return row
 
     def settle_open_trades(
-        self,
-        *,
-        resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+        self, *, resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+        now: datetime | None = None,
     ) -> dict[str, int]:
-        result = {"open_seen": 0, "settled": 0, "unresolved": 0}
-        for trade in self.database.paper_trade_rows(status="OPEN", limit=1000):
-            result["open_seen"] += 1
-            final = self.database.final_snapshot_for_event(str(trade["event_id"]))
-            result_row = self.database.match_result_for_event(str(trade["event_id"]))
-            values: Mapping[str, Any] | None = None
-            if final is not None:
-                values = {
-                    "final_score_home": final["score_home"],
-                    "final_score_away": final["score_away"],
-                    "status": final["match_status"] or "FINISHED",
-                    "extra_time": False,
-                    "penalties": False,
-                }
-            elif result_row is not None:
-                values = {
-                    "final_score_home": result_row["ft_home"],
-                    "final_score_away": result_row["ft_away"],
-                    "status": result_row["final_status"] or "FINISHED",
-                    "extra_time": result_row["extra_time"],
-                    "penalties": result_row["penalties"],
-                }
-            elif resolver is not None:
-                values = resolver(str(trade["event_id"]))
-            if not values:
-                continue
-            row = self.settle_trade(
-                str(trade["paper_trade_id"]),
-                final_score_home=_int(values.get("final_score_home")),
-                final_score_away=_int(values.get("final_score_away")),
-                status=str(values.get("status") or "UNKNOWN"),
-                extra_time=values.get("extra_time"),
-                penalties=values.get("penalties"),
-            )
-            if row is None:
-                continue
-            if str(row["status"]) == "UNRESOLVED":
-                result["unresolved"] += 1
-            else:
-                result["settled"] += 1
-        return result
+        from .results import process_results
+
+        return process_results(self, resolver=resolver, now=now)
 
     def worker_once(
         self,
         *,
         now: datetime | None = None,
         resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+        include_settlement: bool = True,
     ) -> dict[str, int]:
         started = _now_iso()
         signal_result: dict[str, int] = {}
@@ -611,11 +390,18 @@ class PaperTradingService:
         error_message: str | None = None
         try:
             signal_result = self.process_signals(now=now)
-            settlement_result = self.settle_open_trades(resolver=resolver)
         except Exception as exc:  # service loop must survive one bad event
             errors = 1
             error_message = str(exc)
             self.logger.exception("Paper worker iteration failed")
+        try:
+            if include_settlement:
+                settlement_result = self.settle_open_trades(resolver=resolver, now=now)
+        except Exception as exc:
+            errors += 1
+            error_message = str(exc)
+            self.logger.exception("Paper settlement iteration failed")
+        errors += signal_result.get("entry_errors", 0) + settlement_result.get("settlement_errors", 0)
         finished = _now_iso()
         with self.database._lock:  # noqa: SLF001 - worker heartbeat transaction
             with self.database.connection:

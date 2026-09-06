@@ -130,6 +130,8 @@ def _quality(details: EventDetails) -> str:
 
 
 def _second_half_label(event: LiveEvent) -> tuple[int | None, str | None]:
+    if event.extra_time is not False or event.penalties is not False:
+        return None, None
     if (
         event.score_home is None
         or event.score_away is None
@@ -234,6 +236,7 @@ class CollectorEventState:
     last_outcome_availability: dict[str, bool] = field(default_factory=dict)
     latest_details: EventDetails | None = None
     last_status: str | None = None
+    paper_probe_at: float = 0.0
 
 
 class Collector:
@@ -565,11 +568,11 @@ class Collector:
             goal_at=goal_at,
             reopen_delay_seconds=reopen_delay_seconds,
         )
-        if snapshot_type not in {"REOPEN_PROBE"} and self.database.snapshot_exists(
+        if snapshot_type not in {"REOPEN_PROBE", "PAPER_HT_PROBE"} and self.database.snapshot_exists(
             event_id, snapshot_type
         ):
             return False
-        if snapshot_type == "REOPEN_PROBE" and any(
+        if snapshot_type in {"REOPEN_PROBE", "PAPER_HT_PROBE"} and any(
             key[0] == str(event_id) and key[1] == snapshot_type
             for key in self._pending_keys | self._active_keys
         ):
@@ -629,6 +632,10 @@ class Collector:
                 str(item[0]),
             )
         )
+        with self.database._lock:
+            paper_window = self.database.connection.execute(
+                "SELECT MAX(entry_window_end_seconds) FROM paper_portfolios WHERE status='ACTIVE'"
+            ).fetchone()[0] if self.database.get_paper_runtime_setting("enabled", "1") == "1" else None
         for event_id, event, decision, previous in work_items:
             if event_id in self._halftime_missing_events:
                 self.halftime_recovery_count += 1
@@ -650,6 +657,13 @@ class Collector:
                 self._resolve_fotmob_link(event, trigger="LIVE_START", priority="P1")
             state = self._event_states.setdefault(event_id, CollectorEventState())
             observed_at = result.metrics.response_received_at if result.metrics else _now_iso()
+            if paper_window is not None and _is_halftime(event):
+                anchor = self.database.first_halftime_observed_at(event_id)
+                age = _iso_age_seconds(anchor) if anchor else 0.0
+                if age is not None and age <= paper_window and time.monotonic() - state.paper_probe_at >= 10:
+                    self._enqueue(event_id, "PAPER_HT_PROBE", "PAPER_ENTRY_WINDOW_REFRESH",
+                                  raw_full=False, fallback_event=event)
+                    state.paper_probe_at = time.monotonic()
             previous_h2 = self._second_half_goals(previous) if previous is not None else None
             current_h2 = self._second_half_goals(event)
             if not _is_finished(event) and current_h2 is not None and current_h2 > 0 and (
@@ -1105,6 +1119,8 @@ class Collector:
             raw_payload_path=raw_path,
             second_half_goals=second_half_goals,
             second_half_goal_class=second_half_class,
+            extra_time=details.event.extra_time,
+            penalties=details.event.penalties,
             competition_id=details.event.competition_id,
             competition_name=details.event.competition_name,
             competition_country=details.event.competition_country,
@@ -1298,6 +1314,9 @@ class Collector:
             for market in details.markets
             for outcome in market.outcomes
         }
+
+        if job.snapshot_type == "PAPER_HT_PROBE":
+            return  # Current state only; paper decisions retain shared evidence.
 
         if job.snapshot_type == "REOPEN_PROBE":
             if (
@@ -1999,7 +2018,6 @@ class Collector:
             # that were never started remain visible in the final status.
             while self._futures:
                 self._collect_finished(block=True)
-                self._drain_due_jobs()
             self._export_snapshots_if_due(force=True)
         finally:
             self._running = False

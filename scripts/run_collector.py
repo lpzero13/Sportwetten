@@ -14,6 +14,7 @@ if __package__ in {None, ""}:
 from config import Settings, configure_logging
 from fotmob.service import FotMobService
 from services.collector import Collector
+from services.stop_request import StopRequest
 from storage.database import Database
 from storage.raw_storage import RawStorage
 from tipico.client import TipicoClient
@@ -76,7 +77,7 @@ def main() -> None:
         status = (
             collector.run_once()
             if args.once
-            else collector.run_forever(duration_minutes=args.duration_minutes)
+            else collector.run_forever(duration_minutes=args.duration_minutes, stop_event=StopRequest())
         )
         print(json.dumps(status, ensure_ascii=False, indent=2))
     finally:

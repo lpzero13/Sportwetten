@@ -71,9 +71,9 @@ set_env_value FOTMOB_HISTORY_WORKERS 10
 set_env_value FOTMOB_HISTORY_REQUESTS_PER_SECOND 5
 set_env_value FOTMOB_HISTORY_LEAGUE_ID 54
 set_env_value FOTMOB_HT_ENRICHMENT_ENABLED true
-set_env_value WETTEN_APP_VERSION 0.5.9.1
+set_env_value WETTEN_APP_VERSION 0.6.2
 set_env_value WETTEN_RESEARCH_VERSION 0.6.1.1
-set_env_value WETTEN_INSTALLER_VERSION v0611
+set_env_value WETTEN_INSTALLER_VERSION v062
 set_env_value WETTEN_DEPLOY_TIME "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 if command -v systemctl >/dev/null 2>&1; then

@@ -9,6 +9,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from config import Settings, configure_logging
+from runtime_status import APP_VERSION
 from fotmob.client import FotMobClient
 from fotmob.live import FotMobLiveService
 from fotmob.service import FotMobService
@@ -155,226 +156,165 @@ def _load_selected_detail(
     selected_id = st.session_state.get("selected_event_id")
     if not selected_id:
         return
+    opening_intent = st.session_state.pop("detail_intent", None)
+    if opening_intent:
+        from ui.components import scroll_to_top
+        scroll_to_top()
 
-    st.divider()
-    st.subheader("Eventdetails")
-    control_columns = st.columns([1, 1, 5])
+    control_columns = st.columns([1.2, 1.6, 3])
     auto_refresh = control_columns[0].checkbox(
-        "Auto Refresh",
-        value=False,
-        key="detail_auto_refresh",
-        help=f"Detailfeed alle {settings.event_market_refresh_seconds} Sekunden abrufen.",
+        "Auto Refresh", value=True, key="detail_auto_refresh",
+        help=f"Tipico-Quoten in Analyse/Quoten alle {settings.event_market_refresh_seconds} Sekunden abrufen. FotMob hat eigene Steuerelemente.",
     )
     manual_refresh = control_columns[1].button(
-        "Quoten aktualisieren",
-        key=f"manual-detail-refresh-{selected_id}",
+        "Quoten aktualisieren", key=f"manual-detail-refresh-{selected_id}",
         width="stretch",
-        help="Fragt die aktuellen Märkte und Quoten für dieses Event sofort neu ab.",
     )
-    if control_columns[2].button(
-        "Event schließen",
-        key=f"close-detail-{selected_id}",
-    ):
-        st.session_state.pop("selected_event_id", None)
-        st.session_state.pop("detail_state", None)
-        st.session_state.pop("detail_intent", None)
+    if control_columns[2].button("← Zurück zur Spielübersicht", key=f"close-detail-{selected_id}"):
+        for key in ("selected_event_id", "selected_event", "detail_state", "detail_intent",
+                    "detail_tab_order", f"detail-view-{selected_id}"):
+            st.session_state.pop(key, None)
+        st.session_state["navigation_scroll_top"] = True
         st.rerun()
 
-    if auto_refresh:
-        st_autorefresh(
-            interval=settings.event_market_refresh_seconds * 1000,
-            key=f"detail-autorefresh-{selected_id}",
-        )
-
-    detail_state = st.session_state.get("detail_state")
-    loaded_at = None
-    if isinstance(detail_state, dict):
-        loaded_at = detail_state.get("loaded_at")
-    should_load = (
-        not isinstance(detail_state, dict)
-        or detail_state.get("event_id") != selected_id
-        or manual_refresh
-    )
-    if auto_refresh and loaded_at:
-        try:
-            loaded_dt = datetime.fromisoformat(loaded_at.replace("Z", "+00:00"))
-            should_load = should_load or (
-                datetime.now(timezone.utc) - loaded_dt.astimezone(timezone.utc)
-            ).total_seconds() >= settings.event_market_refresh_seconds
-        except ValueError:
-            should_load = True
-
-    overview_event = next(
-        (event for event in event_service.events if event.event_id == selected_id),
-        None,
-    )
-    if should_load:
-        result = market_service.load_event_details(
-            selected_id,
-            overview_event=overview_event,
-        )
-        if result.details is not None:
-            st.session_state.detail_state = {
-                "event_id": selected_id,
-                "details": result.details,
-                "metrics": result.metrics,
-                "loaded_at": (
-                    result.metrics.response_received_at
-                    if result.metrics
-                    else datetime.now(timezone.utc).isoformat()
-                ),
-                "error": result.error,
-            }
-        if manual_refresh and result.success and result.metrics is not None and result.details is not None:
-            st.success(
-                f"Quoten aktualisiert: "
-                f"{format_local_datetime(result.metrics.response_received_at)} · "
-                f"{result.details.market_count} Märkte / {result.details.outcome_count} Outcomes"
-            )
-        elif result.error:
-            st.error(f"Quoten konnten nicht aktualisiert werden: {result.error}")
+    header = st.container()
+    from ui.detail_navigation import render_detail_navigation
+    view, content = render_detail_navigation(selected_id, opening_intent)
+    tipico_view = view in {"Analyse", "Alle Tipico Märkte"}
+    if auto_refresh and tipico_view:
+        st_autorefresh(interval=settings.event_market_refresh_seconds * 1000,
+                       key=f"detail-autorefresh-{selected_id}")
 
     detail_state = st.session_state.get("detail_state")
     if not isinstance(detail_state, dict) or detail_state.get("event_id") != selected_id:
-        st.info("Eventdetails werden geladen …")
-        return
+        detail_state = None
+    overview_event = next((event for event in event_service.events if event.event_id == selected_id), None)
+    if overview_event is None:
+        remembered = st.session_state.get("selected_event")
+        if getattr(remembered, "event_id", None) == selected_id:
+            overview_event = remembered
+    event = (detail_state["details"].event if detail_state else overview_event)
+    provider_view = view in {"FotMob Live", "FotMob HT"}
+    # Opening FotMob must not depend on a Tipico detail endpoint. Its event
+    # identity comes from the clicked overview row (or the existing detail).
+    should_load = manual_refresh or (not detail_state and not (provider_view and event is not None))
+    if auto_refresh and tipico_view and detail_state:
+        loaded = parse_datetime(detail_state.get("loaded_at"))
+        should_load = should_load or loaded is None or (
+            datetime.now(timezone.utc) - loaded.astimezone(timezone.utc)
+        ).total_seconds() >= settings.event_market_refresh_seconds
 
-    if detail_state.get("error"):
-        st.warning(f"Letzter Detailabruf fehlgeschlagen: {detail_state['error']}")
-    details = detail_state["details"]
-    render_event_header(
-        details,
-        metrics=detail_state.get("metrics"),
-        stale=_detail_is_stale(detail_state, settings),
-    )
-    # Der Intent wird nur für den initialen Tab nach dem Klick verwendet. So
-    # bleibt ein späteres Widget-Rerun innerhalb der Analyse stabil und setzt
-    # nicht versehentlich wieder den Quoten-Tab zurück.
-    opening_intent = st.session_state.pop("detail_intent", None)
-    if opening_intent:
-        intent_labels = {
-            "analysis": "Analyse",
-            "quotes": "Quoten",
-            "fotmob": "FotMob",
-            "fotmob_live": "FotMob Live",
-        }
-        st.caption(
-            "Ansicht geöffnet über: "
-            + intent_labels.get(opening_intent, "Eventdetails")
-        )
-
-    if opening_intent == "quotes":
-        quotes_tab, analysis_tab, fotmob_live_tab, fotmob_tab, history_tab, raw_tab = st.tabs(
-            [
-                "Alle Tipico Märkte",
-                "Analyse",
-                "FotMob Live",
-                "FotMob HT",
-                "Odds History",
-                "Debug",
-            ]
-        )
-    elif opening_intent == "fotmob_live":
-        fotmob_live_tab, analysis_tab, fotmob_tab, quotes_tab, history_tab, raw_tab = st.tabs(
-            [
-                "FotMob Live",
-                "Analyse",
-                "FotMob HT",
-                "Alle Tipico Märkte",
-                "Odds History",
-                "Debug",
-            ]
-        )
-    else:
-        analysis_tab, fotmob_live_tab, fotmob_tab, quotes_tab, history_tab, raw_tab = st.tabs(
-            [
-                "Analyse",
-                "FotMob Live",
-                "FotMob HT",
-                "Alle Tipico Märkte",
-                "Odds History",
-                "Debug",
-            ]
-        )
-
-    with analysis_tab:
-        analysis = detail_state.get("analysis")
-        if analysis is None:
-            analysis = intelligence_service.analyze(
-                details,
-                observed_at=str(detail_state.get("loaded_at") or datetime.now(timezone.utc).isoformat()),
-                persist=settings.persist_ui_refresh,
-            )
-            detail_state["analysis"] = analysis
+    if should_load:
+        with st.spinner("Tipico-Quoten werden geladen …"):
+            result = market_service.load_event_details(selected_id, overview_event=overview_event)
+        if result.details is not None:
+            detail_state = {
+                "event_id": selected_id, "details": result.details, "metrics": result.metrics,
+                "loaded_at": result.metrics.response_received_at if result.metrics else datetime.now(timezone.utc).isoformat(),
+                "error": result.error,
+            }
             st.session_state.detail_state = detail_state
-        render_market_analysis(details, analysis, intelligence_service)
-    with quotes_tab:
-        from ui.market_view import render_markets
+            event = result.details.event
+        if result.error:
+            st.error(f"Quoten konnten nicht aktualisiert werden: {result.error}")
+        elif manual_refresh and result.success and result.metrics:
+            st.success(f"Quoten aktualisiert: {format_local_datetime(result.metrics.response_received_at)}")
 
-        render_markets(details)
-    with fotmob_live_tab:
-        render_fotmob_live_panel(
-            fotmob_live_service,
-            overview_event or details.event,
-        )
-    with fotmob_tab:
-        render_fotmob_tab(fotmob_service, details.event)
-    with history_tab:
-        history = database.odds_history_for_event(selected_id)
-        if history:
-            st.dataframe(
-                [
-                    {
-                        "Zeit": format_local_datetime(row["observed_at"]),
-                        "Markt": row["market_caption"] or row["market_id"],
-                        "Type": row["market_type"] or "—",
-                        "Auswahl": row["outcome_caption"] or row["outcome_id"],
-                        "Quote": (
-                            f"{row['odds']:.2f}" if row["odds"] is not None else "—"
-                        ),
-                        "Status": row["status"],
-                        "Verfügbar": bool(row["available"]),
-                        "Snapshot": str(row["snapshot_id"]) if row["snapshot_id"] else "—",
-                    }
-                    for row in history
-                ],
-                hide_index=True,
-                width="stretch",
+    with header:
+        if detail_state:
+            render_event_header(detail_state["details"], metrics=detail_state.get("metrics"),
+                                stale=_detail_is_stale(detail_state, settings))
+        elif event is not None:
+            st.subheader(f"{event.home_team} – {event.away_team}")
+            st.caption(f"{event.competition_country or 'Land unbekannt'} · {event.competition_name} · {event.score_label}")
+
+    with content:
+        if view == "FotMob Live" and event is not None:
+            render_fotmob_live_panel(fotmob_live_service, event)
+            return
+        if view == "FotMob HT" and event is not None:
+            render_fotmob_tab(fotmob_service, event)
+            return
+        if detail_state is None:
+            st.info("Für dieses Spiel konnten noch keine Eventdetails geladen werden. Bitte erneut aktualisieren.")
+            return
+        if detail_state.get("error"):
+            st.warning(f"Letzter Detailabruf fehlgeschlagen: {detail_state['error']}")
+        details = detail_state["details"]
+        if view == "Analyse":
+            analysis = detail_state.get("analysis")
+            if analysis is None:
+                analysis = intelligence_service.analyze(
+                    details,
+                    observed_at=str(detail_state.get("loaded_at") or datetime.now(timezone.utc).isoformat()),
+                    persist=settings.persist_ui_refresh,
+                )
+                detail_state["analysis"] = analysis
+                st.session_state.detail_state = detail_state
+            render_market_analysis(details, analysis, intelligence_service)
+        if view == "Alle Tipico Märkte":
+            from ui.market_view import render_markets
+
+            render_markets(details)
+        if view == "Odds History":
+            history = database.odds_history_for_event(selected_id)
+            if history:
+                st.dataframe(
+                    [
+                        {
+                            "Zeit": format_local_datetime(row["observed_at"]),
+                            "Markt": row["market_caption"] or row["market_id"],
+                            "Type": row["market_type"] or "—",
+                            "Auswahl": row["outcome_caption"] or row["outcome_id"],
+                            "Quote": (
+                                f"{row['odds']:.2f}" if row["odds"] is not None else "—"
+                            ),
+                            "Status": row["status"],
+                            "Verfügbar": bool(row["available"]),
+                            "Snapshot": str(row["snapshot_id"]) if row["snapshot_id"] else "—",
+                        }
+                        for row in history
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
+            else:
+                st.info("Für dieses Event gibt es noch keine Odds-History.")
+        if view == "Debug":
+            detail_metrics = detail_state.get("metrics")
+            if detail_metrics:
+                st.caption(f"Event {selected_id} · HTTP {detail_metrics.status_code} · {detail_metrics.response_time_ms} ms · {detail_metrics.payload_size} Bytes · {format_local_datetime(detail_metrics.response_received_at)}")
+            st.caption(
+                f"Raw-Payload bleibt unverändert. {details.market_count} Märkte / "
+                f"{details.outcome_count} Outcomes."
             )
-        else:
-            st.info("Für dieses Event gibt es noch keine Odds-History.")
-    with raw_tab:
-        st.caption(
-            f"Raw-Payload bleibt unverändert. {details.market_count} Märkte / "
-            f"{details.outcome_count} Outcomes."
-        )
-        with st.expander("Raw Tipico Data", expanded=False):
-            st.json(details.raw_data)
-        canonical = database.canonical_outcomes_for_event(selected_id, limit=300)
-        if canonical:
-            st.subheader("Canonical Outcomes")
-            st.dataframe(
-                [
-                    {
-                        "Zeit": format_local_datetime(row["observed_at"]),
-                        "Type": row["canonical_type"],
-                        "Scope": row["scope"],
-                        "Period": row["period"],
-                        "Side": row["side"] or "—",
-                        "Line": (
-                            f"{row['line']:g}" if row["line"] is not None else "—"
-                        ),
-                        "Quote": (
-                            f"{row['odds']:.2f}" if row["odds"] is not None else "—"
-                        ),
-                        "Status": row["status"],
-                        "Raw Type": row["raw_market_type"],
-                    }
-                    for row in canonical
-                ],
-                hide_index=True,
-                width="stretch",
-            )
+            with st.expander("Raw Tipico Data", expanded=False):
+                st.json(details.raw_data)
+            canonical = database.canonical_outcomes_for_event(selected_id, limit=300)
+            if canonical:
+                st.subheader("Canonical Outcomes")
+                st.dataframe(
+                    [
+                        {
+                            "Zeit": format_local_datetime(row["observed_at"]),
+                            "Type": row["canonical_type"],
+                            "Scope": row["scope"],
+                            "Period": row["period"],
+                            "Side": row["side"] or "—",
+                            "Line": (
+                                f"{row['line']:g}" if row["line"] is not None else "—"
+                            ),
+                            "Quote": (
+                                f"{row['odds']:.2f}" if row["odds"] is not None else "—"
+                            ),
+                            "Status": row["status"],
+                            "Raw Type": row["raw_market_type"],
+                        }
+                        for row in canonical
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
 
 
 def _detail_is_stale(detail_state: dict, settings: Settings) -> bool:
@@ -399,6 +339,9 @@ def main() -> None:
         layout="wide",
     )
     apply_responsive_style()
+    if st.session_state.pop("navigation_scroll_top", False):
+        from ui.components import scroll_to_top
+        scroll_to_top()
     device = detect_device()
     root_dir = Path(__file__).resolve().parent
     (
@@ -413,12 +356,14 @@ def main() -> None:
         fotmob_live_service,
     ) = get_runtime(str(root_dir))
 
-    st.sidebar.title("Tipico Live Observer")
+    st.sidebar.title("Match Observer")
+    st.sidebar.caption("TIPICO · FOTMOB · PAPER LAB")
     page = st.sidebar.radio(
         "Ansicht",
         ["Live", "Upcoming", "Halftime Scanner", "Paper Trading", "Data / Debug"],
+        format_func=lambda value: {"Live": "Live & Analyse", "Upcoming": "Kommende Spiele", "Halftime Scanner": "Halbzeit-Scanner", "Data / Debug": "Daten & System"}.get(value, value),
     )
-    st.sidebar.caption("V0.5 Dashboard · Paper Trading · REST/Polling")
+    st.sidebar.caption(f"V{APP_VERSION} · Paper Trading · REST/Polling")
     st.sidebar.caption(f"Gerät: {device.label}")
     st.sidebar.caption(f"Münchner Zeit: {current_munich_time()}")
 
@@ -472,12 +417,17 @@ def main() -> None:
             )
         return
 
+    if st.session_state.get("selected_event_id"):
+        _load_selected_detail(settings, event_service, market_service, database,
+                              intelligence_service, fotmob_service, fotmob_live_service)
+        return
+
     st_autorefresh(
         interval=settings.live_event_refresh_seconds * 1000,
         key="live-overview-autorefresh",
     )
 
-    st.title("Tipico Live Football")
+    st.title("Live-Spiele")
     force_refresh = st.button("Jetzt aktualisieren", type="primary")
     result = event_service.refresh() if force_refresh else event_service.refresh_if_due()
     _refresh_warning(event_service)
@@ -490,7 +440,7 @@ def main() -> None:
     )
     overview_metrics[2].metric(
         "Letztes Update",
-        format_local_datetime(event_service.last_success_at),
+        format_local_datetime(event_service.last_success_at).split(" ")[-1],
     )
     overview_metrics[3].metric(
         "API",

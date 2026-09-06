@@ -57,7 +57,7 @@ def test_settlement_classifies_zero_middle_two_plus_and_scope() -> None:
     assert settle_scores(halftime_home=1, halftime_away=1, final_home=1, final_away=1).status == "WIN_ZERO"
     assert settle_scores(halftime_home=1, halftime_away=1, final_home=2, final_away=1).status == "LOSS_MIDDLE"
     assert settle_scores(halftime_home=1, halftime_away=1, final_home=2, final_away=2).status == "WIN_TWO_PLUS"
-    assert settle_scores(halftime_home=1, halftime_away=1, final_home=2, final_away=2, extra_time=True).status == "VOID"
+    assert settle_scores(halftime_home=1, halftime_away=1, final_home=2, final_away=2, extra_time=True).status == "UNRESOLVED"
     assert settle_scores(halftime_home=1, halftime_away=1, final_home=2, final_away=2, extra_time=None).status == "UNRESOLVED"
 
 
@@ -81,6 +81,8 @@ def _event() -> LiveEvent:
         ht_score_home=1,
         ht_score_away=1,
         bet_markets_count=2,
+        extra_time=False,
+        penalties=False,
     )
 
 
@@ -97,8 +99,8 @@ def _seed_paper_database(path: Path) -> Database:
         )
     )
     for outcome_id, market_id, canonical_type, odds in (
-        ("zero", "m-zero", "REMAINING_TOTAL_UNDER", 2.2),
-        ("two", "m-two", "REMAINING_TOTAL_OVER", 2.1),
+        ("zero", "m-zero", "REMAINING_TOTAL_UNDER", 3.4),
+        ("two", "m-two", "REMAINING_TOTAL_OVER", 2.3),
     ):
         database.save_canonical_outcomes(
             [
@@ -110,6 +112,7 @@ def _seed_paper_database(path: Path) -> Database:
                     raw_market_type="test-market", raw_market_caption="Test",
                     raw_fixed_param="", raw_choice_param=None,
                     raw_outcome_caption=outcome_id,
+                    settlement_scope="REGULATION_NO_EXTRA_TIME",
                 )
             ]
         )
@@ -121,6 +124,25 @@ def _seed_paper_database(path: Path) -> Database:
         payout_difference=1.5, covered_profit=1.5, win_roi=.05, p1_max=.5,
         p1_tipico=.2, p1_buffer=.3, p_zero=.45, p_one=.2, p_two_plus=.35,
     )
+    from paper.journal import PaperJournal
+    from dataclasses import asdict
+    from types import SimpleNamespace
+    from paper.market import capture_market
+    from intelligence.models import ProbabilityResult
+    from intelligence.strategy import calculate_zero_or_2plus
+    rows = database.canonical_quotes_for_evaluation(event.event_id, OBSERVED, ("REMAINING_TOTAL_UNDER", "REMAINING_TOTAL_OVER"))
+    allowed = CanonicalOutcome.__dataclass_fields__
+    outcomes = [CanonicalOutcome(**{key: row[key] for key in allowed}) for row in rows]
+    zero = next(q for q in outcomes if q.outcome_id == "zero")
+    two = next(q for q in outcomes if q.outcome_id == "two")
+    analysis = SimpleNamespace(
+        observed_at=OBSERVED, normalized_outcomes=outcomes,
+        zero_equivalence=SimpleNamespace(best_odds=SimpleNamespace(selected=zero)),
+        two_plus_equivalence=SimpleNamespace(best_odds=SimpleNamespace(selected=two)),
+        strategy=calculate_zero_or_2plus(3.4, 2.3, p1_tipico=.2),
+        probability=ProbabilityResult(status="OK", p0=.3, p1=.2, p2_plus=.5),
+    )
+    PaperJournal(database).publish(capture_market(event, analysis))
     return database
 
 

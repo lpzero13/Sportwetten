@@ -56,29 +56,18 @@ def render_event_header(
     """Render the shared event context above the detail tabs."""
 
     event = details.event
-    st.subheader(f"{event.home_team} – {event.away_team}")
-    st.caption(
-        f"{event.competition_name} · {event.competition_country or 'Land unbekannt'} · {event.display_minute} · "
-        f"{event.score_label} · Phase: {event.period}"
+    from ui.components import text
+    st.markdown(
+        '<section class="w-match"><div>'
+        f'<p class="w-eyebrow">{text(event.competition_country or "Land unbekannt")} · {text(event.competition_name)}</p>'
+        f'<h2>{text(event.home_team)} – {text(event.away_team)}</h2>'
+        f'<p>{details.market_count} Märkte · {details.outcome_count} Auswahlen · Tipico</p></div>'
+        f'<div class="w-score"><strong>{text(event.score_label)}</strong><small>{text(event.display_minute)} · {text(event.period)}</small></div></section>',
+        unsafe_allow_html=True,
     )
-
-    columns = st.columns(4)
-    columns[0].metric("Tipico Event ID", event.event_id)
-    columns[1].metric("Märkte", details.market_count)
-    columns[2].metric("Outcomes", details.outcome_count)
-    columns[3].metric("Datenalter", _age_label(_age_seconds(metrics)))
 
     if stale:
         st.warning("⚠ STALE – die angezeigten Eventdetails sind älter als der Grenzwert.")
-
-    if metrics is not None:
-        st.caption(
-            f"Letzte Aktualisierung: "
-            f"{format_local_datetime(metrics.response_received_at)} · "
-            f"HTTP {metrics.status_code} · {metrics.response_time_ms} ms · "
-            f"{metrics.payload_size} Bytes"
-        )
-
 
 def _age_label(age: float | None) -> str:
     if age is None:

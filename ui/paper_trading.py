@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 from typing import Any
 
 import streamlit as st
@@ -11,6 +12,9 @@ import streamlit as st
 from paper.analytics import calibration_rows, grouped_trade_rows, portfolio_analytics
 from paper.models import PaperPortfolio
 from paper.service import PaperTradingService
+from paper.journal import PaperJournal
+from paper.market import timestamp
+from datetime import datetime, timezone
 from storage.database import Database
 from ui.time_format import format_local_datetime
 
@@ -46,6 +50,7 @@ def _trade_row(row: Any, currency: str) -> dict[str, Any]:
         "P1": _percent(row["p1_tipico"]),
         "Puffer": _percent(row["p1_buffer"]),
         "Trade-ID": row["paper_trade_id"],
+        "Regelversion": row["portfolio_version"],
     }
 
 
@@ -111,6 +116,9 @@ def _render_create_form(service: PaperTradingService, database: Database) -> Non
     with st.expander("Neues Paper-Portfolio", expanded=not bool(service.portfolios(include_archived=True))):
         with st.form("create-paper-portfolio"):
             name = st.text_input("Name", value="Tipico HZ Test")
+            family = st.selectbox("Strategiefamilie", ["MARKET_STRUCTURE", "MARKET_ONLY"],
+                                  format_func=lambda value: "Quotenstruktur testen (ohne P1-Prognose)" if value == "MARKET_STRUCTURE" else "Markt-P1 gegen Break-even prüfen")
+            st.caption("Quotenstruktur ist ein Experiment. Ein positiver Gewinn im abgedeckten Fall ist noch kein positiver Erwartungswert.")
             first = st.columns(2)
             bankroll = first[0].number_input("Startkapital (€)", min_value=1.0, value=1000.0, step=50.0)
             mode = first[1].selectbox("Einsatzmodus", ["FIXED", "BANKROLL_PERCENTAGE"], format_func=lambda value: "Fester Einsatz" if value == "FIXED" else "% vom verfügbaren Kapital")
@@ -128,6 +136,10 @@ def _render_create_form(service: PaperTradingService, database: Database) -> Non
             fifth = st.columns(2)
             min_q_zero = fifth[0].number_input("Min. Quote 0", min_value=1.01, value=1.01, step=0.05)
             min_q_two = fifth[1].number_input("Min. Quote 2+", min_value=1.01, value=1.01, step=0.05)
+            timing = st.columns(3)
+            window_start = timing[0].number_input("Einstieg ab HZ (Sekunden)", min_value=0, max_value=1800, value=0)
+            window_end = timing[1].number_input("Einstieg bis HZ (Sekunden)", min_value=0, max_value=1800, value=120)
+            min_break_even = timing[2].number_input("Min. P1-Break-even (%)", min_value=0.0, max_value=100.0, value=0.0) / 100
             all_competitions = st.checkbox("Alle Wettbewerbe zulassen", value=True)
             selected = st.multiselect(
                 "Wettbewerbe",
@@ -141,6 +153,10 @@ def _render_create_form(service: PaperTradingService, database: Database) -> Non
             try:
                 service.create_portfolio(
                     name=name,
+                    family=family,
+                    minimum_p1_break_even=min_break_even,
+                    entry_window_start_seconds=int(window_start),
+                    entry_window_end_seconds=int(window_end),
                     starting_bankroll=bankroll,
                     stake_mode=mode,
                     fixed_stake=fixed_stake if mode == "FIXED" else None,
@@ -164,34 +180,77 @@ def _render_create_form(service: PaperTradingService, database: Database) -> Non
 
 
 def _render_signals(database: Database, portfolio: PaperPortfolio) -> None:
-    with database._lock:  # noqa: SLF001 - read-only dashboard query
-        rows = database.connection.execute(
-            """
-            SELECT signal_id, observed_at, event_id, evaluation_id,
-                   decision, reason, details_json
-            FROM paper_signal_log
-            WHERE portfolio_id = ?
-            ORDER BY signal_id DESC LIMIT 300
-            """,
-            (portfolio.portfolio_id,),
-        ).fetchall()
+    rows = PaperJournal(database).decision_rows(portfolio.portfolio_id)
     if not rows:
-        st.info("Noch keine Paper-Signale protokolliert.")
+        st.info("Noch keine Entscheidungen mit gespeichertem Markt-Snapshot.")
         return
-    st.dataframe(
-        [
-            {
-                "Zeit": format_local_datetime(row["observed_at"]),
-                "Event": row["event_id"],
-                "Entscheidung": row["decision"],
-                "Grund": row["reason"],
-                "Details": row["details_json"],
-            }
-            for row in rows
-        ],
-        hide_index=True,
-        width="stretch",
-    )
+    labels = {
+        "ENTRY_CREATED": "Virtueller Einstieg gespeichert",
+        "QUOTE_TOO_OLD": "Quoten sind zu alt",
+        "NOT_HALFTIME": "Spiel ist nicht mehr in der Halbzeitpause",
+        "MISSING_QUOTES": "Eine der beiden Zielquoten fehlt",
+        "MARKET_NOT_OPEN": "Markt ist gesperrt",
+        "MARKET_PROBABILITY_UNAVAILABLE": "P1 kann aus den vorhandenen Märkten nicht berechnet werden",
+        "MINIMUM_P1_BUFFER_NOT_MET": "Markt-Edge liegt unter dem Grenzwert",
+        "ENTRY_WINDOW_EXPIRED": "Konfiguriertes Einstiegsfenster ist vorbei",
+        "BREAK_EVEN_BELOW_THRESHOLD": "Break-even liegt unter dem Grenzwert",
+        "SETTLEMENT_SCOPE_UNKNOWN": "Reguläre Spielzeit ist nicht eindeutig bestätigt",
+        "MARKET_SEMANTICS_MISMATCH": "Markt beschreibt nicht das benötigte Ereignis",
+    }
+    st.caption("Jede Zeile gehört zu einer konkreten Beobachtung und Regelversion. Ein Spiel kann mehrere NO_BET-Entscheidungen vor einem späteren Einstieg haben.")
+    st.dataframe([{
+        "Zeit": format_local_datetime(row["decided_at"]),
+        "Spiel": " – ".join(json.loads(row["payload_json"])["event"].get(k, "") for k in ("home_team", "away_team")),
+        "Version": row["portfolio_version"], "Entscheidung": row["decision"],
+        "Grund": labels.get(row["reason"], row["reason"]),
+        "Ergebnis": row["result_status"] or "Ausstehend",
+    } for row in rows], hide_index=True, width="stretch")
+    index = st.selectbox("Entscheidung und Spielablauf ansehen", range(len(rows)), format_func=lambda i:
+        f'{format_local_datetime(rows[i]["decided_at"])} · {rows[i]["event_id"]} · {rows[i]["decision"]}',
+        key=f"paper-evidence-{portfolio.portfolio_id}")
+    row = rows[index]
+    context = json.loads(row["payload_json"])
+    event = context["event"]
+    zero, two = context.get("zero"), context.get("two_plus")
+    probability = context["probability"]
+    st.write(f'{event["home_team"]} – {event["away_team"]} · {event.get("competition_country") or "Land unbekannt"} · {event.get("competition_name")}')
+    st.write(f'Halbzeit: {event.get("ht_score_home")}:{event.get("ht_score_away")} · Regelversion {row["portfolio_version"]}')
+    st.dataframe([
+        {"Schritt": "Halbzeit erkannt", "Stand": format_local_datetime(context.get("halftime_observed_at"))},
+        {"Schritt": "Quoten gemeinsam beobachtet", "Stand": format_local_datetime(context["observed_at"])},
+        {"Schritt": "Quoten vollständig", "Stand": "Ja" if zero and two else "Nein"},
+        {"Schritt": "P1-Schätzung", "Stand": probability["status"]},
+        {"Schritt": "Entscheidung", "Stand": f'{row["decision"]}: {labels.get(row["reason"], row["reason"])}'},
+        {"Schritt": "Endergebnis bestätigt", "Stand": row["result_status"] or "Ausstehend"},
+    ], hide_index=True, width="stretch")
+    if zero and two:
+        from intelligence.strategy import calculate_zero_or_2plus
+        calc = calculate_zero_or_2plus(zero["odds"], two["odds"], total_stake=100,
+                                      p1_tipico=probability.get("p1") if probability["status"] == "OK" else None)
+        st.dataframe([
+            {"Ergebnis HZ2": "0 Tore", "Quote": zero["odds"], "Einsatz bei 100 €": calc.stake_zero, "Gewinn/Verlust": calc.payout_zero - 100},
+            {"Ergebnis HZ2": "Genau 1 Tor", "Quote": None, "Einsatz bei 100 €": None, "Gewinn/Verlust": -100},
+            {"Ergebnis HZ2": "Mindestens 2 Tore", "Quote": two["odds"], "Einsatz bei 100 €": calc.stake_two_plus, "Gewinn/Verlust": calc.payout_two_plus - 100},
+        ], hide_index=True, width="stretch")
+        st.write(f'P1-Break-even: {_percent(calc.p1_max)} · Markt-P1: {_percent(calc.p1_tipico)} · Markt-Edge: {_percent(calc.p1_buffer)}')
+        if calc.p1_tipico is not None and probability.get("p0") is not None and probability.get("p2_plus") is not None:
+            ev = (probability["p0"] * calc.payout_zero + probability["p2_plus"] * calc.payout_two_plus) / 100 - 1
+            st.write(f'Geschätzter Erwartungswert laut Marktmodell: {_percent(ev)} · P1 nach Power-Methode: {_percent(probability.get("p1_power"))}')
+        if probability.get("execution_reference_overlap"):
+            st.caption("P1-Schätzung und Einstiegsquoten verwenden teilweise dieselben Märkte. Das ist keine unabhängige Bestätigung eines Vorteils.")
+    trades = [trade for trade in database.paper_trade_rows(portfolio.portfolio_id) if trade["event_id"] == row["event_id"]]
+    if trades:
+        trade = trades[0]
+        st.write(f'Trade: {trade["status"]} · Einsatz: {_money(trade["stake_total"])} · P/L: {_money(trade["pnl"])}')
+        if trade["settlement_reason"]:
+            st.caption(f'Abrechnung: {trade["settlement_reason"]}')
+    if row["result_json"]:
+        result = json.loads(row["result_json"])
+        st.write(f'Zweite Halbzeit: {result.get("second_half_goals") if result.get("second_half_goals") is not None else "noch ungeklärt"} Tore · {result.get("target_h2_class") or ""}')
+    with st.expander("Gespeicherte Quellen, Strategie und Ergebnisbeleg"):
+        st.json({"entry_observation": context, "strategy": json.loads(row["config_json"]),
+                 "decision_details": json.loads(row["details_json"]),
+                 "result": json.loads(row["result_json"] or "{}")})
 
 
 def _csv_export(rows: list[Any], currency: str) -> str:
@@ -239,6 +298,9 @@ def _render_selected_portfolio(service: PaperTradingService, database: Database,
     with st.expander("Portfolio-Regeln bearbeiten", expanded=False):
         with st.form("edit-paper-portfolio-" + portfolio.portfolio_id):
             name = st.text_input("Name", value=portfolio.name)
+            family = st.selectbox("Strategiefamilie", ["MARKET_STRUCTURE", "MARKET_ONLY"],
+                                  index=0 if portfolio.family == "MARKET_STRUCTURE" else 1)
+            st.caption("Geänderte Regeln erhalten eine neue Version. Bestehende Einstiege behalten ihre ursprünglichen Regeln.")
             mode = st.selectbox(
                 "Einsatzmodus",
                 ["FIXED", "BANKROLL_PERCENTAGE"],
@@ -258,6 +320,10 @@ def _render_selected_portfolio(service: PaperTradingService, database: Database,
                 "Max. Quotenalter (s)", min_value=1,
                 value=int(portfolio.max_quote_age_seconds), step=1,
             )
+            timing = st.columns(3)
+            window_start = timing[0].number_input("Einstieg ab HZ (s)", min_value=0, max_value=1800, value=portfolio.entry_window_start_seconds)
+            window_end = timing[1].number_input("Einstieg bis HZ (s)", min_value=0, max_value=1800, value=portfolio.entry_window_end_seconds)
+            min_break_even = timing[2].number_input("Min. P1-Break-even (%)", min_value=0.0, max_value=100.0, value=float(portfolio.minimum_p1_break_even) * 100) / 100
             threshold_columns = st.columns(3)
             min_roi = threshold_columns[0].number_input("Min. Win-ROI (%)", value=float(portfolio.minimum_win_roi * 100), step=0.5) / 100
             min_buffer = threshold_columns[1].number_input("Min. P1-Puffer (%)", value=float(portfolio.minimum_p1_buffer * 100), step=0.5) / 100
@@ -276,6 +342,10 @@ def _render_selected_portfolio(service: PaperTradingService, database: Database,
             if st.form_submit_button("Änderungen speichern", type="primary", width="stretch"):
                 service.update_portfolio(
                     portfolio.portfolio_id,
+                    family=family,
+                    minimum_p1_break_even=min_break_even,
+                    entry_window_start_seconds=int(window_start),
+                    entry_window_end_seconds=int(window_end),
                     name=name,
                     stake_mode=mode,
                     fixed_stake=fixed_stake if mode == "FIXED" else None,
@@ -398,10 +468,27 @@ def render_paper_trading(
     else:
         st.warning("Paper-Trading ist global pausiert; es werden keine neuen Trades eröffnet.")
     worker_seen = database.get_paper_runtime_setting("worker_last_seen_at")
-    st.caption(
-        "Paper-Worker letzter Lauf: "
-        + (format_local_datetime(worker_seen) if worker_seen else "noch nicht ausgeführt")
-    )
+    health = PaperJournal(database).health()
+    settlement_result = json.loads(database.get_paper_runtime_setting("settlement_last_result", "{}") or "{}")
+    if settlement_result.get("settlement_errors"):
+        st.warning("Die letzte Ergebnisabfrage hatte Fehler. Betroffene Trades bleiben offen und werden erneut geprüft.")
+    last = health["last_worker"]
+    last_seen = timestamp(last["finished_at"]) if last else None
+    worker_age = (datetime.now(timezone.utc) - last_seen).total_seconds() if last_seen else None
+    if not last_seen or worker_age > 60:
+        import os
+        start_hint = "Unter Windows START_TIPICO.bat öffnen; STATUS_TIPICO.bat zeigt alle Dienste." if os.name == "nt" else "Auf dem Server wetten-paper.service prüfen."
+        st.error("Paper-Worker meldet sich nicht aktuell. " + start_hint)
+    elif last["errors"]:
+        st.error(f"Der letzte Worker-Lauf hatte {last['errors']} Fehler: {last['error_message'] or 'Details in den Entscheidungen und im Worker-Log.'}")
+    else:
+        st.caption(f"Worker zuletzt: {format_local_datetime(worker_seen)} · Offene Trades: {health['open_trades']}")
+    if health["active_portfolios"] == 0:
+        st.info("Noch keine aktive Strategie. Ein Portfolio anlegen oder aktivieren, damit Entscheidungen entstehen.")
+    if not health["last_market_observation"]:
+        st.info("Noch keine gemeinsam gespeicherte Halbzeit-Beobachtung. Collector und Paper-Worker müssen beide auf dem neuen Stand laufen.")
+    if health["legacy_unresolved"]:
+        st.warning(f"{health['legacy_unresolved']} ältere Trades wurden vom früheren Worker als UNRESOLVED abgeschlossen und erstattet. Sie bleiben als Altbestand getrennt; neue ungeklärte Trades bleiben offen.")
     _render_create_form(service, database)
     portfolios = service.portfolios(include_archived=False)
     if not portfolios:

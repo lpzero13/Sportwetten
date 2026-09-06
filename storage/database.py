@@ -701,6 +701,50 @@ CREATE TABLE IF NOT EXISTS paper_worker_runs (
 CREATE INDEX IF NOT EXISTS idx_paper_worker_runs_started
     ON paper_worker_runs(started_at DESC, run_id DESC);
 
+CREATE TABLE IF NOT EXISTS paper_market_state (
+    event_id TEXT PRIMARY KEY,
+    observed_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_paper_market_observed ON paper_market_state(observed_at);
+CREATE TABLE IF NOT EXISTS paper_observations (
+    observation_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_paper_observation_event ON paper_observations(event_id, observed_at);
+CREATE TABLE IF NOT EXISTS paper_decisions (
+    decision_id TEXT PRIMARY KEY,
+    portfolio_id TEXT NOT NULL,
+    portfolio_version INTEGER NOT NULL,
+    config_hash TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    observation_id TEXT NOT NULL REFERENCES paper_observations(observation_id),
+    decided_at TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    details_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_paper_decision_portfolio ON paper_decisions(portfolio_id, decided_at);
+CREATE TABLE IF NOT EXISTS paper_result_checks (
+    event_id TEXT PRIMARY KEY,
+    checked_at TEXT NOT NULL,
+    next_check_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    evidence_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_settlement_audit (
+    audit_id TEXT PRIMARY KEY,
+    paper_trade_id TEXT NOT NULL REFERENCES paper_trades(paper_trade_id),
+    checked_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    evidence_json TEXT NOT NULL
+);
+
 -- Optional FotMob V0.5.2 historical catalog.  The tables live in the core
 -- schema so a database opened by the UI already has the catalog contract;
 -- fotmob.history_storage repeats the IF NOT EXISTS script for older DBs.
@@ -1043,7 +1087,7 @@ SNAPSHOT_COLUMNS = (
     "p2plus_market", "p1_break_even", "p1_buffer", "win_roi",
     "normalizer_version", "strategy_version", "relevant_markets_json",
     "goal_at", "reopen_at", "reopen_delay_seconds", "archive_path",
-    "exported_at", "payload_hash",
+    "exported_at", "payload_hash", "extra_time", "penalties",
 )
 
 # Keep the production strategy-event serializer and every INSERT path on one
@@ -1135,6 +1179,15 @@ class Database:
         ):
             self._ensure_column("snapshots", column, definition)
         self._ensure_column("paper_trades", "entry_raw_payload_path", "TEXT")
+        self._ensure_column("paper_portfolios", "family", "TEXT NOT NULL DEFAULT 'MARKET_ONLY'")
+        self._ensure_column("paper_portfolios", "minimum_p1_break_even", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("paper_trades", "observation_id", "TEXT")
+        self._ensure_column("paper_trades", "portfolio_version", "INTEGER")
+        self._ensure_column("paper_trades", "config_hash", "TEXT")
+        self._ensure_column("paper_trades", "family", "TEXT")
+        self._ensure_column("snapshots", "extra_time", "INTEGER")
+        self._ensure_column("snapshots", "penalties", "INTEGER")
+        self._ensure_column("paper_market_state", "raw_payload_json", "TEXT")
         for column, definition in (
             ("connection_pool_size", "INTEGER"),
             ("cpu_time_seconds", "REAL"),
@@ -3532,6 +3585,7 @@ class Database:
             "minimum_p1_buffer", "maximum_tipico_p1", "minimum_q_zero",
             "minimum_q_two_plus", "max_quote_age_seconds", "entry_window_start_seconds",
             "entry_window_end_seconds", "allow_all_competitions", "status", "version",
+            "family", "minimum_p1_break_even",
         )
         params = tuple(values.get(column) for column in columns)
         with self._lock:
@@ -3568,6 +3622,7 @@ class Database:
             "minimum_win_roi", "minimum_p1_buffer", "maximum_tipico_p1", "minimum_q_zero",
             "minimum_q_two_plus", "max_quote_age_seconds", "entry_window_start_seconds",
             "entry_window_end_seconds", "allow_all_competitions", "status", "version",
+            "family", "minimum_p1_break_even",
         }
         assignments = [(key, values[key]) for key in values if key in allowed]
         if not assignments and competition_ids is None:
@@ -3719,6 +3774,31 @@ class Database:
                 if str(portfolio["status"]).upper() != "ACTIVE":
                     self.connection.rollback()
                     return False, None, "PORTFOLIO_NOT_ACTIVE"
+                if self.get_paper_runtime_setting("enabled", "1") != "1":
+                    self.connection.rollback()
+                    return False, None, "PAPER_DISABLED"
+                current_version = self.connection.execute(
+                    "SELECT version FROM paper_portfolios WHERE portfolio_id = ?", (portfolio_id,)
+                ).fetchone()
+                if snapshot.get("portfolio_version") is not None and int(current_version["version"]) != int(snapshot["portfolio_version"]):
+                    self.connection.rollback()
+                    return False, None, "STRATEGY_CHANGED_DURING_ENTRY"
+                entry = snapshot.get("entry_snapshot", {})
+                if entry.get("market_context"):
+                    from paper.market import digest, encode, is_halftime
+                    context = entry["market_context"]
+                    latest_market = self.connection.execute(
+                        "SELECT payload_json FROM paper_market_state WHERE event_id = ?", (event_id,)
+                    ).fetchone()
+                    if not latest_market or digest(json.loads(latest_market[0])) != snapshot["observation_id"]:
+                        self.connection.rollback()
+                        return False, None, "MARKET_CHANGED_DURING_ENTRY"
+                    current_event = self.connection.execute(
+                        "SELECT * FROM current_event_state WHERE event_id = ?", (event_id,)
+                    ).fetchone()
+                    if current_event and not is_halftime(dict(current_event)):
+                        self.connection.rollback()
+                        return False, None, "NOT_HALFTIME"
                 balance_row = self.connection.execute(
                     """
                     SELECT p.starting_bankroll + COALESCE(SUM(t.amount), 0) AS balance
@@ -3734,6 +3814,12 @@ class Database:
                     self.connection.rollback()
                     return False, None, "INSUFFICIENT_BANKROLL"
                 balance_after = balance_before - stake
+                snapshot = dict(snapshot)
+                snapshot["bankroll_before"] = balance_before
+                snapshot["bankroll_after"] = balance_after
+                if snapshot.get("entry_snapshot"):
+                    snapshot["entry_snapshot"] = {**snapshot["entry_snapshot"],
+                                                  "bankroll_before": balance_before, "bankroll_after": balance_after}
                 trade_columns = (
                     "paper_trade_id", "portfolio_id", "event_id", "competition_id",
                     "competition_name", "competition_country", "created_at",
@@ -3748,6 +3834,7 @@ class Database:
                     "stake_zero", "stake_two_plus", "payout_zero", "payout_two_plus",
                     "p_zero", "p_one", "p_two_plus", "p1_max", "p1_tipico", "p1_buffer",
                     "win_roi", "entry_raw_payload_path", "bankroll_before", "bankroll_after", "rank", "status",
+                    "observation_id", "portfolio_version", "config_hash", "family",
                     "entry_snapshot_json",
                 )
                 trade_params = tuple(snapshot.get(column) for column in trade_columns[:-1]) + (
@@ -3757,6 +3844,17 @@ class Database:
                     f"INSERT INTO paper_trades ({', '.join(trade_columns)}) VALUES ({', '.join('?' for _ in trade_columns)})",
                     trade_params,
                 )
+                if entry.get("market_context"):
+                    observation_id = snapshot["observation_id"]
+                    self.connection.execute("INSERT OR IGNORE INTO paper_observations VALUES (?, ?, ?, ?)",
+                                            (observation_id, event_id, context["observed_at"], encode(context)))
+                    self.connection.execute(
+                        "INSERT OR IGNORE INTO paper_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (digest([portfolio_id, snapshot["portfolio_version"], observation_id, "BET", "ENTRY_CREATED"]),
+                         portfolio_id, snapshot["portfolio_version"], snapshot["config_hash"], event_id,
+                         observation_id, snapshot["created_at"], "BET", "ENTRY_CREATED", encode(entry["strategy_config"]),
+                         encode({"trade_id": snapshot["paper_trade_id"]})),
+                    )
                 self.connection.execute(
                     """
                     INSERT INTO paper_bankroll_transactions (
@@ -3792,6 +3890,8 @@ class Database:
 
         trade_id = str(paper_trade_id)
         status = str(settlement["status"])
+        if status not in {"WIN_ZERO", "WIN_TWO_PLUS", "LOSS_MIDDLE", "VOID", "UNRESOLVED"}:
+            raise ValueError(f"Unsupported settlement status: {status}")
         with self._lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
@@ -3805,9 +3905,18 @@ class Database:
                 if str(trade["status"]).upper() != "OPEN":
                     self.connection.rollback()
                     return False, trade
+                if status == "UNRESOLVED":
+                    self.connection.execute(
+                        "UPDATE paper_trades SET settlement_reason = ? WHERE paper_trade_id = ? AND status = 'OPEN'",
+                        (str(settlement.get("reason") or "RESULT_PENDING"), trade_id),
+                    )
+                    self.connection.commit()
+                    return False, self.connection.execute(
+                        "SELECT * FROM paper_trades WHERE paper_trade_id = ?", (trade_id,)
+                    ).fetchone()
                 stake = float(trade["stake_total"] or 0)
                 return_amount = float(settlement.get("return_amount") or 0)
-                release = stake if status in {"VOID", "UNRESOLVED"} else 0.0
+                release = stake if status == "VOID" else 0.0
                 ledger_amount = return_amount + release
                 balance_row = self.connection.execute(
                     """

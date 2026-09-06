@@ -120,11 +120,15 @@ class MarketIntelligenceService:
             snapshot_id=snapshot_id,
         )
         if persist and self.database is not None:
-            self._persist(analysis)
+            self._persist(analysis, details.event, details.raw_data)
         return analysis
 
-    def _persist(self, analysis: MarketAnalysis) -> None:
+    def _persist(self, analysis: MarketAnalysis, event: Any, raw_payload: dict[str, Any]) -> None:
         try:
+            from paper.journal import PaperJournal
+            from paper.market import capture_market
+
+            PaperJournal(self.database).publish(capture_market(event, analysis), raw_payload=raw_payload if self.settings.raw_paper_entry else None)
             strategy = analysis.strategy
             status = (
                 strategy.status

@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from decimal import Decimal
+from dataclasses import asdict, dataclass, field
+from decimal import Decimal, InvalidOperation
+import hashlib
+import json
 from typing import Any
 
 
 PAPER_STRATEGY = "ZERO_OR_2PLUS"
 PORTFOLIO_STATUSES = {"ACTIVE", "PAUSED", "ARCHIVED"}
 STAKE_MODES = {"FIXED", "BANKROLL_PERCENTAGE"}
+STRATEGY_FAMILIES = {"MARKET_STRUCTURE", "MARKET_ONLY"}
 
 
 def decimal_value(value: Any, default: Decimal | None = None) -> Decimal | None:
     if value is None or value == "":
         return default
     try:
-        return Decimal(str(value))
-    except (TypeError, ValueError):
+        result = Decimal(str(value))
+        return result if result.is_finite() else default
+    except (TypeError, ValueError, InvalidOperation):
         return default
 
 
@@ -47,6 +51,19 @@ class PaperPortfolio:
     selected_competition_ids: tuple[str, ...] = field(default_factory=tuple)
     status: str = "ACTIVE"
     version: int = 1
+    family: str = "MARKET_ONLY"
+    minimum_p1_break_even: Decimal = Decimal("0")
+
+    def config(self) -> dict[str, Any]:
+        """Identity of the rules, independent of display name and pause state."""
+        values = asdict(self)
+        for key in ("portfolio_id", "name", "created_at", "updated_at", "status", "version"):
+            values.pop(key, None)
+        return json.loads(json.dumps(values, default=str, sort_keys=True))
+
+    @property
+    def config_hash(self) -> str:
+        return hashlib.sha256(json.dumps(self.config(), sort_keys=True).encode()).hexdigest()
 
     @classmethod
     def from_row(
@@ -54,6 +71,7 @@ class PaperPortfolio:
         row: Any,
         selected_competition_ids: tuple[str, ...] = (),
     ) -> "PaperPortfolio":
+        row = dict(row)
         return cls(
             portfolio_id=str(row["portfolio_id"]),
             name=str(row["name"]),
@@ -69,7 +87,7 @@ class PaperPortfolio:
             max_stake=decimal_value(row["max_stake"]),
             minimum_win_roi=decimal_value(row["minimum_win_roi"], Decimal("0")) or Decimal("0"),
             minimum_p1_buffer=decimal_value(row["minimum_p1_buffer"], Decimal("0")) or Decimal("0"),
-            maximum_tipico_p1=decimal_value(row["maximum_tipico_p1"], Decimal("1")) or Decimal("1"),
+            maximum_tipico_p1=decimal_value(row["maximum_tipico_p1"], Decimal("1")),
             minimum_q_zero=decimal_value(row["minimum_q_zero"], Decimal("1")) or Decimal("1"),
             minimum_q_two_plus=decimal_value(row["minimum_q_two_plus"], Decimal("1")) or Decimal("1"),
             max_quote_age_seconds=int(row["max_quote_age_seconds"] or 10),
@@ -79,6 +97,8 @@ class PaperPortfolio:
             selected_competition_ids=tuple(selected_competition_ids),
             status=str(row["status"] or "ACTIVE"),
             version=int(row["version"] or 1),
+            family=str(row.get("family") or "MARKET_ONLY"),
+            minimum_p1_break_even=decimal_value(row.get("minimum_p1_break_even"), Decimal("0")),
         )
 
 

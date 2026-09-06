@@ -134,7 +134,8 @@ def test_collector_status_contains_identity_gates_and_outbox_contract(tmp_path: 
 
     status = collector.status(force_refresh=True)
 
-    assert status["app_version"] == "0.5.9.1"
+    from runtime_status import APP_VERSION
+    assert status["app_version"] == APP_VERSION
     assert status["config_fingerprint"].startswith("sha256:")
     assert "git_commit" in status and "git_branch" in status
     assert "feature_runtime_matrix" in status

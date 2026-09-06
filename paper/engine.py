@@ -11,9 +11,9 @@ from .models import PaperPortfolio, SettlementResult, SignalDecision, decimal_va
 CENT = Decimal("0.01")
 NORMAL_SETTLEMENT_STATUSES = {
     "FINISHED", "FINAL", "ENDED", "END", "COMPLETED", "SETTLED", "FULL_TIME",
-    "NO_LONGER_LIVE_FINAL",
+    "NO_LONGER_LIVE_FINAL", "COMPLETE",
 }
-VOID_STATUSES = {"ABORTED", "CANCELLED", "CANCELED", "POSTPONED", "SUSPENDED", "VOID"}
+VOID_STATUSES = {"VOID"}  # Provider interruption alone is not proof of a void bet.
 
 
 def _cent(value: Decimal) -> Decimal:
@@ -71,6 +71,8 @@ def evaluate_signal(
 
     if portfolio.strategy_type != "ZERO_OR_2PLUS":
         return SignalDecision(False, "UNSUPPORTED_STRATEGY")
+    if portfolio.family not in {"MARKET_ONLY", "MARKET_STRUCTURE"}:
+        return SignalDecision(False, "UNSUPPORTED_FAMILY")
     if str(value("status", "")).upper() != "OK":
         return SignalDecision(False, f"EVALUATION_{str(value('status', 'UNKNOWN')).upper()}")
 
@@ -84,12 +86,18 @@ def evaluate_signal(
     win_roi = decimal_value(value("win_roi"))
     if win_roi is None or win_roi < portfolio.minimum_win_roi:
         return SignalDecision(False, "MINIMUM_WIN_ROI_NOT_MET", details={"win_roi": win_roi})
-    p1_buffer = decimal_value(value("p1_buffer"))
-    if p1_buffer is None or p1_buffer < portfolio.minimum_p1_buffer:
-        return SignalDecision(False, "MINIMUM_P1_BUFFER_NOT_MET", details={"p1_buffer": p1_buffer})
-    p1_tipico = decimal_value(value("p1_tipico"))
-    if p1_tipico is None or p1_tipico > portfolio.maximum_tipico_p1:
-        return SignalDecision(False, "MAXIMUM_TIPICO_P1_EXCEEDED", details={"p1_tipico": p1_tipico})
+    p1_max = decimal_value(value("p1_max"))
+    if p1_max is not None and p1_max < portfolio.minimum_p1_break_even:
+        return SignalDecision(False, "BREAK_EVEN_BELOW_THRESHOLD")
+    if portfolio.family == "MARKET_ONLY":
+        p1_buffer = decimal_value(value("p1_buffer"))
+        p1_tipico = decimal_value(value("p1_tipico"))
+        if p1_buffer is None or p1_tipico is None:
+            return SignalDecision(False, "MARKET_PROBABILITY_UNAVAILABLE")
+        if p1_buffer < portfolio.minimum_p1_buffer:
+            return SignalDecision(False, "MINIMUM_P1_BUFFER_NOT_MET", details={"p1_buffer": p1_buffer})
+        if p1_tipico > portfolio.maximum_tipico_p1:
+            return SignalDecision(False, "MAXIMUM_TIPICO_P1_EXCEEDED", details={"p1_tipico": p1_tipico})
 
     max_age = float(portfolio.max_quote_age_seconds)
     age_zero = quote_age_zero_seconds
@@ -138,19 +146,28 @@ def settle_scores(
     status: str | None = "FINISHED",
     extra_time: bool | None = False,
     penalties: bool | None = False,
+    regulation_home: int | None = None,
+    regulation_away: int | None = None,
+    regulation_confirmed: bool = False,
 ) -> SettlementResult:
     """Classify only goals scored after HT and protect against future leakage."""
 
-    final_home_int = int(final_home) if final_home is not None else None
-    final_away_int = int(final_away) if final_away is not None else None
+    def score(value: Any) -> int | None:
+        number = decimal_value(value)
+        if number is None or number < 0 or number != number.to_integral_value():
+            return None
+        return int(number)
+
+    final_home_int = score(regulation_home if regulation_confirmed else final_home)
+    final_away_int = score(regulation_away if regulation_confirmed else final_away)
     if str(status or "").strip().upper() in VOID_STATUSES:
         return SettlementResult("VOID", None, f"EVENT_{str(status).upper()}", final_score_home=final_home_int, final_score_away=final_away_int)
-    if extra_time is True or penalties is True:
+    if not regulation_confirmed and (extra_time in (True, 1) or penalties in (True, 1)):
         return SettlementResult(
-            "VOID", None, "EXTRA_TIME_OR_PENALTIES_NOT_IN_ENTRY_SCOPE",
+            "UNRESOLVED", None, "REGULATION_SCORE_REQUIRED",
             final_score_home=final_home_int, final_score_away=final_away_int,
         )
-    if extra_time is None or penalties is None:
+    if not regulation_confirmed and (extra_time not in (False, 0) or penalties not in (False, 0)):
         return SettlementResult(
             "UNRESOLVED", None, "EXTRA_TIME_SCOPE_UNKNOWN",
             final_score_home=final_home_int, final_score_away=final_away_int,
@@ -160,13 +177,15 @@ def settle_scores(
             "UNRESOLVED", None, "FINAL_RESULT_NOT_CONFIRMED",
             final_score_home=final_home_int, final_score_away=final_away_int,
         )
+    halftime_home = score(halftime_home)
+    halftime_away = score(halftime_away)
     if halftime_home is None or halftime_away is None or final_home_int is None or final_away_int is None:
         return SettlementResult(
             "UNRESOLVED", None, "MISSING_HALF_TIME_OR_FINAL_SCORE",
             final_score_home=final_home_int, final_score_away=final_away_int,
         )
     second_half_goals = final_home_int + final_away_int - int(halftime_home) - int(halftime_away)
-    if second_half_goals < 0:
+    if final_home_int < halftime_home or final_away_int < halftime_away:
         return SettlementResult(
             "UNRESOLVED", None, "FINAL_SCORE_BELOW_HALF_TIME_SCORE",
             final_score_home=final_home_int, final_score_away=final_away_int,

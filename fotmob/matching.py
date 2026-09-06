@@ -107,6 +107,9 @@ def normalize_team_name(value: Any) -> str:
     # mapping is deliberately narrow; reserve/youth/gender markers are still
     # retained and rejected by the marker guard below.
     aliases = {
+        "tsg hoffenheim": "hoffenheim",
+        "borussia dortmund": "dortmund",
+        "bayer leverkusen": "leverkusen",
         "borussia m gladbach": "borussia monchengladbach",
         "m gladbach": "borussia monchengladbach",
         "fc augsburg": "augsburg",

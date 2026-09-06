@@ -86,6 +86,8 @@ class Snapshot:
     archive_path: str | None = None
     exported_at: str | None = None
     payload_hash: str | None = None
+    extra_time: bool | None = None
+    penalties: bool | None = None
 
     def __post_init__(self) -> None:
         if self.snapshot_type not in SNAPSHOT_TYPES:

@@ -56,6 +56,8 @@ SNAPSHOT_SCHEMA = (
             _field("second_half_goals", pa.int64()),
             _field("second_half_goal_class", pa.string()),
             _field("match_status", pa.string()),
+            _field("extra_time", pa.bool_()),
+            _field("penalties", pa.bool_()),
             _field("display_time", pa.string()),
             _field("snapshot_quality", pa.string()),
             _field("market_count", pa.int64(), nullable=False),
@@ -320,6 +322,7 @@ def build_snapshot_payload(
     second_half_goals = snapshot.second_half_goals
     if (
         second_half_goals is None
+        and event.extra_time is False and event.penalties is False
         and total_home is not None and total_away is not None
         and ht_home is not None and ht_away is not None
     ):
@@ -349,6 +352,8 @@ def build_snapshot_payload(
         "second_half_goals": second_half_goals,
         "second_half_goal_class": snapshot.second_half_goal_class,
         "match_status": event.status,
+        "extra_time": event.extra_time,
+        "penalties": event.penalties,
         "display_time": event.display_minute,
         "snapshot_quality": snapshot.snapshot_quality,
         "market_count": int(details.market_count),

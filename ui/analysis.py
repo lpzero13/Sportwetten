@@ -245,133 +245,107 @@ def render_market_analysis(
     analysis: MarketAnalysis,
     intelligence_service: MarketIntelligenceService,
 ) -> None:
-    """Render analysis and allow a local, non-persistent stake scenario."""
+    """Summary first; source data and portfolio rules are never changed here."""
+    from ui.analysis_summary import analysis_summary
+    from ui.components import text, table
 
     event_id = str(details.event.event_id)
-    stake = st.slider(
-        "Szenario-Einsatz (€)",
-        min_value=1,
-        max_value=1000,
-        value=int(round(analysis.strategy.total_stake or 30)),
-        step=1,
-        key=f"analysis-stake-{event_id}",
-        help="Ändert nur die Anzeige der Einsatzverteilung; es wird keine Wette abgegeben.",
+    heading, control = st.columns([3, 1])
+    heading.markdown('<p class="w-eyebrow">Analyse · 0 oder 2+ Tore</p>', unsafe_allow_html=True)
+    heading.caption("Ein Szenario mit zwei Einzelwetten. Genau ein Tor verliert den gesamten Einsatz.")
+    stake = control.number_input(
+        "Szenario-Einsatz (€)", min_value=1, max_value=1000,
+        value=max(1, min(1000, int(round(analysis.strategy.total_stake or 30)))),
+        step=1, key=f"analysis-stake-{event_id}",
+        help="Nur diese Berechnung. Ändert weder Paper-Portfolios noch gespeicherte Einstiegsquoten.",
     )
-    if float(stake) != analysis.strategy.total_stake:
-        analysis = intelligence_service.analyze(
-            details,
-            observed_at=analysis.observed_at,
-            snapshot_id=analysis.snapshot_id,
-            total_stake=float(stake),
-            persist=False,
-        )
-
+    model = analysis_summary(details, analysis, stake=float(stake),
+                             max_age=intelligence_service.settings.max_live_odds_age_seconds)
+    strategy = model["strategy"]
     probability = analysis.probability
-    strategy = analysis.strategy
-    selected_zero = (
-        analysis.zero_equivalence.best_odds.selected
-        if analysis.zero_equivalence.best_odds
-        else None
+    age_text = f'{model["age"]:.1f} s'.replace(".", ",") if model["age"] is not None else "unbekannt"
+    freshness = "Veraltet" if model["stale"] else "Frisch"
+    badge = "warning" if model["stale"] else ""
+    st.markdown(
+        f'<section class="w-hero {text(model["tone"])}"><div>'
+        f'<h3>{text(model["title"])}</h3><p>{text(model["description"])}</p></div>'
+        f'<span class="w-badge {badge}">{freshness} · {age_text}</span></section>',
+        unsafe_allow_html=True,
     )
-    selected_two = (
-        analysis.two_plus_equivalence.best_odds.selected
-        if analysis.two_plus_equivalence.best_odds
-        else None
-    )
-    metrics = st.columns(5)
-    metrics[0].metric("Quote 0", _odds(selected_zero.odds if selected_zero else None))
-    metrics[1].metric("Quote 2+", _odds(selected_two.odds if selected_two else None))
-    metrics[2].metric("P(0)", _pct(probability.p0))
-    metrics[3].metric("P(exakt 1)", _pct(probability.p1))
-    metrics[4].metric("P(2+)", _pct(probability.p2_plus))
+    basis = "Zweite Halbzeit" if model["halftime"] else "Verbleibende Spielzeit ab dieser Beobachtung · kein HZ-Einstieg"
+    st.caption(f'{basis} · Tipico: {format_local_datetime(analysis.observed_at)}')
 
+    def percent(value):
+        return _pct(value).replace(".", ",")
+
+    def signed_money(value):
+        return ("+" if value is not None and value > 0 else "") + _eur(value)
+
+    buffer = strategy.p1_buffer if model["probability_ok"] else None
+    buffer_text = "—" if buffer is None else f"{buffer * 100:+.1f} pp".replace(".", ",")
+    metrics = [
+        ("Gewinnfall · Rendite", percent(strategy.win_roi), "Nur bei 0 oder mindestens 2 Toren", False),
+        ("Marktmodell · Erwartungswert", signed_money(model["ev"]),
+         f'{percent(model["ev_roi"])} des Einsatzes · Schätzung, keine Garantie', model["ev"] is not None and model["ev"] < 0),
+        ("Markt-Puffer", buffer_text, "Break-even minus P(genau 1 Tor)", buffer is not None and buffer < 0),
+    ]
+    cards = "".join(
+        f'<div class="w-kpi"><label>{text(label)}</label><div class="w-number {"negative" if negative else ""}">'
+        f'{text(value)}</div><small>{text(note)}</small></div>' for label, value, note, negative in metrics
+    )
+    st.markdown(f'<div class="w-grid">{cards}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="w-section"><h3>Was wird aus deinen {_eur(float(stake))}?</h3>'
+                '<span>Auszahlung inklusive Einsatz · Netto nach beiden Wetten</span></div>', unsafe_allow_html=True)
+    scenarios = [
+        ("0 Tore", strategy.stake_zero, strategy.q_zero, strategy.payout_zero, probability.p0, False),
+        ("Genau 1 Tor", None, None, 0 if model["quotes_ok"] else None, probability.p1, True),
+        ("2+ Tore", strategy.stake_two_plus, strategy.q_two_plus, strategy.payout_two_plus, probability.p2_plus, False),
+    ]
+    cards = []
+    for label, allocation, odds, payout, likelihood, loss in scenarios:
+        pnl = payout - stake if payout is not None else None
+        cards.append(
+            f'<article class="w-scenario {"loss" if loss or pnl is not None and pnl < 0 else ""}"><h4>{label}</h4>'
+            f'<div class="w-number">{text(signed_money(pnl))}</div><small>Gewinn / Verlust insgesamt</small>'
+            f'<dl><dt>Auszahlung</dt><dd>{text(_eur(payout))}</dd>'
+            f'<dt>{"Abdeckung" if loss else "Dein Teileinsatz"}</dt><dd>{text("Nicht abgedeckt" if loss else _eur(allocation))}</dd>'
+            f'<dt>Quote</dt><dd>{text(_odds(odds))}</dd>'
+            f'<dt>Markt-Schätzung</dt><dd>{text(percent(likelihood) if model["probability_ok"] else "nicht verfügbar")}</dd></dl></article>'
+        )
+    st.markdown('<div class="w-grid">' + "".join(cards) + "</div>", unsafe_allow_html=True)
     st.caption(
-        f"Beobachtet: {format_local_datetime(analysis.observed_at)} · "
-        f"Datenalter: {_age(analysis.observed_at)} · "
-        f"Normalizer: v0.3.1"
+        f'Verlustschwelle P1: {percent(strategy.p1_max)} · '
+        f'Markt-Schätzung für genau 1 Tor: {percent(probability.p1) if model["probability_ok"] else "nicht verfügbar"}. '
+        'Die Schätzung stammt aus Tipico-Quoten, nicht aus einem unabhängigen ML-Modell. '
+        'Gebühren, Steuer und reale Ausführung sind nicht simuliert.'
     )
 
-    st.subheader("Äquivalente Zielmärkte")
-    st.dataframe(
-        [
-            _best_row("0 verbleibende Tore", analysis.zero_equivalence.best_odds),
-            _best_row("2+ verbleibende Tore", analysis.two_plus_equivalence.best_odds),
-        ],
-        hide_index=True,
-        width="stretch",
-    )
-    for market in (analysis.zero_equivalence, analysis.two_plus_equivalence):
-        if market.status != "EQUIVALENT":
-            st.warning(f"{market.label}: {market.status} · {market.explanation}")
-        else:
-            st.caption(f"{market.label}: {market.explanation}")
-    provenance = []
-    for label, market in (
-        ("0 verbleibende Tore", analysis.zero_equivalence),
-        ("2+ verbleibende Tore", analysis.two_plus_equivalence),
-    ):
-        for candidate in market.candidates:
-            provenance.append(
-                {
-                    "Ziel": label,
-                    "Quote": _odds(candidate.odds),
-                    "Market ID": candidate.market_id,
+    with st.expander("Quellen & Marktvergleich", expanded=False):
+        table([_best_row("0 Tore", analysis.zero_equivalence.best_odds),
+               _best_row("2+ Tore", analysis.two_plus_equivalence.best_odds)])
+        for market in (analysis.zero_equivalence, analysis.two_plus_equivalence):
+            st.caption(f"{market.label}: {market.explanation} · {market.status}")
+        provenance = []
+        for label, market in (("0 Tore", analysis.zero_equivalence), ("2+ Tore", analysis.two_plus_equivalence)):
+            for candidate in market.candidates:
+                provenance.append({
+                    "Ziel": label, "Quote": _odds(candidate.odds),
+                    "Markt / Auswahl": candidate.source_label, "Market ID": candidate.market_id,
                     "Outcome ID": candidate.outcome_id,
-                    "Observed at": format_local_datetime(candidate.observed_at),
-                    "Age": _age(candidate.observed_at),
-                    "Status": candidate.status,
-                    "Verfügbar": "OPEN" if candidate.available else "NO",
-                }
-            )
-    if provenance:
-        with st.expander("Quote-Provenienz / Mapping-Details", expanded=False):
-            st.dataframe(provenance, hide_index=True, width="stretch")
-
-    st.subheader("Tipico-Wahrscheinlichkeitsverteilung")
-    if probability.status == "OK":
-        st.dataframe(
-            [
-                {"Bucket": "0", "Wahrscheinlichkeit": _pct(probability.p0)},
-                {"Bucket": "exakt 1", "Wahrscheinlichkeit": _pct(probability.p1)},
-                {"Bucket": "2+", "Wahrscheinlichkeit": _pct(probability.p2_plus)},
-            ],
-            hide_index=True,
-            width="stretch",
-        )
-        st.caption(f"Quelle: {probability.source or '—'} · Summe: 100,0%")
-    else:
-        st.warning(f"Wahrscheinlichkeit nicht rankbar: {probability.status}")
-        if probability.source:
-            st.caption(f"Teilquelle: {probability.source}")
-
-    st.subheader("Strategie ZERO_OR_2PLUS")
-    strategy_columns = st.columns(5)
-    strategy_columns[0].metric("Status", strategy.status)
-    strategy_columns[1].metric("P1-Maximum", _pct(strategy.p1_max))
-    strategy_columns[2].metric("P1 Tipico", _pct(strategy.p1_tipico))
-    strategy_columns[3].metric("Struktureller Puffer", _pct(strategy.p1_buffer))
-    strategy_columns[4].metric("Win-ROI", _pct(strategy.win_roi))
-    st.caption(
-        f"Label: {strategy.label} · Gesamt-Einsatz: {_eur(strategy.total_stake)} · "
-        "P1-Maximum ist kein eigener Edge-Schätzer."
-    )
-    st.dataframe(_scenario_rows(strategy), hide_index=True, width="stretch")
-    if strategy.payout_difference is not None:
-        st.caption(
-            f"Auszahlungsdifferenz nach Cent-Rundung: {_eur(strategy.payout_difference)}"
-        )
-    if strategy.status != "OK":
-        st.warning("Kein positiver gedeckter Auszahlungspuffer oder unvollständige Quoten.")
-    elif probability.status != "OK":
-        st.warning("Die Strategie wird wegen der nicht validen Tipico-Verteilung nicht gerankt.")
-
-    if analysis.warnings:
-        with st.expander("Datenqualität / Hinweise", expanded=False):
-            for warning in analysis.warnings:
-                st.write(f"• {warning}")
-    st.info(
-        "Read-only Analyse: keine Wettempfehlung, keine eigene ML-Wahrscheinlichkeit "
-        "und keine Wettabgabe."
-    )
+                    "Beobachtet": format_local_datetime(candidate.observed_at),
+                    "Status": candidate.status, "Offen": "Ja" if candidate.is_open else "Nein",
+                })
+        table(provenance)
+    with st.expander("Rechenweg & Datenqualität", expanded=False):
+        table([
+            {"Kennzahl": "P1-Break-even", "Wert": percent(strategy.p1_max), "Definition": "1 − 1/Quote 0 − 1/Quote 2+; vor Cent-Rundung"},
+            {"Kennzahl": "Markt-Puffer", "Wert": buffer_text, "Definition": "P1-Break-even − geschätztes P1, in Prozentpunkten"},
+            {"Kennzahl": "Erwartungswert", "Wert": signed_money(model["ev"]), "Definition": "P(0) × Auszahlung 0 + P(2+) × Auszahlung 2+ − Gesamteinsatz"},
+            {"Kennzahl": "Win-ROI", "Wert": percent(strategy.win_roi), "Definition": "Gewinn im abgedeckten Fall / Einsatz; vor Cent-Rundung, ohne Verlustfälle"},
+        ])
+        st.caption(f'Wahrscheinlichkeitsquelle: {probability.source or "nicht verfügbar"} · Status: {probability.status}')
+        st.caption(f'Strategie: {strategy.strategy_version} · Quotenalter-Grenze: {intelligence_service.settings.max_live_odds_age_seconds} s · Rundungsdifferenz: {_eur(strategy.payout_difference)}')
+        for warning in analysis.warnings:
+            st.write(warning)
     if _one_second_half_goal(details.event):
         _render_rescue(details, analysis)

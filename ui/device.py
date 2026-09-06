@@ -64,30 +64,7 @@ def detect_device() -> DeviceInfo:
 
 
 def apply_responsive_style() -> None:
-    """Keep the same app usable on narrow Proxmox/LXC browser screens."""
-
-    st.markdown(
-        """
-        <style>
-        @media (max-width: 700px) {
-            .block-container { padding: 0.8rem 0.55rem 2rem 0.55rem; }
-            [data-testid="stHorizontalBlock"] { flex-wrap: wrap; gap: 0.45rem; }
-            [data-testid="stMetric"] { min-width: 8.4rem; }
-            [data-testid="stDataFrame"] { max-width: 100%; overflow-x: auto; }
-            [data-testid="stExpander"] { width: 100%; }
-            h1 { font-size: 1.55rem; }
-            h2 { font-size: 1.25rem; }
-            h3 { font-size: 1.05rem; }
-            button { min-height: 2.35rem; }
-        }
-        .paper-card {
-            border: 1px solid rgba(128, 128, 128, .28);
-            border-radius: .55rem;
-            padding: .65rem .75rem;
-            margin: .35rem 0;
-        }
-        .paper-card small { color: #777; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    """Shared desktop/mobile theme; no external fonts or assets required."""
+    from pathlib import Path
+    css = Path(__file__).with_name("theme.css").read_text(encoding="utf-8")
+    st.markdown("<style>" + css + "</style>", unsafe_allow_html=True)

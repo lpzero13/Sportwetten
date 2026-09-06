@@ -122,7 +122,7 @@ TIPICO_SKIP_SERVICE_RESTART=1 bash "$INSTALL_DIR/deploy/activate_fotmob.sh" "$EN
 # Record the exact source/artifact identity that was installed.  The
 # manifest is runtime state and is intentionally excluded from Git.
 "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/deploy/write_deployment_manifest.py" \
-    --root "$INSTALL_DIR" --installer-version "v0611"
+    --root "$INSTALL_DIR" --installer-version "v062"
 chown root:"$SERVICE_GROUP" "$INSTALL_DIR/DEPLOYMENT_MANIFEST.json"
 chmod 0640 "$INSTALL_DIR/DEPLOYMENT_MANIFEST.json"
 
