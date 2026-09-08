@@ -1,5 +1,5 @@
 [Unit]
-Description=Sportwetten Tipico result finalization and FotMob reconciliation
+Description=Sportwetten full Tipico result recovery (manual, resumable)
 Wants=network-online.target
 After=network-online.target wetten-collector.service
 
@@ -11,8 +11,11 @@ WorkingDirectory=__INSTALL_DIR__
 EnvironmentFile=-/etc/default/tipico-observer
 Environment=WETTEN_ARCHIVE_PATH=/var/lib/wetten/archive
 Environment=PYTHONUNBUFFERED=1
-ExecStart=__INSTALL_DIR__/.venv/bin/python __INSTALL_DIR__/scripts/result_finalization.py reconcile --root __INSTALL_DIR__ --apply --all-due --mode worker --refresh-index
-TimeoutStartSec=30min
+# This is an explicitly started initial/full inventory pass.  The database
+# lease and persistent item checkpoints make interruption resumable.
+ExecStart=__INSTALL_DIR__/.venv/bin/python __INSTALL_DIR__/scripts/result_finalization.py reconcile --root __INSTALL_DIR__ --full-inventory --apply --workers 10 --mode worker --refresh-index
+TimeoutStartSec=infinity
+TimeoutStopSec=60s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

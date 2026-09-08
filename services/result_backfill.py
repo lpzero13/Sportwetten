@@ -15,11 +15,11 @@ import logging
 import sqlite3
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from urllib.parse import quote
 
 from config import Settings
@@ -34,6 +34,7 @@ from fotmob.matching import (
     MatchMatcher,
     _team_core,
     normalize_team_name,
+    normalize_country,
     team_names_equivalent,
 )
 from fotmob.models import FotMobMatch
@@ -230,6 +231,7 @@ def _is_finished(match: FotMobMatch) -> bool:
 
 
 def _match_from_index(row: Mapping[str, Any]) -> FotMobMatch:
+    raw = json.loads(row["raw_fixture_json"] or "{}") if "raw_fixture_json" in row.keys() else {}
     return FotMobMatch(
         provider_match_id=str(row["fotmob_match_id"]),
         kickoff_at=row["kickoff_at_utc"],
@@ -241,6 +243,7 @@ def _match_from_index(row: Mapping[str, Any]) -> FotMobMatch:
         home_team_id=row["home_team_id"],
         away_team_id=row["away_team_id"],
         status=row["match_status"],
+        extra_data={"identity_aliases": _fixture_aliases(raw)},
     )
 
 
@@ -256,7 +259,19 @@ def _match_from_record(record: FotMobMatchIndexRecord) -> FotMobMatch:
         home_team_id=record.home_team_id,
         away_team_id=record.away_team_id,
         status=record.match_status,
+        extra_data={"identity_aliases": _fixture_aliases(record.raw_fixture or {})},
     )
+
+
+def _fixture_aliases(raw: Mapping[str, Any]) -> dict[str, list[str]]:
+    aliases: dict[str, list[str]] = {}
+    for side in ("home", "away"):
+        team = raw.get(side) or raw.get(side + "Team") or {}
+        aliases[side] = list(dict.fromkeys(
+            team[key].strip() for key in ("longName", "name", "displayName", "teamName")
+            if isinstance(team, Mapping) and isinstance(team.get(key), str) and team[key].strip()
+        ))
+    return aliases
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +376,7 @@ class ResultBackfillRunner:
         self.matcher = MatchMatcher(
             tolerance_minutes=int(getattr(settings, "fotmob_matching_tolerance_minutes", 15))
         )
+        self._provider_days: list[dict[str, Any]] = []
         self.client = client or FotMobClient(
             base_url=settings.fotmob_base_url,
             api_base_url=settings.fotmob_api_base_url,
@@ -394,7 +410,14 @@ class ResultBackfillRunner:
         ).fetchone()
         return row is not None
 
-    def _candidate_rows(self, *, current: datetime, limit: int) -> list[sqlite3.Row]:
+    def _candidate_rows(
+        self,
+        *,
+        current: datetime,
+        limit: int,
+        event_id: str | None = None,
+        event_ids: Sequence[str] | None = None,
+    ) -> list[sqlite3.Row]:
         before = _iso(
             current
             - timedelta(hours=float(getattr(self.settings, "result_backfill_grace_hours", 3.0)))
@@ -418,12 +441,61 @@ class ResultBackfillRunner:
                     )
                 )
             """
-            params: tuple[Any, ...] = (before, _iso(current), max(1, int(limit)))
+            params: tuple[Any, ...] = (before, _iso(current))
         else:
             queue_select = "0 AS backfill_attempt_count, NULL AS backfill_status, NULL AS next_attempt_at, NULL AS last_provider_match_id, NULL AS backfill_identity_status, NULL AS backfill_validation_status, NULL AS backfill_last_error"
             queue_join = ""
             queue_where = ""
-            params = (before, max(1, int(limit)))
+            params = (before,)
+        result_columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(match_results)").fetchall()
+        }
+        if "result_use_h2" in result_columns:
+            result_need = """
+                r.event_id IS NULL
+                OR r.ft_home IS NULL OR r.ft_away IS NULL
+                OR r.ht_home IS NULL OR r.ht_away IS NULL
+                OR COALESCE(r.result_status, 'PENDING') != 'VERIFIED'
+                OR COALESCE(r.result_use_ft, 0) = 0
+                OR COALESCE(r.result_use_h2, 0) = 0
+            """
+            # A local FT-only repair is deliberately kept queue-eligible for
+            # a later FotMob HT enrichment even though its queue row is
+            # already APPLIED.
+            queue_where = """
+                AND (
+                    q.event_id IS NULL
+                    OR (
+                        q.status NOT IN ('APPLIED', 'CONFIRMED')
+                        AND q.next_attempt_at IS NOT NULL
+                        AND q.next_attempt_at <= ?
+                    )
+                    OR (
+                        COALESCE(r.result_use_h2, 0) = 0
+                        AND q.status IN ('APPLIED', 'CONFIRMED')
+                    )
+                )
+            """ if self._table_exists("result_backfill_queue") else queue_where
+        else:
+            result_need = "r.event_id IS NULL OR r.ft_home IS NULL OR r.ft_away IS NULL"
+        if event_id is not None:
+            event_filter = "AND e.event_id = ?"
+            event_params: list[Any] = [str(event_id)]
+        elif event_ids is not None:
+            ids = tuple(dict.fromkeys(str(value) for value in event_ids if str(value)))
+            if not ids:
+                return []
+            event_filter = f"AND e.event_id IN ({', '.join('?' for _ in ids)})"
+            event_params = list(ids)
+        else:
+            event_filter = ""
+            event_params = []
+        # An explicit inventory/recheck is authoritative.  It must be able
+        # to revalidate a prior conflict or an old terminal queue row; the
+        # normal daily path keeps those retry guards.
+        if event_id is not None or event_ids is not None:
+            queue_where = ""
         query = f"""
             SELECT e.*, {queue_select}
             FROM events e
@@ -432,13 +504,17 @@ class ResultBackfillRunner:
             WHERE lower(e.sport) = 'soccer'
               AND e.kickoff_time IS NOT NULL
               AND e.kickoff_time <= ?
-              AND (r.event_id IS NULL OR r.ft_home IS NULL OR r.ft_away IS NULL)
+              AND ({result_need})
               {queue_where}
+              {event_filter}
             ORDER BY e.kickoff_time ASC, e.event_id ASC
             LIMIT ?
         """
+        base_params = [before] if not queue_where else list(params)
+        base_params.extend(event_params)
+        base_params.append(max(1, int(limit)))
         with self._lock:
-            return list(self.connection.execute(query, params).fetchall())
+            return list(self.connection.execute(query, tuple(base_params)).fetchall())
 
     def _existing_link(self, event_id: str) -> tuple[str, float, str] | None:
         accepted = tuple(sorted(AUTO_LINK_STATUSES))
@@ -514,6 +590,8 @@ class ResultBackfillRunner:
         *,
         allow_network: bool,
         persist: bool,
+        force: bool = False,
+        run_id: str | None = None,
     ) -> list[FotMobMatch]:
         times = [_parse_time(event.kickoff_time) for event in events]
         times = [value for value in times if value is not None]
@@ -521,11 +599,13 @@ class ResultBackfillRunner:
             return []
         start = min(value.date() for value in times) - timedelta(days=1)
         end = max(value.date() for value in times) + timedelta(days=1)
-        existing_days = {str(row["observation_date"]) for row in existing_rows}
+        existing_counts: dict[str, int] = defaultdict(int)
+        for row in existing_rows:
+            existing_counts[str(row["observation_date"])] += 1
         days = []
         cursor = start
         while cursor <= end:
-            if cursor.isoformat() not in existing_days:
+            if force or cursor.isoformat() not in existing_counts:
                 days.append(cursor)
             cursor += timedelta(days=1)
         if not days:
@@ -543,15 +623,36 @@ class ResultBackfillRunner:
         for day in days:
             endpoint = self._daily_endpoint(day)
             fetched = self.client.fetch_json(endpoint)
-            if not fetched.success or not isinstance(fetched.payload, Mapping):
-                self.logger.warning("FotMob daily index failed for %s: %s", day, fetched.error)
-                continue
             fetched_at = _iso(_now())
-            extracted = extract_daily_match_index(
-                fetched.payload,
-                observation_date=day,
-                first_seen_at=fetched_at,
-            )
+            status = "COMPLETE"
+            parser_status = "OK"
+            error = fetched.error
+            extracted: list[FotMobMatchIndexRecord] = []
+            if not fetched.success:
+                status = "HTTP_ERROR" if fetched.status_code is not None else "FETCH_ERROR"
+                parser_status = "NOT_RUN"
+                self.logger.warning("FotMob daily index failed for %s: %s", day, fetched.error)
+            elif self._is_no_data(fetched):
+                status = "EMPTY"
+                parser_status = "NO_DATA"
+                error = None
+            elif not isinstance(fetched.payload, Mapping) or not isinstance(fetched.payload.get("leagues"), list):
+                status = "PARSER_ERROR"
+                parser_status = "INVALID_PAYLOAD"
+                error = "daily response lacks a valid leagues list"
+            else:
+                try:
+                    extracted = extract_daily_match_index(
+                        fetched.payload,
+                        observation_date=day,
+                        first_seen_at=fetched_at,
+                    )
+                    status = "COMPLETE" if extracted else "EMPTY"
+                except Exception as exc:  # pragma: no cover - defensive parser boundary
+                    status = "PARSER_ERROR"
+                    parser_status = "ERROR"
+                    error = f"{type(exc).__name__}: {exc}"
+                    self.logger.warning("FotMob daily index parser failed for %s: %s", day, exc)
             records.extend(_match_from_record(record) for record in extracted)
             if persisted_store is not None:
                 persisted_store.upsert_daily_index(
@@ -560,23 +661,65 @@ class ResultBackfillRunner:
                     source_endpoint=endpoint,
                     payload_hash=_payload_hash(fetched.payload),
                     fetched_at=fetched_at,
+                    replace_day=bool(force and status in {"COMPLETE", "EMPTY"}),
                 )
+            day_result = {
+                "observation_date": day.isoformat(),
+                "status": status,
+                "source_endpoint": endpoint,
+                "fetched_at": fetched_at,
+                "response_status": fetched.status_code,
+                "fixture_count": len(extracted),
+                "payload_hash": _payload_hash(fetched.payload),
+                "parser_status": parser_status,
+                "error": error,
+                "existing_cache_rows": existing_counts.get(day.isoformat(), 0),
+                "refreshed": bool(force),
+            }
+            self._provider_days.append(day_result)
+            if run_id and persist and hasattr(self.database, "record_result_finalization_provider_day"):
+                self.database.record_result_finalization_provider_day(run_id, **day_result)
+                # Keep a persistent lease heartbeat while a full inventory is
+                # downloading daily provider catalogs.  This makes a long
+                # network phase distinguishable from a crashed worker and
+                # lets resume/status report the last durable progress point.
+                if hasattr(self.database, "update_result_finalization_run"):
+                    self.database.update_result_finalization_run(
+                        run_id,
+                        heartbeat_at=fetched_at,
+                    )
         return records
 
-    def _catalog(self, events: list[BackfillEvent], *, allow_network: bool, persist: bool) -> _DailyCatalog:
+    def _catalog(
+        self,
+        events: list[BackfillEvent],
+        *,
+        allow_network: bool,
+        persist: bool,
+        force_refresh: bool = False,
+        run_id: str | None = None,
+    ) -> _DailyCatalog:
         rows = self._daily_rows(events)
-        matches = [_match_from_index(row) for row in rows]
-        matches.extend(
-            self._refresh_missing_days(
+        fresh = self._refresh_missing_days(
                 events,
                 rows,
                 allow_network=allow_network,
                 persist=persist,
+                force=force_refresh,
+                run_id=run_id,
             )
-        )
+        refreshed_days = {
+            day["observation_date"] for day in self._provider_days
+            if day["status"] in {"COMPLETE", "EMPTY"}
+        }
+        # The in-memory catalog must reflect replacements too, including
+        # successful empty responses. Otherwise deleted/stale names survive
+        # for the entire run even though SQLite already contains fresh data.
+        matches = [_match_from_index(row) for row in rows if row["observation_date"] not in refreshed_days]
+        matches.extend(fresh)
         by_id: dict[str, FotMobMatch] = {}
         for match in matches:
-            by_id.setdefault(match.provider_match_id, match)
+            by_id[match.provider_match_id] = match
         by_pair: dict[tuple[str, str], list[FotMobMatch]] = defaultdict(list)
         by_core: dict[tuple[str, str], list[FotMobMatch]] = defaultdict(list)
         by_home: dict[str, set[str]] = defaultdict(set)
@@ -612,24 +755,24 @@ class ResultBackfillRunner:
             home_ids = catalog.by_home.get(home, set()) | catalog.by_home.get(core_home, set())
             away_ids = catalog.by_away.get(away, set()) | catalog.by_away.get(core_away, set())
             ids.update(home_ids & away_ids)
-        if ids:
-            return [catalog.by_id[item] for item in sorted(ids) if item in catalog.by_id]
-
         kickoff = _parse_time(event.kickoff_time)
         if kickoff is None:
-            return []
-        fallback: list[FotMobMatch] = []
+            return [catalog.by_id[item] for item in sorted(ids) if item in catalog.by_id]
+        country = normalize_country(event.competition_country)
         for offset in (-1, 0, 1):
             day = (kickoff + timedelta(days=offset)).date().isoformat()
             for match in catalog.by_date.get(day, ()):
                 provider_time = _parse_time(match.kickoff_at)
-                if provider_time is None or abs((provider_time - kickoff).total_seconds()) > 15 * 60:
+                if provider_time is None or abs((provider_time - kickoff).total_seconds()) > self.matcher.tolerance_minutes * 60:
                     continue
-                if team_names_equivalent(event.home_team, match.home_team) and team_names_equivalent(
-                    event.away_team, match.away_team
-                ):
-                    fallback.append(match)
-        return list({match.provider_match_id: match for match in fallback}.values())
+                other_country = normalize_country(match.competition_country)
+                if country and other_country and country != other_country:
+                    continue
+                # Candidate discovery is deliberately broader than acceptance.
+                # Let the shared matcher enforce names, category, league and
+                # uniqueness; an exact-name prefilter defeats its fuzzy rules.
+                ids.add(match.provider_match_id)
+        return [catalog.by_id[item] for item in sorted(ids) if item in catalog.by_id]
 
     def _plans(self, events: list[BackfillEvent], catalog: _DailyCatalog) -> list[BackfillPlan]:
         plans: list[BackfillPlan] = []
@@ -679,13 +822,32 @@ class ResultBackfillRunner:
         message = str(payload.get("message") or "").strip().casefold()
         return message in {"data not found", "match data not found"}
 
-    def _validate(self, event: BackfillEvent, match: FotMobMatch) -> Validation:
-        identity = self.matcher.match(MatchIdentity.from_tipico_event(event), [match])
+    def _validate(self, event: BackfillEvent, match: FotMobMatch, catalog_match: FotMobMatch | None = None) -> Validation:
+        # The same provider may use different short/full names in its daily
+        # list and details. Transfer source aliases only when match, league
+        # and BOTH team IDs agree; scores/status still come from the details.
+        identity_match = match
+        if (catalog_match is not None
+                and match.provider_match_id == catalog_match.provider_match_id
+                and match.competition_id and match.competition_id == catalog_match.competition_id
+                and match.home_team_id and match.home_team_id == catalog_match.home_team_id
+                and match.away_team_id and match.away_team_id == catalog_match.away_team_id):
+            aliases = catalog_match.extra_data.get("identity_aliases", {})
+            identity_match = replace(match, extra_data={**match.extra_data, "identity_aliases": aliases})
+            # INT is a generic provider placeholder, never a contradictory
+            # domestic country. Require agreement of the two league labels
+            # before substituting the explicit country of the same league ID.
+            if (str(match.competition_country or "").upper() == "INT"
+                    and catalog_match.competition_country
+                    and self.matcher._competition_equal(match.competition_name, catalog_match.competition_name,
+                                                       normalize_country(catalog_match.competition_country))):
+                identity_match = replace(identity_match, competition_country=catalog_match.competition_country)
+        identity = self.matcher.match(MatchIdentity.from_tipico_event(event), [identity_match])
         if not identity.auto_linkable:
             return Validation(
                 status="IDENTITY_CONFLICT",
                 scope_status="UNKNOWN",
-                flags=tuple(identity.reasons or ["detail_identity_not_confirmed"]),
+                flags=tuple(identity.candidates[0].reasons if identity.candidates else identity.reasons or ["detail_identity_not_confirmed"]),
             )
         if not _is_finished(match):
             return Validation("NOT_FINISHED", "UNKNOWN", ("provider_not_finished",))
@@ -695,19 +857,24 @@ class ResultBackfillRunner:
             match.score_home,
             match.score_away,
         )
-        if any(value is None for value in values):
-            return Validation("INCOMPLETE_SCORE", "UNKNOWN", ("ht_or_ft_score_missing",))
+        ft_values = (match.score_home, match.score_away)
+        if any(value is None for value in ft_values):
+            return Validation("INCOMPLETE_SCORE", "UNKNOWN", ("ft_score_missing",))
         if any(int(value) < 0 for value in values if value is not None):
             return Validation("INVALID_SCORE", "UNKNOWN", ("negative_score",))
-        second_half_goals = int(match.score_home + match.score_away - match.ht_score_home - match.ht_score_away)
-        if second_half_goals < 0:
-            return Validation("INVALID_SCORE", "UNKNOWN", ("ft_total_below_ht_total",))
         scope, scope_flags = _scope_status(match)
         if scope == "EXTRA_TIME" or scope == "PENALTIES":
             return Validation("EXCLUDED_NON_REGULATION", scope, tuple(scope_flags))
         if scope == "UNKNOWN" and not bool(getattr(self.settings, "result_backfill_allow_unknown_scope", False)):
             return Validation("SCOPE_UNKNOWN", scope, tuple(scope_flags))
         flags = list(scope_flags)
+        if match.ht_score_home is None or match.ht_score_away is None:
+            return Validation("VALID_FT_ONLY", scope, tuple(sorted(set(flags))))
+        if match.score_home < match.ht_score_home or match.score_away < match.ht_score_away:
+            return Validation("INVALID_SCORE", scope, tuple(sorted(set(flags + ["ft_below_ht_score"]))))
+        second_half_goals = int(match.score_home + match.score_away - match.ht_score_home - match.ht_score_away)
+        if second_half_goals < 0:
+            return Validation("INVALID_SCORE", scope, tuple(sorted(set(flags + ["ft_total_below_ht_total"]))))
         if event.ht_score_home is not None and event.ht_score_away is not None:
             if (event.ht_score_home, event.ht_score_away) != (match.ht_score_home, match.ht_score_away):
                 flags.append("tipico_event_halftime_conflict")
@@ -724,9 +891,11 @@ class ResultBackfillRunner:
     def _retry_at(status: str, attempt_count: int, moment: datetime) -> str | None:
         if status in TERMINAL_QUEUE_STATUSES:
             return None
-        if status in {"AMBIGUOUS", "SCOPE_UNKNOWN", "IDENTITY_CONFLICT", "INCOMPLETE_SCORE", "INVALID_SCORE", "TIPICO_HT_CONFLICT"}:
+        if status == "NOT_FINISHED":
+            delay_hours = 5
+        elif status in {"AMBIGUOUS", "SCOPE_UNKNOWN", "IDENTITY_CONFLICT", "INCOMPLETE_SCORE", "INVALID_SCORE", "TIPICO_HT_CONFLICT"}:
             delay_hours = 168
-        elif status in {"NO_CANDIDATE", "UNMATCHED", "NO_DATA", "NOT_FINISHED"}:
+        elif status in {"NO_CANDIDATE", "UNMATCHED", "NO_DATA"}:
             delay_hours = 24 if attempt_count <= 1 else 72 if attempt_count <= 3 else 168
         else:
             delay_hours = 24
@@ -749,6 +918,7 @@ class ResultBackfillRunner:
         error: str | None,
         moment: datetime,
         apply: bool,
+        run_id: str | None = None,
     ) -> dict[str, Any]:
         event = plan.event
         attempt = event.backfill_attempt_count + 1
@@ -784,10 +954,27 @@ class ResultBackfillRunner:
             "kickoff_at": match.kickoff_at if match is not None else event.kickoff_time,
             "source_context": plan.source_context,
             "raw_payload_path": None,
+            "source_record_type": "FOTMOB_MATCH_DETAIL" if match is not None else "FOTMOB_LOOKUP",
+            "source_record_id": provider_id,
+            "observed_at": _iso(moment),
+            "raw_status": match.status if match is not None else None,
+            "raw_period": match.period if match is not None else None,
+            "result_status": (
+                "VERIFIED"
+                if validation.status in {"VALID_REGULATION", "VALID_SCOPE_ASSUMED", "VALID_FT_ONLY"}
+                else "PENDING"
+            ),
+            "result_use_ft": int(
+                validation.status in {"VALID_REGULATION", "VALID_SCOPE_ASSUMED", "VALID_FT_ONLY"}
+            ),
+            "result_use_h2": int(
+                validation.status in {"VALID_REGULATION", "VALID_SCOPE_ASSUMED"}
+            ),
+            "rule_version": "v0.6.5",
             "created_at": _iso(moment),
         }
         result_values = None
-        if validation.status in {"VALID_REGULATION", "VALID_SCOPE_ASSUMED"} and match is not None:
+        if validation.status in {"VALID_REGULATION", "VALID_SCOPE_ASSUMED", "VALID_FT_ONLY"} and match is not None:
             result_values = {
                 "event_id": event.event_id,
                 "competition_id": event.competition_id or match.competition_id,
@@ -800,7 +987,11 @@ class ResultBackfillRunner:
                 "ht_away": match.ht_score_away,
                 "ft_home": match.score_home,
                 "ft_away": match.score_away,
-                "first_half_goals": int(match.ht_score_home + match.ht_score_away),
+                "first_half_goals": (
+                    int(match.ht_score_home + match.ht_score_away)
+                    if match.ht_score_home is not None and match.ht_score_away is not None
+                    else None
+                ),
                 "second_half_goals": validation.second_half_goals,
                 "second_half_goal_class": validation.second_half_goal_class,
                 "final_status": "finished",
@@ -814,6 +1005,19 @@ class ResultBackfillRunner:
                 "result_resolved_at": _iso(moment),
                 "result_revision": 0,
                 "result_last_checked_at": _iso(moment),
+                "result_status": "VERIFIED",
+                "result_use_ft": 1,
+                "result_use_h2": int(validation.status != "VALID_FT_ONLY"),
+                "result_reason": "HT_MISSING" if validation.status == "VALID_FT_ONLY" else "FOTMOB_BACKFILL_VERIFIED",
+                "result_raw_status": match.status,
+                "result_ht_source": "FOTMOB_BACKFILL" if validation.status != "VALID_FT_ONLY" else None,
+                "result_ft_source": "FOTMOB_BACKFILL",
+                # FotMob gives us a terminal provider observation, not a
+                # trustworthy real-world final-whistle timestamp.  Keep the
+                # check time separately and leave ended_at unknown.
+                "ended_at": None,
+                "end_observed_at": _iso(moment),
+                "result_rule_version": "v0.6.5",
             }
         next_attempt = self._retry_at(queue_status, attempt, moment)
         queue = {
@@ -853,6 +1057,7 @@ class ResultBackfillRunner:
                 evidence,
                 queue,
                 result_values=result_values,
+                run_id=run_id,
             )
             result.update(persisted)
             if persisted.get("result_action") == "RESULT_CONFLICT":
@@ -869,6 +1074,9 @@ class ResultBackfillRunner:
         refresh_index: bool = False,
         allow_unknown_scope: bool | None = None,
         now: datetime | None = None,
+        event_id: str | None = None,
+        event_ids: Sequence[str] | None = None,
+        run_id: str | None = None,
     ) -> dict[str, Any]:
         started = now or _now()
         if allow_unknown_scope is not None:
@@ -887,9 +1095,21 @@ class ResultBackfillRunner:
         if execution_mode not in NETWORK_MODES:
             execution_mode = "worker"
         network_allowed = self._network_allowed(execution_mode)
-        candidate_rows = self._candidate_rows(current=started, limit=batch_limit)
+        candidate_rows = self._candidate_rows(
+            current=started,
+            limit=batch_limit,
+            event_id=event_id,
+            event_ids=event_ids,
+        )
         events = [_event_from_row(row) for row in candidate_rows]
-        catalog = self._catalog(events, allow_network=network_allowed and refresh_index, persist=apply)
+        self._provider_days = []
+        catalog = self._catalog(
+            events,
+            allow_network=network_allowed and refresh_index,
+            persist=apply,
+            force_refresh=bool(refresh_index),
+            run_id=run_id,
+        )
         plans = self._plans(events, catalog)
         fetch_ids = sorted({plan.provider_match_id for plan in plans if plan.provider_match_id})
         fetched_by_id: dict[str, FotMobFetchResult] = {}
@@ -932,6 +1152,7 @@ class ResultBackfillRunner:
                         error=None,
                         moment=_now(),
                         apply=apply,
+                        run_id=run_id,
                     )
                 )
                 continue
@@ -953,13 +1174,15 @@ class ResultBackfillRunner:
                         error=fetched.error,
                         moment=_now(),
                         apply=apply,
+                        run_id=run_id,
                     )
                 )
                 continue
-            validation = self._validate(plan.event, fetched.match)
+            validation = self._validate(plan.event, fetched.match, catalog.by_id.get(plan.provider_match_id))
             queue_status = {
                 "VALID_REGULATION": "APPLIED",
                 "VALID_SCOPE_ASSUMED": "APPLIED",
+                "VALID_FT_ONLY": "APPLIED",
                 "EXCLUDED_NON_REGULATION": "EXCLUDED_NON_REGULATION",
                 "NOT_FINISHED": "NOT_FINISHED",
             }.get(validation.status, validation.status)
@@ -973,6 +1196,7 @@ class ResultBackfillRunner:
                     error=None,
                     moment=_now(),
                     apply=apply,
+                    run_id=run_id,
                 )
             )
 
@@ -1000,8 +1224,11 @@ class ResultBackfillRunner:
             "execution_mode": execution_mode,
             "network_allowed": network_allowed,
             "refresh_index": bool(refresh_index),
+            "provider_days": list(self._provider_days),
             "workers": worker_count,
             "candidate_limit": batch_limit,
+            "event_id": event_id,
+            "event_ids_requested": len(event_ids) if event_ids is not None else None,
             "events_selected": len(events),
             "plans": len(plans),
             "provider_ids": len(fetch_ids),
@@ -1010,6 +1237,9 @@ class ResultBackfillRunner:
             "daily_index_matches": len(catalog.by_id),
             "applied": applied,
             "counts": dict(sorted(counts.items())),
+            # The complete fixed-list runner consumes this field.  ``samples``
+            # remains intentionally capped for the lightweight daily CLI/UI.
+            "outcomes": outcomes,
             "samples": outcomes[:50],
             "client_metrics": self.client.metrics_snapshot() if hasattr(self.client, "metrics_snapshot") else {},
         }

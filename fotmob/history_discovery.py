@@ -27,7 +27,7 @@ def _first(mapping: Mapping[str, Any] | None, *keys: str) -> Any:
 
 
 def _text(value: Any) -> str | None:
-    if value is None or isinstance(value, bool):
+    if value is _MISSING or value is None or isinstance(value, bool):
         return None
     if isinstance(value, Mapping):
         for key in ("name", "shortName", "displayName", "label", "text", "value", "type"):
@@ -79,7 +79,8 @@ def _team(value: Any) -> tuple[str | None, str | None]:
         if isinstance(nested, Mapping):
             value = nested
         identifier = _first(value, "id", "teamId", "team_id")
-        name = _first(value, "name", "shortName", "displayName", "teamName")
+        name = next((text for key in ("longName", "name", "shortName", "displayName", "teamName")
+                     if (text := _text(_first(value, key)))), None)
         return (
             None if identifier is _MISSING or identifier is None else str(identifier),
             _text(None if name is _MISSING else name),
@@ -346,6 +347,7 @@ def _record_from_item(
         first_seen_at=first_seen_at,
         source_context=source_context,
         is_next_day=is_next_day,
+        raw_fixture=dict(item),
     )
 
 

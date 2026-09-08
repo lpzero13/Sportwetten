@@ -151,13 +151,17 @@ def test_apply_inserts_only_verified_missing_result_and_evidence(tmp_path: Path)
     ).fetchone()
     assert (queue["status"], queue["attempt_count"]) == ("APPLIED", 1)
     evidence = database.connection.execute(
-        "SELECT validation_status, provider_match_id FROM result_backfill_evidence WHERE event_id = ?",
+        "SELECT validation_status, provider_match_id, source_record_type, result_status, result_use_h2 FROM result_backfill_evidence WHERE event_id = ?",
         (event.event_id,),
     ).fetchone()
     assert (evidence["validation_status"], evidence["provider_match_id"]) == (
         "VALID_REGULATION",
         "fotmob-result-1",
     )
+    assert evidence["source_record_type"] == "FOTMOB_MATCH_DETAIL"
+    assert evidence["result_status"] == "VERIFIED"
+    assert evidence["result_use_h2"] == 1
+    assert database.event_info(event.event_id)["canonical_status"] == "FINISHED"
     assert database.result_backfill_status()["missing_final_results"] == 0
     database.close()
 
@@ -196,6 +200,113 @@ def test_unknown_scope_is_recorded_but_not_promoted(tmp_path: Path) -> None:
     ).fetchone()
     assert (queue["status"], queue["validation_status"]) == ("SCOPE_UNKNOWN", "SCOPE_UNKNOWN")
     database.close()
+
+
+def test_provider_result_revision_and_conflict_are_idempotent(tmp_path: Path) -> None:
+    database = Database(tmp_path / "data" / "tipico.db")
+    try:
+        event = _event()
+        event.event_id = "provider-revision"
+        database.upsert_event(event, "2026-08-22T17:00:00+00:00")
+
+        def evidence(evidence_id: str, ft_home: int, ft_away: int) -> dict[str, object]:
+            return {
+                "evidence_id": evidence_id,
+                "event_id": event.event_id,
+                "provider": "FOTMOB",
+                "provider_match_id": "fm-provider-revision",
+                "fetched_at": "2026-08-23T01:00:00+00:00",
+                "response_status": 200,
+                "match_confidence": 1.0,
+                "identity_status": "EXACT",
+                "validation_status": "VALID_REGULATION",
+                "provider_status": "finished",
+                "scope_status": "REGULATION",
+                "ht_home": 1,
+                "ht_away": 0,
+                "ft_home": ft_home,
+                "ft_away": ft_away,
+                "result_status": "VERIFIED",
+                "result_use_ft": 1,
+                "result_use_h2": 1,
+                "rule_version": "v0.6.5",
+            }
+
+        def result_values(ft_home: int, ft_away: int) -> dict[str, object]:
+            return {
+                "event_id": event.event_id,
+                "competition_id": event.competition_id,
+                "competition_name": event.competition_name,
+                "competition_country": event.competition_country,
+                "home_team": event.home_team,
+                "away_team": event.away_team,
+                "kickoff_at": event.kickoff_time,
+                "ht_home": 1,
+                "ht_away": 0,
+                "ft_home": ft_home,
+                "ft_away": ft_away,
+                "first_half_goals": 1,
+                "second_half_goals": ft_home + ft_away - 1,
+                "second_half_goal_class": "2_PLUS" if ft_home + ft_away - 1 >= 2 else "1",
+                "final_status": "finished",
+                "finished_at": "2026-08-23T01:00:00+00:00",
+                "extra_time": 0,
+                "penalties": 0,
+                "result_source": "FOTMOB_BACKFILL",
+                "result_scope_status": "REGULATION",
+                "result_status": "VERIFIED",
+                "result_use_ft": 1,
+                "result_use_h2": 1,
+                "result_reason": "FOTMOB_BACKFILL_VERIFIED",
+                "result_ht_source": "FOTMOB_BACKFILL",
+                "result_ft_source": "FOTMOB_BACKFILL",
+                "result_rule_version": "v0.6.5",
+            }
+
+        queue = {
+            "event_id": event.event_id,
+            "status": "APPLIED",
+            "attempt_count": 1,
+            "identity_status": "EXACT",
+            "validation_status": "VALID_REGULATION",
+        }
+        first = database.persist_result_backfill_outcome(
+            evidence("provider-revision-1", 2, 0), queue,
+            result_values=result_values(2, 0), run_id="revision-run",
+        )
+        assert first["result_action"] == "INSERTED"
+        assert database.match_result_for_event(event.event_id)["result_revision"] == 0
+
+        second = database.persist_result_backfill_outcome(
+            evidence("provider-revision-2", 3, 0), queue,
+            result_values=result_values(3, 0), run_id="revision-run",
+        )
+        assert second["result_action"] == "RESULT_CONFLICT"
+        row = database.match_result_for_event(event.event_id)
+        assert row is not None
+        assert (row["result_status"], row["result_use_ft"], row["result_revision"]) == (
+            "CONFLICT", 0, 1
+        )
+        changes = database.connection.execute(
+            "SELECT action, revision, new_ft_home FROM result_finalization_changes WHERE event_id = ? ORDER BY change_id",
+            (event.event_id,),
+        ).fetchall()
+        assert [(item["action"], item["revision"], item["new_ft_home"]) for item in changes] == [
+            ("RESULT_INSERTED_BY_PROVIDER", 0, 2),
+            ("PROVIDER_CONFLICT_REVIEW_REQUIRED", 1, 3),
+        ]
+
+        repeated = database.persist_result_backfill_outcome(
+            evidence("provider-revision-2", 3, 0), queue,
+            result_values=result_values(3, 0), run_id="revision-run",
+        )
+        assert repeated["result_action"] == "RESULT_CONFLICT"
+        assert database.connection.execute(
+            "SELECT COUNT(*) FROM result_finalization_changes WHERE event_id = ?",
+            (event.event_id,),
+        ).fetchone()[0] == 2
+    finally:
+        database.close()
 
 
 def test_later_tipico_final_supersedes_backfill_provenance(tmp_path: Path) -> None:

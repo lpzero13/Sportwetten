@@ -374,6 +374,8 @@ class TipicoSource:
             and abs(stored_p1 - p1_recomputed) > P1_TOLERANCE
         )
         result_status = str((result or {}).get("final_status") or "").upper()
+        quality_status = str((result or {}).get("result_status") or "").upper() or None
+        result_source = (result or {}).get("result_source") or ("TIPICO_ORIGINAL" if result else None)
         final_home = _int((result or {}).get("ft_home"))
         final_away = _int((result or {}).get("ft_away"))
         ht_home_result = _int((result or {}).get("ht_home"))
@@ -405,12 +407,25 @@ class TipicoSource:
             h2_goals = final_home + final_away - ht_home - ht_away
         else:
             h2_goals = _int((result or {}).get("second_half_goals"))
-        result_valid = bool(
+        legacy_result_valid = bool(
             result_terminal and result_ht_match and h2_goals is not None and h2_goals >= 0
             and not scope_conflict
             and (result_extra_time is None or _flag_is_zero(result_extra_time))
             and (result_penalties is None or _flag_is_zero(result_penalties))
         )
+        ft_result_valid = bool(
+            result_terminal and final_home is not None and final_away is not None
+            and final_home >= 0 and final_away >= 0
+            and (result or {}).get("result_use_ft", 1) not in (False, 0, "0")
+            and quality_status not in {"CONFLICT", "PENDING", "UNAVAILABLE"}
+        )
+        result_valid = bool(
+            legacy_result_valid
+            and (result or {}).get("result_use_h2", 1) not in (False, 0, "0")
+            and quality_status not in {"CONFLICT", "PENDING", "UNAVAILABLE"}
+        )
+        if result is not None and (result or {}).get("result_use_h2") is None:
+            result_valid = legacy_result_valid
         market_semantics = bool(
             pair_semantics_verified and q0 is not None and q2 is not None and p1_recompute_valid
         )
@@ -500,7 +515,15 @@ class TipicoSource:
             "result_terminal": result_terminal,
             "result_ht_match": result_ht_match,
             "result_valid": result_valid,
-            "result_source": "TIPICO_MATCH_RESULT" if result else None,
+            "ft_result_valid": ft_result_valid,
+            "result_status": quality_status or ("VERIFIED" if result_valid else "PENDING" if result is None else "LEGACY"),
+            "result_use_ft": bool(ft_result_valid),
+            "result_use_h2": bool(result_valid),
+            "result_reason": (result or {}).get("result_reason") if result else "RESULT_MISSING",
+            "result_source": result_source,
+            "result_evidence_id": (result or {}).get("result_evidence_id") if result else None,
+            "result_revision": (result or {}).get("result_revision") if result else None,
+            "result_resolved_at": (result or {}).get("result_resolved_at") if result else None,
             "final_score_home": final_home,
             "final_score_away": final_away,
             "result_extra_time": result_extra_time,
@@ -627,11 +650,13 @@ class TipicoSource:
         )
         day_map: dict[str, dict[str, Any]] = defaultdict(lambda: {
             "date_utc": None, "snapshots": 0, "with_quotes": 0,
-            "with_p1": 0, "with_result": 0, "entry_eligible": 0,
+            "with_p1": 0, "with_ft_result": 0, "with_result": 0,
+            "entry_eligible": 0,
         })
         comp_map: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {
             "competition_country": None, "competition_name": None,
-            "snapshots": 0, "with_result": 0, "entry_eligible": 0,
+            "snapshots": 0, "with_ft_result": 0, "with_result": 0,
+            "entry_eligible": 0,
         })
         for row in observations:
             date = row["observed_date_utc"] or "UNKNOWN"
@@ -640,17 +665,20 @@ class TipicoSource:
             day["snapshots"] += 1
             day["with_quotes"] += int(row["q_zero"] is not None and row["q_two_plus"] is not None)
             day["with_p1"] += int(row["p1_market"] is not None)
+            day["with_ft_result"] += int(row["ft_result_valid"])
             day["with_result"] += int(row["result_valid"])
             day["entry_eligible"] += int(row["entry_eligible"])
             key = (str(row["competition_country"] or "UNKNOWN"), str(row["competition_name"] or "UNKNOWN"))
             comp = comp_map[key]
             comp["competition_country"], comp["competition_name"] = key
             comp["snapshots"] += 1
+            comp["with_ft_result"] += int(row["ft_result_valid"])
             comp["with_result"] += int(row["result_valid"])
             comp["entry_eligible"] += int(row["entry_eligible"])
         findings: list[dict[str, Any]] = []
         def add(code: str, severity: str, evidence: str, risk: str) -> None:
             findings.append({"code": code, "severity": severity, "evidence": evidence, "risk": risk})
+        missing_ft_results = sum(not row["ft_result_valid"] for row in observations)
         missing_results = sum(not row["result_valid"] for row in observations)
         unconfirmed_phase = sum(not row["phase_confirmed"] for row in observations)
         scope_unknown = sum(
@@ -660,6 +688,8 @@ class TipicoSource:
         p1_conflicts = sum("P1_RECOMPUTATION_CONFLICT" in row["quality_flags"] for row in observations)
         if missing_results:
             add("RESULT_COVERAGE_LIMITED", "HIGH", f"{missing_results} von {len(observations)} HT_STABLE-Zeilen sind nicht als vollständiges Ergebnis auflösbar.", "Rendite- und Trefferquoten können durch Ergebnisabdeckung verzerrt werden.")
+        if missing_ft_results and missing_ft_results != missing_results:
+            add("FT_COVERAGE_SEPARATE", "MEDIUM", f"{missing_ft_results} von {len(observations)} HT_STABLE-Zeilen haben keinen freigegebenen FT-Endstand; H2-Abdeckung ist separat.", "FT-Anzeige und H2-Label dürfen nicht gleichgesetzt werden.")
         if unconfirmed_phase:
             add("HALFTIME_PHASE_CONFLICTS", "HIGH", f"{unconfirmed_phase} HT_STABLE-Zeilen haben keinen bestätigten break/HZ/Score-Zustand.", "Ein Snapshot kann außerhalb des vorgesehenen Einstiegszeitpunkts liegen.")
         if scope_unknown:

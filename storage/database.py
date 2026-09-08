@@ -162,7 +162,10 @@ CREATE TABLE IF NOT EXISTS events (
     raw_data_json TEXT NOT NULL DEFAULT '{}',
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
-    last_updated_at TEXT
+    last_updated_at TEXT,
+    canonical_status TEXT,
+    raw_status TEXT,
+    status_normalized_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_first_seen
@@ -394,7 +397,17 @@ CREATE TABLE IF NOT EXISTS match_results (
     result_scope_status TEXT,
     result_resolved_at TEXT,
     result_revision INTEGER NOT NULL DEFAULT 0,
-    result_last_checked_at TEXT
+    result_last_checked_at TEXT,
+    result_status TEXT NOT NULL DEFAULT 'VERIFIED',
+    result_use_ft INTEGER NOT NULL DEFAULT 1,
+    result_use_h2 INTEGER NOT NULL DEFAULT 0,
+    result_reason TEXT,
+    result_raw_status TEXT,
+    result_ht_source TEXT,
+    result_ft_source TEXT,
+    ended_at TEXT,
+    end_observed_at TEXT,
+    result_rule_version TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_match_results_finished_at
@@ -449,6 +462,15 @@ CREATE TABLE IF NOT EXISTS result_backfill_evidence (
     kickoff_at TEXT,
     source_context TEXT NOT NULL,
     raw_payload_path TEXT,
+    source_record_type TEXT,
+    source_record_id TEXT,
+    observed_at TEXT,
+    raw_status TEXT,
+    raw_period TEXT,
+    result_status TEXT,
+    result_use_ft INTEGER,
+    result_use_h2 INTEGER,
+    rule_version TEXT,
     created_at TEXT NOT NULL,
     UNIQUE(event_id, provider, provider_match_id, payload_hash, validation_status)
 );
@@ -458,6 +480,125 @@ CREATE INDEX IF NOT EXISTS idx_result_backfill_evidence_event
 
 CREATE INDEX IF NOT EXISTS idx_result_backfill_evidence_validation
     ON result_backfill_evidence(validation_status, fetched_at DESC);
+
+CREATE TABLE IF NOT EXISTS result_finalization_changes (
+    change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT,
+    event_id TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0,
+    changed_at TEXT NOT NULL,
+    action TEXT NOT NULL,
+    previous_status TEXT,
+    new_status TEXT,
+    previous_ft_home INTEGER,
+    previous_ft_away INTEGER,
+    new_ft_home INTEGER,
+    new_ft_away INTEGER,
+    previous_source TEXT,
+    new_source TEXT,
+    reason TEXT,
+    evidence_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_result_finalization_changes_event
+    ON result_finalization_changes(event_id, change_id DESC);
+
+CREATE TABLE IF NOT EXISTS result_finalization_runs (
+    run_id TEXT PRIMARY KEY,
+    lock_key TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    pid INTEGER,
+    summary_json TEXT,
+    source_database_id TEXT,
+    source_path TEXT,
+    as_of_utc TEXT,
+    code_version TEXT,
+    rule_version TEXT,
+    config_fingerprint TEXT,
+    heartbeat_at TEXT,
+    completed_at TEXT,
+    run_status TEXT,
+    coverage_target_status TEXT,
+    processing_complete INTEGER NOT NULL DEFAULT 0,
+    frozen_event_count INTEGER NOT NULL DEFAULT 0,
+    historical_count INTEGER NOT NULL DEFAULT 0,
+    excluded_count INTEGER NOT NULL DEFAULT 0,
+    backup_path TEXT,
+    report_directory TEXT,
+    inventory_fingerprint TEXT,
+    worker_count INTEGER,
+    last_error TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_result_finalization_runs_lock
+    ON result_finalization_runs(lock_key)
+    WHERE status = 'RUNNING';
+
+CREATE INDEX IF NOT EXISTS idx_result_finalization_runs_started
+    ON result_finalization_runs(started_at DESC, run_id);
+
+CREATE TABLE IF NOT EXISTS result_finalization_items (
+    run_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    cohort TEXT NOT NULL,
+    eligibility_reason TEXT,
+    local_status TEXT,
+    provider_status TEXT,
+    resolution_status TEXT,
+    stage TEXT NOT NULL DEFAULT 'PENDING',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    last_error TEXT,
+    provider_match_id TEXT,
+    evidence_id TEXT,
+    result_revision INTEGER,
+    before_result_use_ft INTEGER,
+    before_result_use_h2 INTEGER,
+    after_result_use_ft INTEGER,
+    after_result_use_h2 INTEGER,
+    before_entry_h2_usable INTEGER,
+    after_entry_h2_usable INTEGER,
+    before_entry_eligible INTEGER,
+    after_entry_eligible INTEGER,
+    before_backtest_ready INTEGER,
+    after_backtest_ready INTEGER,
+    checked_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, event_id),
+    FOREIGN KEY (run_id) REFERENCES result_finalization_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_result_finalization_items_stage
+    ON result_finalization_items(run_id, stage, cohort, updated_at, event_id);
+
+CREATE INDEX IF NOT EXISTS idx_result_finalization_items_event
+    ON result_finalization_items(event_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS result_finalization_provider_days (
+    run_id TEXT NOT NULL,
+    observation_date TEXT NOT NULL,
+    status TEXT NOT NULL,
+    source_endpoint TEXT,
+    fetched_at TEXT,
+    response_status INTEGER,
+    fixture_count INTEGER NOT NULL DEFAULT 0,
+    payload_hash TEXT,
+    parser_status TEXT,
+    error TEXT,
+    existing_cache_rows INTEGER NOT NULL DEFAULT 0,
+    refreshed INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, observation_date),
+    FOREIGN KEY (run_id) REFERENCES result_finalization_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_result_finalization_provider_days_status
+    ON result_finalization_provider_days(run_id, status, observation_date);
 
 CREATE TABLE IF NOT EXISTS market_presence (
     presence_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1255,6 +1396,12 @@ class Database:
         self._ensure_column("snapshots", "extra_time", "INTEGER")
         self._ensure_column("snapshots", "penalties", "INTEGER")
         for column, definition in (
+            ("canonical_status", "TEXT"),
+            ("raw_status", "TEXT"),
+            ("status_normalized_at", "TEXT"),
+        ):
+            self._ensure_column("events", column, definition)
+        for column, definition in (
             ("result_source", "TEXT"),
             ("result_evidence_id", "TEXT"),
             ("result_confidence", "REAL"),
@@ -1262,8 +1409,62 @@ class Database:
             ("result_resolved_at", "TEXT"),
             ("result_revision", "INTEGER NOT NULL DEFAULT 0"),
             ("result_last_checked_at", "TEXT"),
+            ("result_status", "TEXT NOT NULL DEFAULT 'VERIFIED'"),
+            ("result_use_ft", "INTEGER NOT NULL DEFAULT 1"),
+            ("result_use_h2", "INTEGER NOT NULL DEFAULT 0"),
+            ("result_reason", "TEXT"),
+            ("result_raw_status", "TEXT"),
+            ("result_ht_source", "TEXT"),
+            ("result_ft_source", "TEXT"),
+            ("ended_at", "TEXT"),
+            ("end_observed_at", "TEXT"),
+            ("result_rule_version", "TEXT"),
         ):
             self._ensure_column("match_results", column, definition)
+        for column, definition in (
+            ("source_record_type", "TEXT"),
+            ("source_record_id", "TEXT"),
+            ("observed_at", "TEXT"),
+            ("raw_status", "TEXT"),
+            ("raw_period", "TEXT"),
+            ("result_status", "TEXT"),
+            ("result_use_ft", "INTEGER"),
+            ("result_use_h2", "INTEGER"),
+            ("rule_version", "TEXT"),
+        ):
+            self._ensure_column("result_backfill_evidence", column, definition)
+        self._ensure_column("result_finalization_changes", "run_id", "TEXT")
+        for column, definition in (
+            ("source_database_id", "TEXT"),
+            ("source_path", "TEXT"),
+            ("as_of_utc", "TEXT"),
+            ("code_version", "TEXT"),
+            ("rule_version", "TEXT"),
+            ("config_fingerprint", "TEXT"),
+            ("heartbeat_at", "TEXT"),
+            ("completed_at", "TEXT"),
+            ("run_status", "TEXT"),
+            ("coverage_target_status", "TEXT"),
+            ("processing_complete", "INTEGER NOT NULL DEFAULT 0"),
+            ("frozen_event_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("historical_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("excluded_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("backup_path", "TEXT"),
+            ("report_directory", "TEXT"),
+            ("inventory_fingerprint", "TEXT"),
+            ("worker_count", "INTEGER"),
+            ("last_error", "TEXT"),
+        ):
+            self._ensure_column("result_finalization_runs", column, definition)
+        for column, definition in (
+            ("before_result_use_h2", "INTEGER"),
+            ("after_result_use_h2", "INTEGER"),
+            ("before_entry_eligible", "INTEGER"),
+            ("after_entry_eligible", "INTEGER"),
+            ("before_backtest_ready", "INTEGER"),
+            ("after_backtest_ready", "INTEGER"),
+        ):
+            self._ensure_column("result_finalization_items", column, definition)
         self._ensure_column("paper_market_state", "raw_payload_json", "TEXT")
         for column, definition in (
             ("connection_pool_size", "INTEGER"),
@@ -1291,6 +1492,7 @@ class Database:
         )
         self._ensure_snapshot_unique_index()
         self._backfill_competitions()
+        self._backfill_result_finalization_columns()
         self.connection.execute(
             """
             INSERT OR IGNORE INTO paper_runtime_settings
@@ -1367,6 +1569,99 @@ class Database:
             self.connection.execute(
                 f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
             )
+
+    def _backfill_result_finalization_columns(self) -> None:
+        """Initialize V0.6.5 quality fields without rewriting raw history.
+
+        Older databases only had ``final_status`` and score columns.  The
+        migration deliberately derives conservative use flags from those
+        fields: a complete regular-time score may be used for FT and H2,
+        while a missing half-time or unknown scope remains visible but is not
+        silently released for H2 settlement.
+        """
+
+        self.connection.execute(
+            """
+            UPDATE events
+            SET raw_status = COALESCE(raw_status, status),
+                canonical_status = CASE
+                    WHEN lower(COALESCE(status, '')) IN
+                        ('finished', 'ended', 'complete', 'completed', 'final', 'full_time')
+                        THEN 'FINISHED'
+                    WHEN lower(COALESCE(status, '')) IN ('running', 'live', 'extra_time')
+                        THEN 'LIVE'
+                    WHEN lower(COALESCE(status, '')) IN ('break', 'half_time', 'halftime', 'ht')
+                        THEN 'HALFTIME'
+                    WHEN lower(COALESCE(status, '')) IN ('pre_match', 'prematch')
+                        THEN 'SCHEDULED'
+                    WHEN lower(COALESCE(status, '')) IN ('cancelled', 'canceled')
+                        THEN 'CANCELLED'
+                    WHEN lower(COALESCE(status, '')) = 'postponed'
+                        THEN 'POSTPONED'
+                    WHEN lower(COALESCE(status, '')) = 'abandoned'
+                        THEN 'ABANDONED'
+                    ELSE COALESCE(canonical_status, 'UNKNOWN')
+                END
+            WHERE raw_status IS NULL OR canonical_status IS NULL
+            """
+        )
+        self.connection.execute(
+            """
+            UPDATE match_results
+            SET result_source = COALESCE(result_source, 'TIPICO_ORIGINAL'),
+                result_raw_status = COALESCE(result_raw_status, final_status),
+                result_status = CASE
+                    WHEN ft_home IS NOT NULL AND ft_away IS NOT NULL
+                         AND CAST(ft_home AS INTEGER) >= 0
+                         AND CAST(ft_away AS INTEGER) >= 0
+                         AND lower(COALESCE(final_status, '')) IN
+                             ('finished', 'ended', 'complete', 'completed', 'final', 'full_time')
+                        THEN 'VERIFIED'
+                    WHEN ft_home IS NOT NULL OR ft_away IS NOT NULL
+                        THEN 'PARTIAL'
+                    ELSE 'PENDING'
+                END,
+                result_use_ft = CASE
+                    WHEN ft_home IS NOT NULL AND ft_away IS NOT NULL
+                         AND CAST(ft_home AS INTEGER) >= 0
+                         AND CAST(ft_away AS INTEGER) >= 0
+                         AND lower(COALESCE(final_status, '')) IN
+                             ('finished', 'ended', 'complete', 'completed', 'final', 'full_time')
+                         AND COALESCE(extra_time, 0) = 0
+                         AND COALESCE(penalties, 0) = 0
+                        THEN 1 ELSE 0 END,
+                result_use_h2 = CASE
+                    WHEN ht_home IS NOT NULL AND ht_away IS NOT NULL
+                         AND ft_home IS NOT NULL AND ft_away IS NOT NULL
+                         AND CAST(ht_home AS INTEGER) >= 0
+                         AND CAST(ht_away AS INTEGER) >= 0
+                         AND CAST(ft_home AS INTEGER) >= CAST(ht_home AS INTEGER)
+                         AND CAST(ft_away AS INTEGER) >= CAST(ht_away AS INTEGER)
+                         AND lower(COALESCE(final_status, '')) IN
+                             ('finished', 'ended', 'complete', 'completed', 'final', 'full_time')
+                         AND extra_time = 0 AND penalties = 0
+                        THEN 1 ELSE 0 END,
+                result_reason = COALESCE(
+                    result_reason,
+                    CASE
+                        WHEN ft_home IS NULL OR ft_away IS NULL THEN 'MISSING_FT'
+                        WHEN ht_home IS NULL OR ht_away IS NULL THEN 'HT_MISSING'
+                        WHEN ft_home < ht_home OR ft_away < ht_away THEN 'INVALID_FT_BELOW_HT'
+                        WHEN extra_time IS NULL OR penalties IS NULL THEN 'SCOPE_UNKNOWN'
+                        WHEN extra_time != 0 OR penalties != 0 THEN 'NON_REGULATION_SCOPE'
+                        ELSE 'LEGACY_COMPLETE'
+                    END
+                ),
+                result_ht_source = COALESCE(result_ht_source, result_source),
+                result_ft_source = COALESCE(result_ft_source, result_source),
+                ended_at = COALESCE(ended_at, finished_at),
+                end_observed_at = COALESCE(end_observed_at, finished_at),
+                result_resolved_at = COALESCE(result_resolved_at, finished_at),
+                result_last_checked_at = COALESCE(result_last_checked_at, finished_at),
+                result_rule_version = COALESCE(result_rule_version, 'v0.6.5-migration')
+            WHERE result_rule_version IS NULL
+            """
+        )
 
     def _backfill_competitions(self) -> None:
         """Populate the new metadata table for events collected by V0.1."""
@@ -2960,7 +3255,10 @@ class Database:
             "second_half_goal_class", "final_status", "finished_at", "extra_time",
             "penalties", "result_source", "result_evidence_id",
             "result_confidence", "result_scope_status", "result_resolved_at",
-            "result_revision", "result_last_checked_at",
+            "result_revision", "result_last_checked_at", "result_status",
+            "result_use_ft", "result_use_h2", "result_reason",
+            "result_raw_status", "result_ht_source", "result_ft_source",
+            "ended_at", "end_observed_at", "result_rule_version",
         )
         result_values = dict(values)
         # This method is the canonical Tipico collector write path.  A later
@@ -2976,8 +3274,55 @@ class Database:
             result_values.get("result_last_checked_at") or result_values.get("finished_at")
         )
         result_values.setdefault("result_revision", 0)
+        result_values.setdefault("result_raw_status", result_values.get("final_status"))
+        result_values.setdefault("result_status", "VERIFIED")
+        result_values.setdefault(
+            "result_use_ft",
+            int(
+                result_values.get("ft_home") is not None
+                and result_values.get("ft_away") is not None
+                and result_values.get("extra_time") in (0, False)
+                and result_values.get("penalties") in (0, False)
+            ),
+        )
+        result_values.setdefault(
+            "result_use_h2",
+            int(
+                result_values.get("ht_home") is not None
+                and result_values.get("ht_away") is not None
+                and result_values.get("ft_home") is not None
+                and result_values.get("ft_away") is not None
+                and result_values.get("ft_home") >= result_values.get("ht_home")
+                and result_values.get("ft_away") >= result_values.get("ht_away")
+                and result_values.get("extra_time") in (0, False)
+                and result_values.get("penalties") in (0, False)
+            ),
+        )
+        result_values.setdefault(
+            "result_reason",
+            "TIPICO_FINAL_OBSERVATION" if result_values.get("result_use_ft") else "RESULT_QUALITY_REVIEW",
+        )
+        result_values.setdefault("result_ht_source", result_values.get("result_source"))
+        result_values.setdefault("result_ft_source", result_values.get("result_source"))
+        result_values.setdefault("ended_at", result_values.get("finished_at"))
+        result_values.setdefault("end_observed_at", result_values.get("finished_at"))
+        result_values.setdefault("result_rule_version", "v0.6.5")
         params = tuple(result_values.get(column) for column in columns)
+        revision_fields = (
+            "ht_home", "ht_away", "ft_home", "ft_away", "first_half_goals",
+            "second_half_goals", "second_half_goal_class", "result_source",
+            "result_evidence_id", "result_scope_status", "result_status",
+            "result_use_ft", "result_use_h2", "result_reason",
+        )
         with self._lock:
+            previous = self.connection.execute(
+                "SELECT * FROM match_results WHERE event_id = ?",
+                (str(values["event_id"]),),
+            ).fetchone()
+            revision_change = bool(
+                previous is not None
+                and any(previous[field] != result_values.get(field) for field in revision_fields)
+            )
             with self.connection:
                 self.connection.execute(
                     f"""
@@ -3006,11 +3351,56 @@ class Database:
                         result_confidence = excluded.result_confidence,
                         result_scope_status = excluded.result_scope_status,
                         result_resolved_at = excluded.result_resolved_at,
-                        result_revision = COALESCE(match_results.result_revision, 0),
-                        result_last_checked_at = excluded.result_last_checked_at
+                        result_revision = COALESCE(match_results.result_revision, 0)
+                            + CASE WHEN match_results.ht_home IS NOT excluded.ht_home
+                                      OR match_results.ht_away IS NOT excluded.ht_away
+                                      OR match_results.ft_home IS NOT excluded.ft_home
+                                      OR match_results.ft_away IS NOT excluded.ft_away
+                                      OR match_results.first_half_goals IS NOT excluded.first_half_goals
+                                      OR match_results.second_half_goals IS NOT excluded.second_half_goals
+                                      OR match_results.second_half_goal_class IS NOT excluded.second_half_goal_class
+                                      OR match_results.result_source IS NOT excluded.result_source
+                                      OR match_results.result_evidence_id IS NOT excluded.result_evidence_id
+                                      OR match_results.result_scope_status IS NOT excluded.result_scope_status
+                                      OR match_results.result_status IS NOT excluded.result_status
+                                      OR match_results.result_use_ft IS NOT excluded.result_use_ft
+                                      OR match_results.result_use_h2 IS NOT excluded.result_use_h2
+                                      OR match_results.result_reason IS NOT excluded.result_reason
+                                   THEN 1 ELSE 0 END,
+                        result_last_checked_at = excluded.result_last_checked_at,
+                        result_status = excluded.result_status,
+                        result_use_ft = excluded.result_use_ft,
+                        result_use_h2 = excluded.result_use_h2,
+                        result_reason = excluded.result_reason,
+                        result_raw_status = excluded.result_raw_status,
+                        result_ht_source = excluded.result_ht_source,
+                        result_ft_source = excluded.result_ft_source,
+                        ended_at = excluded.ended_at,
+                        end_observed_at = excluded.end_observed_at,
+                        result_rule_version = excluded.result_rule_version
                     """,
                     params,
                 )
+                if revision_change:
+                    self._record_result_finalization_change_locked(
+                        run_id=None,
+                        event_id=str(values["event_id"]),
+                        revision=int(previous["result_revision"] or 0) + 1,
+                        changed_at=result_values.get("result_last_checked_at") or _now_iso(),
+                        action="TIPICO_RESULT_REVISION",
+                        previous=dict(previous),
+                        new_status=result_values.get("result_status"),
+                        new_ft_home=result_values.get("ft_home"),
+                        new_ft_away=result_values.get("ft_away"),
+                        new_source=result_values.get("result_source"),
+                        reason=(
+                            "TIPICO_PROVIDER_CORRECTION"
+                            if previous["ft_home"] != result_values.get("ft_home")
+                            or previous["ft_away"] != result_values.get("ft_away")
+                            else "TIPICO_RESULT_QUALITY_CORRECTION"
+                        ),
+                        evidence_id=result_values.get("result_evidence_id"),
+                    )
             row = self.connection.execute(
                 "SELECT * FROM match_results WHERE event_id = ?",
                 (str(values["event_id"]),),
@@ -3122,12 +3512,844 @@ class Database:
             "evidence_rows": sum(int(row["n"] or 0) for row in evidence_rows),
         }
 
+    def source_database_identity(self) -> str:
+        """Return a cheap logical identity for the currently opened SQLite DB.
+
+        The identity intentionally includes SQLite/WAL facts and schema
+        metadata instead of hashing only the main file.  A main-file hash is
+        not a sufficient identity while WAL is active and hashing a large
+        production database on every heartbeat would be unnecessarily costly.
+        """
+
+        with self._lock:
+            page_count = self.connection.execute("PRAGMA page_count").fetchone()[0]
+            page_size = self.connection.execute("PRAGMA page_size").fetchone()[0]
+            schema_version = self.connection.execute("PRAGMA schema_version").fetchone()[0]
+            user_version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+            journal_mode = self.connection.execute("PRAGMA journal_mode").fetchone()[0]
+            schema_rows = self.connection.execute(
+                """SELECT type, name, sql FROM sqlite_master
+                   WHERE sql IS NOT NULL ORDER BY type, name"""
+            ).fetchall()
+        try:
+            stat = self.path.stat()
+            file_info = {
+                "path": str(self.path.resolve()),
+                "size_bytes": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        except OSError:
+            file_info = {"path": str(self.path.resolve())}
+        payload = {
+            "file": file_info,
+            "page_count": int(page_count or 0),
+            "page_size": int(page_size or 0),
+            "schema_version": int(schema_version or 0),
+            "user_version": int(user_version or 0),
+            "journal_mode": str(journal_mode or ""),
+            "wal_size_bytes": self.wal_observability()["wal_size_bytes"],
+            "schema": [tuple(row) for row in schema_rows],
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+
+    def quick_check(self) -> str:
+        """Run SQLite's integrity check without changing application data."""
+
+        with self._lock:
+            row = self.connection.execute("PRAGMA quick_check").fetchone()
+        return str(row[0]) if row else "unknown"
+
+    def backup_to(self, target: Path | str) -> Path:
+        """Create a consistent SQLite backup using the native backup API."""
+
+        destination = Path(target).expanduser().resolve()
+        if destination == self.path.resolve():
+            raise ValueError("backup target must differ from the source database")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            raise FileExistsError(f"backup target already exists: {destination}")
+        dest_connection = sqlite3.connect(destination, timeout=30)
+        try:
+            with self._lock:
+                self.connection.commit()
+                self.connection.backup(dest_connection)
+            dest_connection.commit()
+            check = dest_connection.execute("PRAGMA quick_check").fetchone()
+            if not check or str(check[0]).lower() != "ok":
+                raise RuntimeError(f"SQLite backup quick_check failed: {check[0] if check else 'unknown'}")
+        finally:
+            dest_connection.close()
+        return destination
+
+    def create_result_finalization_run(self, values: Mapping[str, Any]) -> str:
+        """Insert one persistent recovery run and return its run id."""
+
+        run_id = str(values.get("run_id") or uuid.uuid4())
+        started = str(values.get("started_at") or _now_iso())
+        columns = (
+            "run_id", "lock_key", "started_at", "finished_at", "status", "mode", "pid",
+            "summary_json", "source_database_id", "source_path", "as_of_utc", "code_version",
+            "rule_version", "config_fingerprint", "heartbeat_at", "completed_at", "run_status",
+            "coverage_target_status", "processing_complete", "frozen_event_count", "historical_count",
+            "excluded_count", "backup_path", "report_directory", "inventory_fingerprint",
+            "worker_count", "last_error",
+        )
+        row = {column: values.get(column) for column in columns}
+        row.update({
+            "run_id": run_id,
+            "lock_key": str(values.get("lock_key") or "default"),
+            "started_at": started,
+            "status": str(values.get("status") or "RUNNING"),
+            "mode": str(values.get("mode") or "full_inventory"),
+            "pid": values.get("pid"),
+            "heartbeat_at": str(values.get("heartbeat_at") or started),
+            "run_status": str(values.get("run_status") or values.get("status") or "RUNNING"),
+            "coverage_target_status": str(values.get("coverage_target_status") or "NOT_EVALUATED"),
+            "processing_complete": int(bool(values.get("processing_complete", False))),
+            "frozen_event_count": int(values.get("frozen_event_count") or 0),
+            "historical_count": int(values.get("historical_count") or 0),
+            "excluded_count": int(values.get("excluded_count") or 0),
+            "worker_count": values.get("worker_count"),
+        })
+        with self._lock, self.connection:
+            self.connection.execute(
+                f"INSERT INTO result_finalization_runs ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                tuple(row.get(column) for column in columns),
+            )
+        return run_id
+
+    def update_result_finalization_run(self, run_id: str, **values: Any) -> None:
+        allowed = {
+            "source_database_id", "source_path", "as_of_utc", "code_version", "rule_version",
+            "config_fingerprint", "finished_at", "summary_json", "heartbeat_at", "completed_at", "status", "run_status",
+            "coverage_target_status", "processing_complete", "frozen_event_count", "historical_count",
+            "excluded_count", "backup_path", "report_directory", "inventory_fingerprint",
+            "worker_count", "last_error",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        if not updates:
+            return
+        if "summary_json" in updates and not isinstance(updates["summary_json"], str):
+            updates["summary_json"] = json.dumps(updates["summary_json"], ensure_ascii=False, default=str)
+        if "heartbeat_at" not in updates and any(key in updates for key in {"status", "run_status", "processing_complete"}):
+            updates["heartbeat_at"] = _now_iso()
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        with self._lock, self.connection:
+            self.connection.execute(
+                f"UPDATE result_finalization_runs SET {assignments} WHERE run_id = ?",
+                tuple(updates.values()) + (str(run_id),),
+            )
+
+    def result_finalization_run(self, run_id: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.connection.execute(
+                "SELECT * FROM result_finalization_runs WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+
+    def seed_result_finalization_inventory(self, run_id: str, *, as_of_utc: str) -> dict[str, int | str]:
+        """Freeze one event-grain checklist before any provider work starts."""
+
+        try:
+            moment = datetime.fromisoformat(str(as_of_utc).replace("Z", "+00:00"))
+        except ValueError:
+            moment = datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        moment = moment.astimezone(timezone.utc)
+        cutoff = moment - timedelta(hours=24)
+        now_text = moment.isoformat()
+        void_statuses = {"cancelled", "canceled", "postponed", "abandoned"}
+        rows = self.connection.execute(
+            "SELECT event_id, kickoff_time, status, period, first_seen_at, last_seen_at, last_updated_at FROM events WHERE lower(sport) = 'soccer' ORDER BY kickoff_time, event_id"
+        ).fetchall()
+        # A few legacy rows can lack a kickoff time.  Do not silently drop an
+        # old row from the recovery denominator when its durable observation
+        # history proves that it is at least 24 hours old.  Keep genuinely
+        # un-ageable rows in the explicit AGE_UNKNOWN cohort.
+        latest_observed: dict[str, datetime] = {}
+
+        def remember_observation(event_id: Any, value: Any) -> None:
+            observed = _parse_timestamp(value)
+            if observed is None:
+                return
+            key = str(event_id)
+            if key not in latest_observed or observed > latest_observed[key]:
+                latest_observed[key] = observed
+
+        for row in rows:
+            for field in ("first_seen_at", "last_seen_at", "last_updated_at"):
+                remember_observation(row["event_id"], row[field])
+        for table in ("current_event_state", "event_states", "snapshots"):
+            table_exists = self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if table_exists is None:
+                continue
+            columns = {
+                str(item["name"])
+                for item in self.connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if "event_id" not in columns or "observed_at" not in columns:
+                continue
+            for observation in self.connection.execute(
+                f"SELECT event_id, MAX(observed_at) AS observed_at FROM {table} GROUP BY event_id"
+            ).fetchall():
+                remember_observation(observation["event_id"], observation["observed_at"])
+        inventory_tokens: list[str] = []
+        historical = excluded = 0
+        with self._lock, self.connection:
+            for row in rows:
+                event_id = str(row["event_id"])
+                kickoff = None
+                if row["kickoff_time"]:
+                    try:
+                        kickoff = datetime.fromisoformat(str(row["kickoff_time"]).replace("Z", "+00:00"))
+                        if kickoff.tzinfo is None:
+                            kickoff = kickoff.replace(tzinfo=timezone.utc)
+                        kickoff = kickoff.astimezone(timezone.utc)
+                    except ValueError:
+                        kickoff = None
+                status_token = _status_token(row["status"])
+                status_is_terminal = status_token in (FINISHED_EVENT_STATUSES | {"no_longer_live"})
+                if kickoff is None:
+                    last_observed = latest_observed.get(event_id)
+                    if last_observed is not None and (
+                        last_observed <= cutoff or status_is_terminal
+                    ):
+                        cohort, reason, stage, resolution = (
+                            "HISTORICAL",
+                            "KICKOFF_MISSING_HISTORICAL_OBSERVATION",
+                            "PENDING_LOCAL",
+                            "PENDING",
+                        )
+                        historical += 1
+                    else:
+                        cohort, reason, stage, resolution = (
+                            "AGE_UNKNOWN",
+                            "KICKOFF_MISSING_OR_INVALID",
+                            "AGE_UNKNOWN",
+                            "AGE_UNKNOWN",
+                        )
+                elif kickoff > cutoff:
+                    cohort, reason, stage, resolution = "NOT_DUE", "KICKOFF_WITHIN_24H", "NOT_DUE", "NOT_DUE"
+                else:
+                    cohort, reason, stage, resolution = "HISTORICAL", "HISTORICAL_DUE", "PENDING_LOCAL", "PENDING"
+                    historical += 1
+                    if status_token in void_statuses:
+                        stage, resolution, reason = "EXCLUDED", "EXCLUDED", f"EXPLICIT_{status_token.upper()}"
+                        excluded += 1
+                if cohort == "HISTORICAL" and status_token in void_statuses and stage != "EXCLUDED":
+                    stage, resolution, reason = "EXCLUDED", "EXCLUDED", f"EXPLICIT_{status_token.upper()}"
+                    excluded += 1
+                result = self.connection.execute(
+                    "SELECT result_use_ft, result_use_h2, result_revision FROM match_results WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()
+                before_ft = result["result_use_ft"] if result else None
+                before_h2 = result["result_use_h2"] if result else None
+                revision = result["result_revision"] if result else None
+                self.connection.execute(
+                    """INSERT OR IGNORE INTO result_finalization_items (
+                           run_id, event_id, cohort, eligibility_reason,
+                           local_status, provider_status, resolution_status, stage,
+                           attempt_count, result_revision, before_result_use_ft,
+                           before_result_use_h2, before_entry_h2_usable,
+                           before_entry_eligible, before_backtest_ready,
+                           created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, 'PENDING', 'PENDING', ?, ?, 0, ?, ?, ?, NULL, NULL, NULL, ?, ?)""",
+                    (str(run_id), event_id, cohort, reason, resolution, stage, revision, before_ft, before_h2, now_text, now_text),
+                )
+                inventory_tokens.append(f"{event_id}|{cohort}|{reason}")
+            fingerprint = hashlib.sha256("\n".join(inventory_tokens).encode("utf-8")).hexdigest()
+            self.connection.execute(
+                "UPDATE result_finalization_runs SET frozen_event_count = ?, historical_count = ?, excluded_count = ?, inventory_fingerprint = ?, heartbeat_at = ? WHERE run_id = ?",
+                (len(rows), historical, excluded, fingerprint, now_text, str(run_id)),
+            )
+        return {
+            "frozen_event_count": len(rows),
+            "historical_count": historical,
+            "excluded_count": excluded,
+            "inventory_fingerprint": fingerprint,
+        }
+
+    def update_result_finalization_item(self, run_id: str, event_id: str, **values: Any) -> None:
+        allowed = {
+            "eligibility_reason", "local_status", "provider_status", "resolution_status", "stage",
+            "attempt_count", "next_attempt_at", "last_error", "provider_match_id", "evidence_id",
+            "result_revision", "before_result_use_ft", "after_result_use_ft", "before_entry_h2_usable",
+            "before_result_use_h2", "after_result_use_h2", "after_entry_h2_usable",
+            "before_entry_eligible", "after_entry_eligible", "before_backtest_ready", "after_backtest_ready",
+            "checked_at", "completed_at",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        if not updates:
+            return
+        updates["updated_at"] = _now_iso()
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        with self._lock, self.connection:
+            self.connection.execute(
+                f"UPDATE result_finalization_items SET {assignments} WHERE run_id = ? AND event_id = ?",
+                tuple(updates.values()) + (str(run_id), str(event_id)),
+            )
+
+    def update_result_finalization_items_bulk(
+        self,
+        run_id: str,
+        rows: Iterable[Mapping[str, Any]],
+    ) -> int:
+        """Update many run items in one short transaction."""
+
+        allowed = {
+            "eligibility_reason", "local_status", "provider_status", "resolution_status", "stage",
+            "attempt_count", "next_attempt_at", "last_error", "provider_match_id", "evidence_id",
+            "result_revision", "before_result_use_ft", "after_result_use_ft", "before_entry_h2_usable",
+            "before_result_use_h2", "after_result_use_h2", "after_entry_h2_usable",
+            "before_entry_eligible", "after_entry_eligible", "before_backtest_ready", "after_backtest_ready",
+            "checked_at", "completed_at",
+        }
+        count = 0
+        with self._lock, self.connection:
+            for item in rows:
+                event_id = item.get("event_id")
+                if event_id is None:
+                    continue
+                updates = {key: value for key, value in item.items() if key in allowed}
+                if not updates:
+                    continue
+                updates["updated_at"] = _now_iso()
+                assignments = ", ".join(f"{key} = ?" for key in updates)
+                self.connection.execute(
+                    f"UPDATE result_finalization_items SET {assignments} WHERE run_id = ? AND event_id = ?",
+                    tuple(updates.values()) + (str(run_id), str(event_id)),
+                )
+                count += 1
+        return count
+
+    def result_finalization_items(
+        self,
+        run_id: str,
+        *,
+        stages: Iterable[str] | None = None,
+        cohorts: Iterable[str] | None = None,
+        limit: int | None = None,
+    ) -> list[sqlite3.Row]:
+        clauses = ["run_id = ?"]
+        params: list[Any] = [str(run_id)]
+        if stages:
+            values = tuple(str(value) for value in stages)
+            clauses.append(f"stage IN ({', '.join('?' for _ in values)})")
+            params.extend(values)
+        if cohorts:
+            values = tuple(str(value) for value in cohorts)
+            clauses.append(f"cohort IN ({', '.join('?' for _ in values)})")
+            params.extend(values)
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self._lock:
+            return list(self.connection.execute(
+                f"SELECT * FROM result_finalization_items WHERE {' AND '.join(clauses)} ORDER BY event_id{limit_sql}",
+                params,
+            ).fetchall())
+
+    def record_result_finalization_provider_day(
+        self,
+        run_id: str,
+        observation_date: str,
+        *,
+        status: str,
+        source_endpoint: str | None = None,
+        fetched_at: str | None = None,
+        response_status: int | None = None,
+        fixture_count: int = 0,
+        payload_hash: str | None = None,
+        parser_status: str | None = None,
+        error: str | None = None,
+        existing_cache_rows: int = 0,
+        refreshed: bool = False,
+    ) -> None:
+        with self._lock, self.connection:
+            self.connection.execute(
+                """INSERT INTO result_finalization_provider_days (
+                       run_id, observation_date, status, source_endpoint,
+                       fetched_at, response_status, fixture_count, payload_hash,
+                       parser_status, error, existing_cache_rows, refreshed, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(run_id, observation_date) DO UPDATE SET
+                       status = excluded.status,
+                       source_endpoint = excluded.source_endpoint,
+                       fetched_at = excluded.fetched_at,
+                       response_status = excluded.response_status,
+                       fixture_count = excluded.fixture_count,
+                       payload_hash = excluded.payload_hash,
+                       parser_status = excluded.parser_status,
+                       error = excluded.error,
+                       existing_cache_rows = excluded.existing_cache_rows,
+                       refreshed = excluded.refreshed,
+                       updated_at = excluded.updated_at""",
+                (
+                    str(run_id), str(observation_date), str(status), source_endpoint,
+                    fetched_at, response_status, max(0, int(fixture_count)), payload_hash,
+                    parser_status, error, max(0, int(existing_cache_rows)), int(bool(refreshed)),
+                    _now_iso(),
+                ),
+            )
+
+    def result_finalization_provider_days(self, run_id: str) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.connection.execute(
+                "SELECT * FROM result_finalization_provider_days WHERE run_id = ? ORDER BY observation_date",
+                (str(run_id),),
+            ).fetchall())
+
+    def result_finalization_status(self) -> dict[str, Any]:
+        """Return V0.6.5 quality coverage for the Data/Debug UI."""
+
+        with self._lock:
+            status_rows = self.connection.execute(
+                "SELECT COALESCE(result_status, 'PENDING') AS status, COUNT(*) AS n FROM match_results GROUP BY COALESCE(result_status, 'PENDING')"
+            ).fetchall()
+            missing_pending = self.connection.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM events e
+                LEFT JOIN match_results r ON r.event_id = e.event_id
+                WHERE lower(e.sport) = 'soccer'
+                  AND r.event_id IS NULL
+                  AND (e.kickoff_time IS NULL OR e.kickoff_time <= ?)
+                  AND lower(COALESCE(e.status, '')) NOT IN
+                      ('cancelled', 'canceled', 'postponed', 'abandoned',
+                       'pre_match', 'prematch', 'scheduled', 'running', 'live',
+                       'break', 'half_time', 'halftime', 'ht', 'extra_time')
+                """
+                , (datetime.now(timezone.utc).isoformat(),)
+            ).fetchone()
+            missing_unavailable = self.connection.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM events e
+                LEFT JOIN match_results r ON r.event_id = e.event_id
+                WHERE lower(e.sport) = 'soccer'
+                  AND r.event_id IS NULL
+                  AND lower(COALESCE(e.status, '')) IN
+                      ('cancelled', 'canceled', 'postponed', 'abandoned')
+                """
+            ).fetchone()
+            quality = self.connection.execute(
+                """SELECT
+                       SUM(CASE WHEN result_use_ft = 1 THEN 1 ELSE 0 END) AS ft_ready,
+                       SUM(CASE WHEN result_use_h2 = 1 THEN 1 ELSE 0 END) AS h2_ready,
+                       SUM(CASE WHEN result_status = 'CONFLICT' THEN 1 ELSE 0 END) AS conflicts,
+                       SUM(CASE WHEN result_status = 'PENDING' THEN 1 ELSE 0 END) AS pending,
+                       SUM(CASE WHEN result_status = 'UNAVAILABLE' THEN 1 ELSE 0 END) AS unavailable,
+                       MAX(result_resolved_at) AS last_resolved_at,
+                       MAX(result_last_checked_at) AS last_checked_at
+                   FROM match_results"""
+            ).fetchone()
+            backtest_ready = self.connection.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM match_results r
+                WHERE r.result_use_h2 = 1
+                  AND EXISTS (
+                      SELECT 1 FROM snapshots s
+                      WHERE s.event_id = r.event_id
+                        AND s.snapshot_type IN ('HALFTIME', 'HT_STABLE')
+                        AND COALESCE(s.snapshot_quality, '') != 'FAILED'
+                  )
+                """
+            ).fetchone()
+            queue_rows = self.connection.execute(
+                "SELECT status, COUNT(*) AS n FROM result_backfill_queue GROUP BY status"
+            ).fetchall()
+            run = self.connection.execute(
+                """SELECT * FROM result_finalization_runs
+                   ORDER BY started_at DESC, run_id DESC LIMIT 1"""
+            ).fetchone()
+            recovery_coverage: dict[str, Any] | None = None
+            recovery_items: dict[str, Any] | None = None
+            has_recovery_items = self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'result_finalization_items'"
+            ).fetchone() is not None
+            if run is not None and has_recovery_items:
+                recovery_rows = self.connection.execute(
+                    """SELECT
+                           COUNT(*) AS n_all,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' THEN 1 ELSE 0 END) AS n_historical,
+                           SUM(CASE WHEN cohort = 'NOT_DUE' THEN 1 ELSE 0 END) AS n_not_due,
+                           SUM(CASE WHEN cohort = 'AGE_UNKNOWN' THEN 1 ELSE 0 END) AS n_age_unknown,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage = 'EXCLUDED' THEN 1 ELSE 0 END) AS n_excluded,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage <> 'EXCLUDED' AND after_result_use_ft = 1 THEN 1 ELSE 0 END) AS n_ft,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage <> 'EXCLUDED' AND after_result_use_h2 = 1 THEN 1 ELSE 0 END) AS n_h2,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage <> 'EXCLUDED' AND after_entry_eligible = 1 THEN 1 ELSE 0 END) AS n_entry,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage <> 'EXCLUDED' AND after_entry_h2_usable = 1 THEN 1 ELSE 0 END) AS n_entry_h2,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage <> 'EXCLUDED' AND after_backtest_ready = 1 THEN 1 ELSE 0 END) AS n_backtest,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage = 'BLOCKED_PROVIDER' THEN 1 ELSE 0 END) AS provider_blocked,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage IN ('PROVIDER_PENDING', 'BLOCKED_PROVIDER') THEN 1 ELSE 0 END) AS provider_open,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage NOT IN ('PENDING_LOCAL', 'LOCAL_PROCESSING') THEN 1 ELSE 0 END) AS n_local_checked,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage NOT IN ('COMPLETE', 'EXCLUDED') THEN 1 ELSE 0 END) AS unresolved,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage NOT IN ('COMPLETE', 'EXCLUDED') THEN 1 ELSE 0 END) AS unprocessed,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage <> 'EXCLUDED' AND before_result_use_ft = 1 THEN 1 ELSE 0 END) AS n_ft_before,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage <> 'EXCLUDED' AND before_result_use_h2 = 1 THEN 1 ELSE 0 END) AS n_h2_before,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage <> 'EXCLUDED' AND before_entry_eligible = 1 THEN 1 ELSE 0 END) AS n_entry_before,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage <> 'EXCLUDED' AND before_entry_h2_usable = 1 THEN 1 ELSE 0 END) AS n_entry_h2_before,
+                           SUM(CASE WHEN cohort = 'HISTORICAL' AND stage <> 'EXCLUDED' AND before_backtest_ready = 1 THEN 1 ELSE 0 END) AS n_backtest_before
+                       FROM result_finalization_items WHERE run_id = ?""",
+                    (str(run["run_id"]),),
+                ).fetchone()
+                stage_rows = self.connection.execute(
+                    """SELECT stage, COUNT(*) AS n
+                       FROM result_finalization_items WHERE run_id = ? GROUP BY stage ORDER BY stage""",
+                    (str(run["run_id"]),),
+                ).fetchall()
+                raw = {key: int(value or 0) for key, value in dict(recovery_rows).items()}
+                eligible = max(0, raw.get("n_historical", 0) - raw.get("n_excluded", 0))
+                entry = raw.get("n_entry", 0)
+
+                def _ratio(value: int, denominator: int) -> float | None:
+                    return None if denominator <= 0 else value / denominator
+
+                def _missing(value: int, denominator: int) -> int | None:
+                    return None if denominator <= 0 else max(0, (9 * denominator + 9) // 10 - value)
+
+                processing_complete = raw.get("unprocessed", 0) == 0
+                raw.update({
+                    "n_eligible": eligible,
+                    "local_coverage": _ratio(raw.get("n_local_checked", 0), raw.get("n_historical", 0)),
+                    "processing_complete": int(processing_complete),
+                    "unresolved": max(0, eligible - raw.get("n_ft", 0)),
+                    "ft_coverage": _ratio(raw.get("n_ft", 0), eligible),
+                    "h2_coverage": _ratio(raw.get("n_h2", 0), eligible),
+                    "entry_h2_coverage": _ratio(raw.get("n_entry_h2", 0), entry),
+                    "backtest_coverage": _ratio(raw.get("n_backtest", 0), entry),
+                    "ft_target_status": "NOT_EVALUATED" if eligible <= 0 else "MET" if raw.get("n_ft", 0) / eligible >= 0.90 else "NOT_MET",
+                    "entry_h2_target_status": "NOT_EVALUATED" if entry <= 0 else "MET" if raw.get("n_entry_h2", 0) / entry >= 0.90 else "NOT_MET",
+                    "missing_ft_to_90": _missing(raw.get("n_ft", 0), eligible),
+                    "missing_entry_h2_to_90": _missing(raw.get("n_entry_h2", 0), entry),
+                    "provider_blocked": raw.get("provider_blocked", 0),
+                    "provider_open": raw.get("provider_open", 0),
+                })
+                raw["ft_gap_to_90_pct_points"] = None if raw["ft_coverage"] is None else round((raw["ft_coverage"] - 0.90) * 100, 4)
+                raw["ft_coverage_historical"] = _ratio(raw.get("n_ft", 0), raw.get("n_historical", 0))
+                raw["entry_h2_gap_to_90_pct_points"] = None if raw["entry_h2_coverage"] is None else round((raw["entry_h2_coverage"] - 0.90) * 100, 4)
+                raw["h2_coverage_historical"] = _ratio(raw.get("n_h2", 0), raw.get("n_historical", 0))
+                recovery_coverage = raw
+                recovery_items = {
+                    "total": int(raw.get("n_all", 0)),
+                    "stages": {str(item["stage"]): int(item["n"] or 0) for item in stage_rows},
+                }
+            changes = self.connection.execute(
+                "SELECT COUNT(*) AS n, MAX(changed_at) AS last_changed_at FROM result_finalization_changes"
+            ).fetchone()
+        status_counts = {str(row["status"]): int(row["n"] or 0) for row in status_rows}
+        status_counts["PENDING"] = status_counts.get("PENDING", 0) + int(
+            (missing_pending["n"] if missing_pending else 0) or 0
+        )
+        status_counts["UNAVAILABLE"] = status_counts.get("UNAVAILABLE", 0) + int(
+            (missing_unavailable["n"] if missing_unavailable else 0) or 0
+        )
+        return {
+            "result_status": status_counts,
+            "ft_ready": int((quality["ft_ready"] if quality else 0) or 0),
+            "h2_ready": int((quality["h2_ready"] if quality else 0) or 0),
+            "backtest_ready": int((backtest_ready["n"] if backtest_ready else 0) or 0),
+            "conflicts": int((quality["conflicts"] if quality else 0) or 0),
+            "pending": status_counts.get("PENDING", 0) + status_counts.get("PARTIAL", 0),
+            "unavailable": status_counts.get("UNAVAILABLE", 0),
+            "last_resolved_at": quality["last_resolved_at"] if quality else None,
+            "last_checked_at": quality["last_checked_at"] if quality else None,
+            "queue": {str(row["status"]): int(row["n"] or 0) for row in queue_rows},
+            "last_run": dict(run) if run else None,
+            "last_run_coverage": recovery_coverage,
+            "last_run_items": recovery_items,
+            "changes": int((changes["n"] if changes else 0) or 0),
+            "last_changed_at": changes["last_changed_at"] if changes else None,
+        }
+
+    def result_finalization_filter_options(self) -> dict[str, list[str]]:
+        """Return complete filter domains for the event-grain result explorer."""
+
+        fields = {
+            "date": "substr(COALESCE(e.kickoff_time, e.last_seen_at), 1, 10)",
+            "country": "e.competition_country",
+            "competition": "e.competition_name",
+            "raw_status": "e.status",
+            "canonical_status": "e.canonical_status",
+            "result_source": "r.result_source",
+            "result_status": "r.result_status",
+        }
+        with self._lock:
+            result: dict[str, list[str]] = {}
+            for name, expression in fields.items():
+                rows = self.connection.execute(
+                    f"""SELECT DISTINCT {expression} AS value
+                        FROM events e
+                        LEFT JOIN match_results r ON r.event_id = e.event_id
+                        WHERE lower(e.sport) = 'soccer' AND {expression} IS NOT NULL AND {expression} <> ''
+                        ORDER BY value COLLATE NOCASE"""
+                ).fetchall()
+                result[name] = [str(row["value"]) for row in rows]
+            return result
+
+    def result_finalization_count(
+        self,
+        *,
+        date_value: str | None = None,
+        country: str | None = None,
+        competition: str | None = None,
+        raw_status: str | None = None,
+        canonical_status: str | None = None,
+        result_source: str | None = None,
+        result_status: str | None = None,
+    ) -> int:
+        """Count the complete soccer inventory after exact explorer filters."""
+
+        clauses, params = self._result_finalization_filter_sql(
+            date_value=date_value, country=country, competition=competition,
+            raw_status=raw_status, canonical_status=canonical_status,
+            result_source=result_source, result_status=result_status,
+        )
+        with self._lock:
+            row = self.connection.execute(
+                f"""SELECT COUNT(*) AS n FROM events e
+                    LEFT JOIN match_results r ON r.event_id = e.event_id
+                    WHERE lower(e.sport) = 'soccer' AND {' AND '.join(clauses)}""",
+                params,
+            ).fetchone()
+        return int(row["n"] or 0) if row else 0
+
+    @staticmethod
+    def _result_finalization_filter_sql(
+        *,
+        date_value: str | None = None,
+        country: str | None = None,
+        competition: str | None = None,
+        raw_status: str | None = None,
+        canonical_status: str | None = None,
+        result_source: str | None = None,
+        result_status: str | None = None,
+    ) -> tuple[list[str], list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        filters = (
+            (date_value, "substr(COALESCE(e.kickoff_time, e.last_seen_at), 1, 10) = ?"),
+            (country, "e.competition_country = ?"),
+            (competition, "e.competition_name = ?"),
+            (raw_status, "e.status = ?"),
+            (canonical_status, "e.canonical_status = ?"),
+            (result_source, "r.result_source = ?"),
+            (result_status, "r.result_status = ?"),
+        )
+        for value, clause in filters:
+            if value not in (None, ""):
+                clauses.append(clause)
+                params.append(str(value))
+        return clauses or ["1 = 1"], params
+
+    def result_finalization_rows(
+        self,
+        limit: int | None = 5000,
+        offset: int = 0,
+        *,
+        date_value: str | None = None,
+        country: str | None = None,
+        competition: str | None = None,
+        raw_status: str | None = None,
+        canonical_status: str | None = None,
+        result_source: str | None = None,
+        result_status: str | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return a paged event-grain view after full-database filters.
+
+        ``limit=None`` is supported for callers that explicitly need the
+        complete set.  The UI uses exact SQL filters plus pagination so a
+        large historical database is never silently truncated to the newest
+        5,000 events.
+        """
+
+        clauses, params = self._result_finalization_filter_sql(
+            date_value=date_value, country=country, competition=competition,
+            raw_status=raw_status, canonical_status=canonical_status,
+            result_source=result_source, result_status=result_status,
+        )
+        limit_sql = ""
+        query_params = list(params)
+        if limit is not None:
+            limit_sql = " LIMIT ? OFFSET ?"
+            query_params.extend((max(1, int(limit)), max(0, int(offset))))
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    f"""
+                    SELECT e.event_id, e.kickoff_time,
+                           e.competition_name, e.competition_country,
+                           e.home_team, e.away_team,
+                           e.status AS raw_status, e.period AS raw_period,
+                           e.score_home AS last_score_home,
+                           e.score_away AS last_score_away,
+                           e.canonical_status,
+                           c.status AS current_status,
+                           c.period AS current_period,
+                           c.score_home AS current_score_home,
+                           c.score_away AS current_score_away,
+                           r.final_status, r.ht_home, r.ht_away,
+                           r.ft_home, r.ft_away,
+                           r.result_status, r.result_use_ft, r.result_use_h2,
+                           r.result_source, r.result_evidence_id,
+                           r.result_reason, r.result_scope_status,
+                           r.result_ht_source, r.result_ft_source,
+                           r.result_revision, r.result_resolved_at,
+                           r.result_last_checked_at,
+                           q.status AS queue_status,
+                           ev.source_record_type AS evidence_type,
+                           ev.source_record_id AS evidence_record_id,
+                           ev.observed_at AS evidence_observed_at
+                    FROM events e
+                    LEFT JOIN current_event_state c ON c.event_id = e.event_id
+                    LEFT JOIN match_results r ON r.event_id = e.event_id
+                    LEFT JOIN result_backfill_queue q ON q.event_id = e.event_id
+                    LEFT JOIN result_backfill_evidence ev
+                           ON ev.evidence_id = r.result_evidence_id
+                    WHERE lower(e.sport) = 'soccer' AND {' AND '.join(clauses)}
+                    ORDER BY COALESCE(e.kickoff_time, e.last_seen_at) DESC,
+                             e.event_id DESC
+                    {limit_sql}
+                    """,
+                    query_params,
+                ).fetchall()
+            )
+
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT e.event_id, e.kickoff_time,
+                           e.competition_name, e.competition_country,
+                           e.home_team, e.away_team,
+                           e.status AS raw_status, e.period AS raw_period,
+                           e.score_home AS last_score_home,
+                           e.score_away AS last_score_away,
+                           e.canonical_status,
+                           c.status AS current_status,
+                           c.period AS current_period,
+                           c.score_home AS current_score_home,
+                           c.score_away AS current_score_away,
+                           r.final_status, r.ht_home, r.ht_away,
+                           r.ft_home, r.ft_away,
+                           r.result_status, r.result_use_ft, r.result_use_h2,
+                           r.result_source, r.result_evidence_id,
+                           r.result_reason, r.result_scope_status,
+                           r.result_ht_source, r.result_ft_source,
+                           r.result_revision, r.result_resolved_at,
+                           r.result_last_checked_at,
+                           q.status AS queue_status,
+                           ev.source_record_type AS evidence_type,
+                           ev.source_record_id AS evidence_record_id,
+                           ev.observed_at AS evidence_observed_at
+                    FROM events e
+                    LEFT JOIN current_event_state c ON c.event_id = e.event_id
+                    LEFT JOIN match_results r ON r.event_id = e.event_id
+                    LEFT JOIN result_backfill_queue q ON q.event_id = e.event_id
+                    LEFT JOIN result_backfill_evidence ev
+                           ON ev.evidence_id = r.result_evidence_id
+                    WHERE lower(e.sport) = 'soccer'
+                    ORDER BY COALESCE(e.kickoff_time, e.last_seen_at) DESC,
+                             e.event_id DESC
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+            )
+
+    def result_evidence_for_event(self, event_id: str, limit: int = 100) -> list[sqlite3.Row]:
+        """Return immutable local/provider evidence for one event."""
+
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT evidence_id, provider, provider_match_id,
+                           fetched_at, response_status, match_confidence,
+                           identity_status, validation_status,
+                           validation_flags_json, provider_status, scope_status,
+                           ht_home, ht_away, ft_home, ft_away,
+                           second_half_goals, competition_country,
+                           source_context, source_record_type, source_record_id,
+                           observed_at, raw_status, raw_period, result_status,
+                           result_use_ft, result_use_h2, rule_version, created_at
+                    FROM result_backfill_evidence
+                    WHERE event_id = ?
+                    ORDER BY created_at DESC, evidence_id DESC
+                    LIMIT ?
+                    """,
+                    (str(event_id), max(1, int(limit))),
+                ).fetchall()
+            )
+
+    def _record_result_finalization_change_locked(
+        self,
+        *,
+        run_id: str | None,
+        event_id: str,
+        revision: int,
+        changed_at: str,
+        action: str,
+        previous: Mapping[str, Any] | None,
+        new_status: str | None,
+        new_ft_home: int | None,
+        new_ft_away: int | None,
+        new_source: str | None,
+        reason: str,
+        evidence_id: str | None,
+    ) -> None:
+        """Append one result lineage row while the caller holds the DB lock."""
+
+        def score(value: Any) -> int | None:
+            if isinstance(value, bool):
+                return None
+            try:
+                parsed = int(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+            return parsed
+
+        self.connection.execute(
+            """INSERT INTO result_finalization_changes (
+                   run_id, event_id, revision, changed_at, action,
+                   previous_status, new_status, previous_ft_home,
+                   previous_ft_away, new_ft_home, new_ft_away,
+                   previous_source, new_source, reason, evidence_id
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                run_id,
+                str(event_id),
+                max(0, int(revision)),
+                changed_at,
+                action,
+                previous.get("result_status", previous.get("final_status")) if previous else None,
+                new_status,
+                score(previous.get("ft_home")) if previous else None,
+                score(previous.get("ft_away")) if previous else None,
+                score(new_ft_home),
+                score(new_ft_away),
+                previous.get("result_source") if previous else None,
+                new_source,
+                reason,
+                evidence_id,
+            ),
+        )
+
     def persist_result_backfill_outcome(
         self,
         evidence: Mapping[str, Any],
         queue: Mapping[str, Any],
         *,
         result_values: Mapping[str, Any] | None = None,
+        run_id: str | None = None,
     ) -> dict[str, Any]:
         """Append provider evidence and update one queue row atomically.
 
@@ -3135,6 +4357,11 @@ class Database:
         no final score, or when it is absent.  A complete Tipico result is
         never overwritten by this method.  A caller may still record a
         ``RESULT_CONFLICT`` evidence row for a manual review.
+
+        Result insertions, quality enrichments and conflicts receive a
+        monotonic ``result_revision`` and an event-grain change record.  The
+        optional ``run_id`` links that record to a resumable full-recovery
+        inventory without changing the legacy daily-worker contract.
         """
 
         evidence_columns = (
@@ -3145,7 +4372,10 @@ class Database:
             "ht_home", "ht_away", "ft_home", "ft_away", "second_half_goals",
             "second_half_goal_class", "competition_id", "competition_name",
             "competition_country", "home_team", "away_team", "kickoff_at",
-            "source_context", "raw_payload_path", "created_at",
+            "source_context", "raw_payload_path", "source_record_type",
+            "source_record_id", "observed_at", "raw_status", "raw_period",
+            "result_status", "result_use_ft", "result_use_h2", "rule_version",
+            "created_at",
         )
         evidence_values = dict(evidence)
         flags = evidence_values.get("validation_flags_json", "[]")
@@ -3159,6 +4389,7 @@ class Database:
         evidence_values.setdefault("validation_status", "INVALID")
         evidence_values.setdefault("evidence_id", str(uuid.uuid4()))
         evidence_values.setdefault("event_id", str(queue.get("event_id") or ""))
+        evidence_values.setdefault("rule_version", "v0.6.5")
         evidence_params = tuple(evidence_values.get(column) for column in evidence_columns)
 
         event_id = str(queue.get("event_id") or evidence_values.get("event_id") or "")
@@ -3187,6 +4418,9 @@ class Database:
 
         applied = False
         result_action = "NOT_APPLIED"
+        change_previous: Mapping[str, Any] | None = None
+        change_revision: int | None = None
+        change_action: str | None = None
         with self._lock, self.connection:
             self.connection.execute(
                 f"""
@@ -3214,30 +4448,86 @@ class Database:
                     if existing_ft != incoming_ft:
                         result_action = "RESULT_CONFLICT"
                     else:
-                        self.connection.execute(
-                            """
-                            UPDATE match_results
-                            SET result_source = CASE
-                                    WHEN result_source IS NULL THEN 'CROSS_PROVIDER_CONFIRMED'
-                                    ELSE result_source
-                                END,
-                                result_evidence_id = COALESCE(result_evidence_id, ?),
-                                result_confidence = COALESCE(result_confidence, ?),
-                                result_scope_status = COALESCE(result_scope_status, ?),
-                                result_last_checked_at = ?,
-                                result_revision = COALESCE(result_revision, 0)
-                            WHERE event_id = ?
-                            """,
-                            (
-                                evidence_values.get("evidence_id"),
-                                evidence_values.get("match_confidence"),
-                                evidence_values.get("scope_status"),
-                                evidence_values.get("fetched_at") or _now_iso(),
-                                event_id,
-                            ),
+                        # A previously repaired FT-only result may receive a
+                        # trusted HT from a later provider detail response.
+                        # Fill only missing HT/derived fields; never rewrite a
+                        # frozen Tipico HT with a different provider value.
+                        existing_ht = (result["ht_home"], result["ht_away"])
+                        incoming_ht = (result_values.get("ht_home"), result_values.get("ht_away"))
+                        ht_conflict = (
+                            all(value is not None for value in existing_ht)
+                            and all(value is not None for value in incoming_ht)
+                            and existing_ht != incoming_ht
                         )
-                        applied = True
-                        result_action = "CONFIRMED_EXISTING"
+                        if ht_conflict:
+                            result_action = "RESULT_CONFLICT"
+                        else:
+                            incoming_has_ht = all(value is not None for value in incoming_ht)
+                            previous_revision = int(result["result_revision"] or 0)
+                            changed = bool(
+                                incoming_has_ht and (
+                                    existing_ht != incoming_ht
+                                    or result["first_half_goals"] != result_values.get("first_half_goals")
+                                    or result["second_half_goals"] != result_values.get("second_half_goals")
+                                    or result["second_half_goal_class"] != result_values.get("second_half_goal_class")
+                                    or int(result["result_use_h2"] or 0) != int(result_values.get("result_use_h2", 0) or 0)
+                                )
+                            )
+                            next_revision = previous_revision + 1 if changed else previous_revision
+                            self.connection.execute(
+                                """
+                                UPDATE match_results
+                                SET result_source = CASE
+                                        WHEN result_source IS NULL THEN 'CROSS_PROVIDER_CONFIRMED'
+                                        ELSE result_source
+                                    END,
+                                    result_evidence_id = COALESCE(result_evidence_id, ?),
+                                    result_confidence = COALESCE(result_confidence, ?),
+                                    result_scope_status = COALESCE(result_scope_status, ?),
+                                    ht_home = CASE WHEN ht_home IS NULL AND ? THEN ? ELSE ht_home END,
+                                    ht_away = CASE WHEN ht_away IS NULL AND ? THEN ? ELSE ht_away END,
+                                    first_half_goals = CASE
+                                        WHEN first_half_goals IS NULL AND ? THEN ? ELSE first_half_goals END,
+                                    second_half_goals = CASE
+                                        WHEN second_half_goals IS NULL AND ? THEN ? ELSE second_half_goals END,
+                                    second_half_goal_class = CASE
+                                        WHEN second_half_goal_class IS NULL AND ? THEN ? ELSE second_half_goal_class END,
+                                    result_status = COALESCE(?, result_status),
+                                    result_use_ft = COALESCE(?, result_use_ft),
+                                    result_use_h2 = CASE WHEN ? THEN ? ELSE COALESCE(result_use_h2, 0) END,
+                                    result_reason = CASE WHEN ? THEN ? ELSE result_reason END,
+                                    result_ht_source = CASE WHEN ? THEN COALESCE(result_ht_source, ?) ELSE result_ht_source END,
+                                    result_last_checked_at = ?,
+                                    result_revision = ?,
+                                    result_rule_version = COALESCE(?, 'v0.6.5')
+                                WHERE event_id = ?
+                                """,
+                                (
+                                    evidence_values.get("evidence_id"),
+                                    evidence_values.get("match_confidence"),
+                                    evidence_values.get("scope_status"),
+                                    incoming_has_ht, incoming_ht[0],
+                                    incoming_has_ht, incoming_ht[1],
+                                    incoming_has_ht, result_values.get("first_half_goals"),
+                                    incoming_has_ht, result_values.get("second_half_goals"),
+                                    incoming_has_ht, result_values.get("second_half_goal_class"),
+                                    result_values.get("result_status"),
+                                    result_values.get("result_use_ft"),
+                                    incoming_has_ht, result_values.get("result_use_h2", 0),
+                                    incoming_has_ht, result_values.get("result_reason"),
+                                    incoming_has_ht, result_values.get("result_ht_source", "FOTMOB_BACKFILL"),
+                                    evidence_values.get("fetched_at") or _now_iso(),
+                                    next_revision,
+                                    result_values.get("result_rule_version", "v0.6.5"),
+                                    event_id,
+                                ),
+                            )
+                            applied = True
+                            result_action = "CONFIRMED_EXISTING"
+                            if changed:
+                                change_previous = dict(result)
+                                change_revision = next_revision
+                                change_action = "RESULT_ENRICHED_BY_PROVIDER"
                 elif result is None:
                     columns = (
                         "event_id", "competition_id", "competition_name",
@@ -3248,6 +4538,9 @@ class Database:
                         "extra_time", "penalties", "result_source",
                         "result_evidence_id", "result_confidence", "result_scope_status",
                         "result_resolved_at", "result_revision", "result_last_checked_at",
+                        "result_status", "result_use_ft", "result_use_h2", "result_reason",
+                        "result_raw_status", "result_ht_source", "result_ft_source",
+                        "ended_at", "end_observed_at", "result_rule_version",
                     )
                     values = dict(result_values)
                     values.setdefault("result_source", "FOTMOB_BACKFILL")
@@ -3257,6 +4550,19 @@ class Database:
                     values.setdefault("result_resolved_at", _now_iso())
                     values.setdefault("result_revision", 0)
                     values.setdefault("result_last_checked_at", evidence_values.get("fetched_at"))
+                    values.setdefault("result_status", "VERIFIED")
+                    values.setdefault("result_use_ft", 1)
+                    values.setdefault(
+                        "result_use_h2",
+                        int(values.get("ht_home") is not None and values.get("ht_away") is not None),
+                    )
+                    values.setdefault("result_reason", "FOTMOB_BACKFILL_VERIFIED")
+                    values.setdefault("result_raw_status", values.get("final_status"))
+                    values.setdefault("result_ht_source", values.get("result_source"))
+                    values.setdefault("result_ft_source", values.get("result_source"))
+                    values.setdefault("ended_at", values.get("finished_at"))
+                    values.setdefault("end_observed_at", values.get("finished_at"))
+                    values.setdefault("result_rule_version", "v0.6.5")
                     self.connection.execute(
                         f"""
                         INSERT INTO match_results ({', '.join(columns)})
@@ -3266,8 +4572,27 @@ class Database:
                     )
                     applied = True
                     result_action = "INSERTED"
+                    change_previous = None
+                    change_revision = int(values.get("result_revision") or 0)
+                    change_action = "RESULT_INSERTED_BY_PROVIDER"
                 else:
                     values = dict(result_values)
+                    change_previous = dict(result)
+                    previous_revision = int(result["result_revision"] or 0)
+                    quality_fields = (
+                        "ht_home", "ht_away", "ft_home", "ft_away",
+                        "first_half_goals", "second_half_goals",
+                        "second_half_goal_class", "result_use_ft",
+                        "result_use_h2", "result_status", "result_scope_status",
+                    )
+                    changed = any(
+                        result[field] is None and values.get(field) is not None
+                        for field in quality_fields
+                    ) or (
+                        int(result["result_use_ft"] or 0) != int(values.get("result_use_ft", 1) or 0)
+                        or int(result["result_use_h2"] or 0) != int(values.get("result_use_h2", 0) or 0)
+                    )
+                    next_revision = previous_revision + 1 if changed else previous_revision
                     self.connection.execute(
                         """
                         UPDATE match_results
@@ -3293,8 +4618,18 @@ class Database:
                             result_confidence = COALESCE(result_confidence, ?),
                             result_scope_status = COALESCE(result_scope_status, ?),
                             result_resolved_at = COALESCE(result_resolved_at, ?),
-                            result_revision = COALESCE(result_revision, 0),
-                            result_last_checked_at = ?
+                            result_revision = ?,
+                            result_last_checked_at = ?,
+                            result_status = COALESCE(result_status, ?),
+                            result_use_ft = COALESCE(result_use_ft, ?),
+                            result_use_h2 = COALESCE(result_use_h2, ?),
+                            result_reason = COALESCE(result_reason, ?),
+                            result_raw_status = COALESCE(result_raw_status, ?),
+                            result_ht_source = COALESCE(result_ht_source, ?),
+                            result_ft_source = COALESCE(result_ft_source, ?),
+                            ended_at = COALESCE(ended_at, ?),
+                            end_observed_at = COALESCE(end_observed_at, ?),
+                            result_rule_version = COALESCE(result_rule_version, ?)
                         WHERE event_id = ?
                         """,
                         (
@@ -3308,20 +4643,114 @@ class Database:
                             values.get("finished_at"), values.get("extra_time"),
                             values.get("penalties"), values.get("result_evidence_id"),
                             values.get("result_confidence"), values.get("result_scope_status"),
-                            values.get("result_resolved_at"), values.get("result_last_checked_at"),
+                            values.get("result_resolved_at"), next_revision,
+                            values.get("result_last_checked_at"),
+                            values.get("result_status", "VERIFIED"),
+                            values.get("result_use_ft", 1), values.get("result_use_h2", 0),
+                            values.get("result_reason"), values.get("result_raw_status"),
+                            values.get("result_ht_source"), values.get("result_ft_source"),
+                            values.get("ended_at"), values.get("end_observed_at"),
+                            values.get("result_rule_version", "v0.6.5"),
                             event_id,
                         ),
                     )
                     applied = True
                     result_action = "FILLED_PARTIAL"
+                    if changed:
+                        change_revision = next_revision
+                        change_action = "RESULT_FILLED_PARTIAL"
 
             if result_action == "RESULT_CONFLICT":
                 queue_values["status"] = "CONFLICT"
                 queue_values["resolved_at"] = None
                 queue_values["next_attempt_at"] = None
+                conflict_result = self.connection.execute(
+                    "SELECT * FROM match_results WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()
+                incoming_ft = (
+                    result_values.get("ft_home"), result_values.get("ft_away")
+                ) if result_values is not None else (None, None)
+                previous_revision = int(conflict_result["result_revision"] or 0) if conflict_result else 0
+                last_change = self.connection.execute(
+                    """SELECT new_ft_home, new_ft_away, action
+                       FROM result_finalization_changes
+                       WHERE event_id = ? ORDER BY change_id DESC LIMIT 1""",
+                    (event_id,),
+                ).fetchone()
+                same_conflict = bool(
+                    conflict_result is not None
+                    and str(conflict_result["result_status"] or "") == "CONFLICT"
+                    and str(conflict_result["result_reason"] or "") == "FOTMOB_RESULT_CONFLICT"
+                    and last_change is not None
+                    and last_change["action"] == "PROVIDER_CONFLICT_REVIEW_REQUIRED"
+                    and (last_change["new_ft_home"], last_change["new_ft_away"]) == incoming_ft
+                )
+                if conflict_result is not None and not same_conflict:
+                    next_revision = previous_revision + 1
+                    self.connection.execute(
+                        """UPDATE match_results
+                           SET result_status = 'CONFLICT', result_use_ft = 0,
+                               result_use_h2 = 0,
+                               result_reason = 'FOTMOB_RESULT_CONFLICT',
+                               result_last_checked_at = ?,
+                               result_revision = ?, result_rule_version = ?
+                           WHERE event_id = ?""",
+                        (
+                            evidence_values.get("fetched_at") or _now_iso(),
+                            next_revision, evidence_values.get("rule_version", "v0.6.5"),
+                            event_id,
+                        ),
+                    )
+                    self._record_result_finalization_change_locked(
+                        run_id=run_id,
+                        event_id=event_id,
+                        revision=next_revision,
+                        changed_at=evidence_values.get("fetched_at") or _now_iso(),
+                        action="PROVIDER_CONFLICT_REVIEW_REQUIRED",
+                        previous=dict(conflict_result),
+                        new_status="CONFLICT",
+                        new_ft_home=incoming_ft[0],
+                        new_ft_away=incoming_ft[1],
+                        new_source="FOTMOB_BACKFILL",
+                        reason="FOTMOB_RESULT_CONFLICT",
+                        evidence_id=evidence_values.get("evidence_id"),
+                    )
                 self.connection.execute(
                     "UPDATE result_backfill_evidence SET validation_status = 'RESULT_CONFLICT' WHERE evidence_id = ?",
                     (evidence_values.get("evidence_id"),),
+                )
+            elif change_action is not None:
+                self._record_result_finalization_change_locked(
+                    run_id=run_id,
+                    event_id=event_id,
+                    revision=int(change_revision or 0),
+                    changed_at=evidence_values.get("fetched_at") or _now_iso(),
+                    action=change_action,
+                    previous=change_previous,
+                    new_status=evidence_values.get("result_status"),
+                    new_ft_home=result_values.get("ft_home") if result_values is not None else None,
+                    new_ft_away=result_values.get("ft_away") if result_values is not None else None,
+                    new_source=(
+                        str(result_values.get("result_source") or "FOTMOB_BACKFILL")
+                        if result_values is not None else None
+                    ),
+                    reason=str(result_values.get("result_reason") or "FOTMOB_BACKFILL_RESULT")
+                    if result_values is not None else "FOTMOB_BACKFILL_RESULT",
+                    evidence_id=evidence_values.get("evidence_id"),
+                )
+            if result_action in {"INSERTED", "FILLED_PARTIAL", "CONFIRMED_EXISTING"}:
+                # A provider-confirmed result also repairs the derived game
+                # status, while preserving the raw Tipico observation.
+                self.connection.execute(
+                    """
+                    UPDATE events
+                    SET canonical_status = 'FINISHED',
+                        raw_status = COALESCE(raw_status, status),
+                        status_normalized_at = COALESCE(status_normalized_at, ?)
+                    WHERE event_id = ?
+                    """,
+                    (evidence_values.get("fetched_at") or _now_iso(), event_id),
                 )
             self.connection.execute(
                 f"""
@@ -4569,6 +5998,12 @@ class Database:
             "fotmob_performance_profile",
             "fotmob_coverage_catalog",
             "tipico_market_capability",
+            "result_finalization_runs",
+            "result_finalization_items",
+            "result_finalization_provider_days",
+            "result_finalization_changes",
+            "result_backfill_queue",
+            "result_backfill_evidence",
         }
         if table not in allowed:
             raise ValueError(f"Unsupported table: {table}")

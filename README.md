@@ -1,4 +1,4 @@
-# Tipico Market Intelligence Dashboard V0.6.4
+# Tipico Market Intelligence Dashboard V0.6.5.2
 
 Lokales, read-only Streamlit-Tool zur Beobachtung des öffentlichen Tipico-Live-Fußballfeeds
 mit getrenntem Paper-Trading für die mathematisch definierte `ZERO_OR_2PLUS`-Strategie.
@@ -220,19 +220,32 @@ Die optionalen Einstellungen liegen nach der Installation in
 `git pull` mit Root-Rechten und ein erneuter Aufruf von
 `bash deploy/install_proxmox.sh`.
 
-### Ergebnis-Nachpflege über FotMob
+### Ergebnis-Finalisierung und Nachpflege über FotMob
 
-Der tägliche `wetten-result-backfill.timer` sucht Tipico-Fußballspiele ohne
-vollständigen Endstand. Er verwendet zuerst den lokal gespeicherten FotMob-
-Tagesindex, ergänzt fehlende Index-Tage bei Bedarf und ruft danach die
-Detaildaten mit zehn konfigurierten Workern ab.
-Nur abgeschlossene Spiele mit vollständigem Halbzeit- und Endstand sowie
-bestätigtem Regular-Time-Scope werden in `match_results` ergänzt. Die FotMob-
-Zuordnung und jede Prüfung landen zusätzlich in `result_backfill_evidence`; die
-Wiederholungen und offenen Fälle stehen in `result_backfill_queue`. Bestehende
-vollständige Tipico-Ergebnisse bleiben unverändert.
+Der tägliche `wetten-result-backfill.timer` startet seit V0.6.5 zuerst die
+lokale Tipico-Ergebnis-Finalisierung und danach den bestehenden FotMob-
+Backfill. `ended` wird nur bei belastbarer Abschlussbeobachtung zu `FINISHED`;
+`no_longer_live` und ein alter Zwischenstand werden nicht durch Zeitablauf zu
+einem Endstand. FT- und H2-Freigabe sind getrennt. Ein FT ohne vertrauens-
+würdige HT bleibt sichtbar, wird aber nicht als H2-Label oder H2-Paper-
+Settlement verwendet.
+
+Die lokale Evidenz wird vor FotMob geprüft. Nur ein identitätsgeprüfter,
+regulärer Provider-Endstand darf fehlende Ergebnisse ergänzen. FotMob-
+Zuordnung, Rohstatus, Scope, Score und Regelversion landen in
+`result_backfill_evidence`; offene Fälle, Retries und Konflikte in
+`result_backfill_queue`. Roh-Snapshots und Event-States werden nicht
+rückwirkend umetikettiert; jede Ergebnisänderung ist über
+`result_finalization_changes` nachvollziehbar.
 
 Der Timer wird beim erneuten Aufruf von `deploy/install_proxmox.sh` eingerichtet.
+Seit V0.6.5.2 läuft er um 01:00 und 07:00 Uhr in `Europe/Berlin`, unabhängig
+von der Container-Zeitzone. Noch laufende Provider-Spiele werden nach fünf
+Stunden erneut fällig. Alte unklare Zuordnungen behalten längere Retry-Abstände.
+`--all-due` verarbeitet alle zu Laufbeginn fälligen Spiele; der lokale Schritt
+darf die nachfolgende Provider-Prüfung nicht durch seine Retry-Zeit verhindern.
+Nach diesem Matching-Update sollte einmal `wetten-result-recovery.service`
+gestartet werden, damit auch alte Fälle mit zukünftigem Retry-Termin geprüft werden.
 Ein manueller Lauf ist möglich:
 
 ~~~bash
@@ -245,8 +258,64 @@ Vor einem produktiven Schreiben kann derselbe Ablauf schreibgeschützt geprüft
 werden:
 
 ~~~bash
-.venv/bin/python scripts/result_backfill.py --root /opt/tipico-observer --dry-run
+.venv/bin/python scripts/result_finalization.py audit --root /opt/tipico-observer
+.venv/bin/python scripts/result_finalization.py reconcile --root /opt/tipico-observer --dry-run --mode cached
 ~~~
+
+Ein einmaliger, fortsetzbarer Bestandslauf über jedes Fußball-Event der
+eingefrorenen Prüfliste wird so gestartet. `--full-inventory` ist absichtlich
+separat vom täglichen `--all-due`-Lauf:
+
+~~~bash
+.venv/bin/python scripts/result_finalization.py reconcile \
+  --root /opt/tipico-observer --full-inventory --apply \
+  --workers 10 --mode worker --refresh-index
+~~~
+
+Der Vollbestand läuft unabhängig vom 90-%-Ziel bis zur letzten Prüflistenzeile.
+Ein technisch abgeschlossener Lauf mit geringerer Abdeckung bleibt deshalb
+`COMPLETED`/`NOT_MET`; fehlende Ergebnisse werden nicht als Treffer gezählt.
+Der manuelle Vollbestandsdienst wird bei der Installation nur eingerichtet,
+nicht automatisch aktiviert:
+
+~~~bash
+systemctl start wetten-result-recovery.service
+systemctl status wetten-result-recovery.service --no-pager
+journalctl -u wetten-result-recovery.service -n 100 --no-pager
+~~~
+
+Die CLI gibt die `run_id` aus. Nach einem Prozessabbruch oder einer Provider-
+Blockade wird derselbe Lauf fortgesetzt, ohne eine neue Kohorte anzulegen:
+
+~~~bash
+.venv/bin/python scripts/result_finalization.py resume \
+  --root /opt/tipico-observer --run-id <RUN_ID> --workers 10 --mode worker
+.venv/bin/python scripts/result_finalization.py status \
+  --root /opt/tipico-observer --run-id <RUN_ID>
+.venv/bin/python scripts/result_finalization.py report \
+  --root /opt/tipico-observer --run-id <RUN_ID>
+~~~
+
+`audit` und `reconcile --dry-run` sind schreibgeschützt. Für den Vollbestand
+ist Exit-Code `0` ein technisch beendeter Lauf (auch bei `NOT_MET`), Exit-Code
+`2` signalisiert Provider-/Policy-Blockade und Exit-Code `1` einen technischen
+Fehler. Die maschinenlesbaren Reports unterscheiden Laufstatus, Verarbeitungs-
+vollständigkeit und Coverage-Ziel.
+
+Für einen einzelnen offenen Fall gibt es den gezielten Recheck:
+
+~~~bash
+.venv/bin/python scripts/result_finalization.py recheck \
+  --root /opt/tipico-observer --event-id EVENT_ID --apply --mode worker
+~~~
+
+Die vier Reports `RESULT_FINALIZATION_STATUS.md`,
+`RESULT_FINALIZATION_AUDIT.csv`, `RESULT_FINALIZATION_CHANGES.csv` und
+`RESULT_FINALIZATION_UNRESOLVED.csv` sowie die zusätzlichen Recovery-Reports
+liegen beim Vollbestand unter `data/result_finalization/<RUN_ID>/` (bei einem
+expliziten `--out-dir` dort). Der Lauf verwendet einen Datenbank-Lock mit
+Heartbeat, damit auf dem Container kein zweiter Finalisierungslauf parallel
+schreibt und ein abgebrochener Lauf sicher fortgesetzt werden kann.
 
 Ergebnisse ohne expliziten Nachweis für reguläre 90 Minuten werden standardmäßig
 nicht übernommen. Das Verhalten kann nach Prüfung gezielt mit

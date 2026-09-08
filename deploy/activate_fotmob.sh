@@ -76,9 +76,9 @@ set_env_value RESULT_BACKFILL_GRACE_HOURS 3
 set_env_value RESULT_BACKFILL_LIMIT 500
 set_env_value RESULT_BACKFILL_WORKERS 10
 set_env_value RESULT_BACKFILL_ALLOW_UNKNOWN_SCOPE false
-set_env_value WETTEN_APP_VERSION 0.6.4
+set_env_value WETTEN_APP_VERSION 0.6.5.2
 set_env_value WETTEN_RESEARCH_VERSION 0.6.1.1
-set_env_value WETTEN_INSTALLER_VERSION v064
+set_env_value WETTEN_INSTALLER_VERSION v0652
 set_env_value WETTEN_DEPLOY_TIME "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 if command -v systemctl >/dev/null 2>&1; then

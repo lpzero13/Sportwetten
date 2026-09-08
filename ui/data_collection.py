@@ -52,6 +52,23 @@ def _size_label(size_bytes: int) -> str:
     return "0.0 B"
 
 
+def _duration_seconds(start: object, end: object) -> float | None:
+    """Parse persisted UTC timestamps for a non-invasive progress estimate."""
+
+    if not start or not end:
+        return None
+    try:
+        left = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        right = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        if left.tzinfo is None:
+            left = left.replace(tzinfo=timezone.utc)
+        if right.tzinfo is None:
+            right = right.replace(tzinfo=timezone.utc)
+        return max(0.0, (right - left).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+
 def render_data_collection(
     database: Database,
     settings: Settings,
@@ -289,33 +306,266 @@ def render_data_collection(
     persistence_columns[2].metric("Paper Trades", database.count_rows("paper_trades"))
     persistence_columns[3].metric("Current Events", database.count_rows("current_event_state"))
     result_backfill = database.result_backfill_status()
+    result_finalization = database.result_finalization_status()
     result_queue = result_backfill.get("queue", {}) or {}
     result_sources = result_backfill.get("result_sources", {}) or {}
     st.subheader("Ergebnis-Nachpflege")
-    result_columns = st.columns(4)
+    result_columns = st.columns(6)
     result_columns[0].metric(
-        "Finale fehlen",
-        result_backfill.get("missing_final_results", 0),
-        help="Tipico-Events ohne vollständiges FT-Ergebnis; FotMob-Backfill arbeitet diese täglich ab.",
+        "FT freigegeben",
+        result_finalization.get("ft_ready", 0),
+        help="Endstände mit ausreichender Ergebnisqualität für FT-Auswertungen.",
     )
-    result_columns[1].metric("Durch FotMob ergänzt", result_sources.get("FOTMOB_BACKFILL", 0))
-    result_columns[2].metric(
-        "Retry / Prüfung",
+    result_columns[1].metric("H2 freigegeben", result_finalization.get("h2_ready", 0))
+    result_columns[2].metric("Offen", result_finalization.get("pending", 0))
+    result_columns[3].metric("Konflikte", result_finalization.get("conflicts", 0))
+    result_columns[4].metric("Durch FotMob ergänzt", result_sources.get("FOTMOB_BACKFILL", 0))
+    result_columns[5].metric(
+        "Backtest-fähig",
+        result_finalization.get("backtest_ready", 0),
+        help="Verifiziertes H2-Ergebnis plus gespeicherter HT/HT_STABLE-Einstieg.",
+    )
+    st.caption(
+        f"Ergebnisstatus: {result_finalization.get('result_status', {})} · "
+        f"Nicht verfügbar: {result_finalization.get('unavailable', 0)} · "
+        f"Letzte Prüfung: {format_local_datetime(result_finalization.get('last_checked_at'))} · "
+        f"Letzte Reparatur: {format_local_datetime(result_finalization.get('last_changed_at'))} · "
+        "Nächster planmäßiger Lauf: täglich 03:15 Serverzeit"
+    )
+    retry_columns = st.columns(2)
+    retry_columns[0].metric(
+        "Retry / Backfill-Queue",
         sum(
             int(value or 0)
             for key, value in result_queue.items()
             if key not in {"APPLIED", "CONFIRMED", "CONFLICT", "CANCELLED", "EXCLUDED_NON_REGULATION"}
         ),
     )
-    result_columns[3].metric("Evidenz-Zeilen", result_backfill.get("evidence_rows", 0))
+    retry_columns[1].metric("Evidenz-Zeilen", result_backfill.get("evidence_rows", 0))
     st.caption(
-        "Der Ergebnis-Backfill ergänzt nur fehlende Endstände. FotMob-Evidenz, "
-        "Match-Zuordnung, Scope und Prüfstatus bleiben separat nachvollziehbar; "
-        "vollständige Tipico-Ergebnisse werden nicht überschrieben."
+        "Rohstatus und kanonischer Status bleiben getrennt. `no_longer_live` wird "
+        "nicht allein durch Zeitablauf als beendet gewertet; Endstände, Quellen, "
+        "H2-Freigabe und Konflikte bleiben je Event nachvollziehbar."
     )
     if result_queue:
         with st.expander("Backfill-Queue", expanded=False):
             st.write(result_queue)
+
+    latest_run = result_finalization.get("last_run") or {}
+    run_coverage = result_finalization.get("last_run_coverage") or {}
+    if latest_run:
+        st.subheader("Letzter Vollbestands-Lauf")
+        run_columns = st.columns(6)
+        run_columns[0].metric("Prüfliste", f"{run_coverage.get('n_all', 0):,}")
+        run_columns[1].metric("Historisch", f"{run_coverage.get('n_historical', 0):,}")
+        run_columns[2].metric("FT", f"{run_coverage.get('n_ft', 0):,}/{run_coverage.get('n_eligible', 0):,}")
+        run_columns[3].metric("H2", f"{run_coverage.get('n_h2', 0):,}/{run_coverage.get('n_eligible', 0):,}")
+        run_columns[4].metric("H2-Entry", f"{run_coverage.get('n_entry_h2', 0):,}/{run_coverage.get('n_entry', 0):,}")
+        run_columns[5].metric(
+            "Provider offen / blockiert",
+            f"{run_coverage.get('provider_open', 0):,} / {run_coverage.get('provider_blocked', 0):,}",
+        )
+        st.caption(
+            f"Run {latest_run.get('run_id', '—')} · Status {latest_run.get('run_status') or latest_run.get('status') or '—'} · "
+            f"vollständig: {'Ja' if run_coverage.get('processing_complete') else 'Nein'} · "
+            f"lokal geprüft: {run_coverage.get('n_local_checked', 0):,}/{run_coverage.get('n_historical', 0):,} · "
+            f"nicht fällig: {run_coverage.get('n_not_due', 0):,} · Alter unbekannt: {run_coverage.get('n_age_unknown', 0):,} · "
+            f"FT brutto: {run_coverage.get('n_ft', 0):,}/{run_coverage.get('n_historical', 0):,} · "
+            f"FT-Ziel: {run_coverage.get('ft_target_status', '—')} · "
+            f"H2-Entry-Ziel: {run_coverage.get('entry_h2_target_status', '—')} · "
+            f"Fehlend bis 90 %: FT {run_coverage.get('missing_ft_to_90', '—')}, "
+            f"H2-Entry {run_coverage.get('missing_entry_h2_to_90', '—')}"
+        )
+        run_stages = (result_finalization.get("last_run_items") or {}).get("stages", {}) or {}
+        unprocessed = int(run_coverage.get("unprocessed", 0) or 0)
+        historical_total = int(run_coverage.get("n_historical", 0) or 0)
+        processed = max(0, historical_total - unprocessed)
+        run_status = str(latest_run.get("run_status") or latest_run.get("status") or "")
+        run_end = latest_run.get("finished_at") or latest_run.get("completed_at")
+        if run_status == "RUNNING":
+            run_end = datetime.now(timezone.utc).isoformat()
+        elapsed = _duration_seconds(latest_run.get("started_at"), run_end)
+        throughput = (processed / elapsed * 60.0) if elapsed and elapsed > 0 and processed else None
+        eta_minutes = (unprocessed / throughput) if throughput and unprocessed else None
+        progress_columns = st.columns(4)
+        progress_columns[0].metric(
+            "Fortschritt",
+            f"{processed:,}/{historical_total:,}",
+            help="Bearbeitete historische Prüflistenzeilen; Provider-No-Data bleibt fachlich ungelöst, aber nicht unversucht.",
+        )
+        progress_columns[1].metric(
+            "Durchsatz",
+            f"{throughput:,.0f}/min" if throughput is not None else "—",
+        )
+        if eta_minutes is not None:
+            low = max(0.0, eta_minutes * 0.75)
+            high = eta_minutes * 1.50
+            eta_label = f"ca. {eta_minutes:.1f} min"
+            eta_help = f"Unsicherheitsband: {low:.1f}–{high:.1f} min; basiert auf dem bisherigen Laufdurchsatz."
+        elif unprocessed == 0:
+            eta_label = "fertig"
+            eta_help = "Keine unversuchten historischen Prüflistenzeilen."
+        else:
+            eta_label = "—"
+            eta_help = "Noch kein belastbarer Durchsatz aus dem persistenten Laufstatus."
+        progress_columns[2].metric("Restzeit", eta_label, help=eta_help)
+        progress_columns[3].metric(
+            "Heartbeat",
+            format_local_datetime(latest_run.get("heartbeat_at")),
+            help=f"Stages: {run_stages or '—'}",
+        )
+
+    st.subheader("Ergebnis-Explorer")
+    st.caption(
+        "Event-Grain: Filter werden in der vollständigen Datenbank ausgeführt; die Anzeige ist paginiert. "
+        "Rohstatus, kanonischer Spielstatus, Endstandqualität und verwendbare H2-Zielvariable werden getrennt angezeigt."
+    )
+    filter_options = database.result_finalization_filter_options()
+
+    def _options(name: str) -> list[str]:
+        return ["Alle", *filter_options.get(name, [])]
+
+    filter_columns = st.columns(4)
+    selected_date = filter_columns[0].selectbox(
+        "Kickoff-Datum", _options("date"), key="result_filter_date"
+    )
+    selected_country = filter_columns[1].selectbox(
+        "Land", _options("country"), key="result_filter_country"
+    )
+    selected_competition = filter_columns[2].selectbox(
+        "Liga", _options("competition"), key="result_filter_competition"
+    )
+    selected_raw_status = filter_columns[3].selectbox(
+        "Rohstatus", _options("raw_status"), key="result_filter_raw_status"
+    )
+    filter_columns = st.columns(3)
+    selected_canonical = filter_columns[0].selectbox(
+        "Kanonischer Status", _options("canonical_status"), key="result_filter_canonical"
+    )
+    selected_source = filter_columns[1].selectbox(
+        "Ergebnisquelle", _options("result_source"), key="result_filter_source"
+    )
+    selected_result_status = filter_columns[2].selectbox(
+        "Ergebnisstatus", _options("result_status"), key="result_filter_result_status"
+    )
+    selected_filters = {
+        "date_value": None if selected_date == "Alle" else selected_date,
+        "country": None if selected_country == "Alle" else selected_country,
+        "competition": None if selected_competition == "Alle" else selected_competition,
+        "raw_status": None if selected_raw_status == "Alle" else selected_raw_status,
+        "canonical_status": None if selected_canonical == "Alle" else selected_canonical,
+        "result_source": None if selected_source == "Alle" else selected_source,
+        "result_status": None if selected_result_status == "Alle" else selected_result_status,
+    }
+    filtered_total = database.result_finalization_count(**selected_filters)
+    page_size = st.selectbox("Zeilen pro Seite", [25, 50, 100, 250], index=1, key="result_page_size")
+    page_count = max(1, (filtered_total + page_size - 1) // page_size)
+    page_number = st.number_input(
+        "Seite", min_value=1, max_value=page_count, value=min(int(st.session_state.get("result_page_number", 1)), page_count), step=1,
+        key="result_page_number",
+    )
+    result_rows = database.result_finalization_rows(
+        limit=page_size,
+        offset=(int(page_number) - 1) * page_size,
+        **selected_filters,
+    )
+    st.caption(f"{filtered_total:,} Events im vollständigen Bestand · Seite {int(page_number)} von {page_count}")
+    if result_rows:
+        st.dataframe(
+            [
+                {
+                    "Event": row["event_id"],
+                    "Datum": str(row["kickoff_time"] or "—")[:10],
+                    "Land": row["competition_country"] or "—",
+                    "Liga": row["competition_name"] or "—",
+                    "Spiel": f"{row['home_team']} – {row['away_team']}",
+                    "Rohstatus": row["raw_status"] or "—",
+                    "Kanonisch": row["canonical_status"] or "UNKNOWN",
+                    "HT": (
+                        f"{row['ht_home']}:{row['ht_away']}"
+                        if row["ht_home"] is not None and row["ht_away"] is not None else "—"
+                    ),
+                    "FT": (
+                        f"{row['ft_home']}:{row['ft_away']}"
+                        if row["ft_home"] is not None and row["ft_away"] is not None else "—"
+                    ),
+                    "Qualität": row["result_status"] or "PENDING",
+                    "FT frei": "Ja" if row["result_use_ft"] else "Nein",
+                    "H2 frei": "Ja" if row["result_use_h2"] else "Nein",
+                    "Quelle": row["result_source"] or "—",
+                    "Grund": row["result_reason"] or "—",
+                }
+                for row in result_rows
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+        selected_result_id = st.selectbox(
+            "Ergebnisdetail anzeigen",
+            [str(row["event_id"]) for row in result_rows],
+            format_func=lambda value: next(
+                (
+                    f"{row['home_team']} – {row['away_team']} · "
+                    f"{row['competition_name']} · {value}"
+                    for row in result_rows if str(row["event_id"]) == value
+                ),
+                value,
+            ),
+            key="result_detail_event",
+        )
+        selected_result = next(
+            row for row in result_rows if str(row["event_id"]) == selected_result_id
+        )
+        detail_columns = st.columns(4)
+        detail_columns[0].metric(
+            "Letzter Stand",
+            f"{selected_result['current_score_home']}:{selected_result['current_score_away']}"
+            if selected_result["current_score_home"] is not None
+            and selected_result["current_score_away"] is not None else "—",
+        )
+        detail_columns[1].metric(
+            "HT / FT",
+            (
+                f"{selected_result['ht_home']}:{selected_result['ht_away']} / "
+                f"{selected_result['ft_home']}:{selected_result['ft_away']}"
+            ) if selected_result["ft_home"] is not None else "—",
+        )
+        detail_columns[2].metric("Quelle", selected_result["result_source"] or "—")
+        detail_columns[3].metric("Revision", selected_result["result_revision"] or 0)
+        st.caption(
+            f"Beleg: {selected_result['evidence_type'] or '—'} / "
+            f"{selected_result['evidence_record_id'] or '—'} · "
+            f"Grund: {selected_result['result_reason'] or '—'} · "
+            f"Scope: {selected_result['result_scope_status'] or '—'} · "
+            f"zuletzt geprüft: {format_local_datetime(selected_result['result_last_checked_at'])}"
+        )
+        evidence_rows = database.result_evidence_for_event(selected_result_id)
+        if evidence_rows:
+            with st.expander("Evidenz und Herkunft", expanded=False):
+                st.dataframe(
+                    [
+                        {
+                            "Provider": row["provider"],
+                            "Typ": row["source_record_type"] or "—",
+                            "Referenz": row["source_record_id"] or "—",
+                            "Status": row["validation_status"] or "—",
+                            "Rohstatus": row["raw_status"] or "—",
+                            "HT": f"{row['ht_home']}:{row['ht_away']}"
+                            if row["ht_home"] is not None and row["ht_away"] is not None else "—",
+                            "FT": f"{row['ft_home']}:{row['ft_away']}"
+                            if row["ft_home"] is not None and row["ft_away"] is not None else "—",
+                            "Regel": row["rule_version"] or "—",
+                            "Beobachtet": format_local_datetime(row["observed_at"]),
+                        }
+                        for row in evidence_rows
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
+    elif filtered_total:
+        st.info("Für diese Seite wurden keine Zeilen geladen. Seite zurücksetzen.")
+    else:
+        st.info("Noch keine Fußball-Events für den Ergebnis-Explorer vorhanden.")
     market_type_rows = database.market_type_counts()
     if market_type_rows:
         with st.expander("Beobachtete Market Types", expanded=False):

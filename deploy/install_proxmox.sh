@@ -46,6 +46,7 @@ mkdir -p \
     "$INSTALL_DIR/data/raw" \
     "$INSTALL_DIR/data/halftime_reports" \
     "$INSTALL_DIR/data/result_backfill" \
+    "$INSTALL_DIR/data/result_finalization" \
     "$INSTALL_DIR/logs" \
     "/var/lib/wetten/archive/fotmob/match_core" \
     "/var/lib/wetten/archive/fotmob/period_stats" \
@@ -126,6 +127,12 @@ sed \
     -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
     "$INSTALL_DIR/deploy/wetten-result-backfill.timer" \
     > /etc/systemd/system/wetten-result-backfill.timer
+sed \
+    -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
+    -e "s|__SERVICE_USER__|$SERVICE_USER|g" \
+    -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
+    "$INSTALL_DIR/deploy/wetten-result-recovery.service" \
+    > /etc/systemd/system/wetten-result-recovery.service
 
 # Reconcile the V0.5.9.1 production FotMob flags even when an older env file
 # already exists.  The helper keeps a timestamped backup and keeps the
@@ -135,7 +142,7 @@ TIPICO_SKIP_SERVICE_RESTART=1 bash "$INSTALL_DIR/deploy/activate_fotmob.sh" "$EN
 # Record the exact source/artifact identity that was installed.  The
 # manifest is runtime state and is intentionally excluded from Git.
 "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/deploy/write_deployment_manifest.py" \
-    --root "$INSTALL_DIR" --installer-version "v064"
+    --root "$INSTALL_DIR" --installer-version "v0652"
 chown root:"$SERVICE_GROUP" "$INSTALL_DIR/DEPLOYMENT_MANIFEST.json"
 chmod 0640 "$INSTALL_DIR/DEPLOYMENT_MANIFEST.json"
 
@@ -172,4 +179,5 @@ echo
 echo "Installation abgeschlossen."
 echo "Dashboard: http://${LXC_IP:-<LXC-IP>}:8506"
 echo "Status:    systemctl status wetten-ui wetten-collector wetten-paper wetten-result-backfill.timer"
+echo "Vollbestand: systemctl start wetten-result-recovery.service"
 echo "Logs:      journalctl -u wetten-ui -u wetten-collector -u wetten-paper -u wetten-result-backfill.service -f"

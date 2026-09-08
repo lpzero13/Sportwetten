@@ -7,12 +7,28 @@ from datetime import datetime, timezone
 import json
 from typing import Any
 
-from .engine import settle_scores
+from .engine import SettlementResult, settle_scores
 from .journal import PaperJournal
 from .market import timestamp
 
 
 def classify(half_home: Any, half_away: Any, values: dict[str, Any]) -> Any:
+    # V0.6.5 keeps FT visibility separate from H2 settlement permission.
+    # A verified FT without a trustworthy HT, unknown scope or a conflict is
+    # displayed and retained as evidence but must not settle a paper trade.
+    result_status = str(values.get("result_status") or "").upper()
+    if (
+        ("result_use_ft" in values and values.get("result_use_ft") in (False, 0, "0"))
+        or ("result_use_h2" in values and values.get("result_use_h2") in (False, 0, "0"))
+        or result_status in {"CONFLICT", "PENDING", "PARTIAL", "UNAVAILABLE"}
+    ):
+        return SettlementResult(
+            "UNRESOLVED",
+            None,
+            str(values.get("result_reason") or "H2_RESULT_NOT_RELEASED"),
+            final_score_home=values.get("final_score_home"),
+            final_score_away=values.get("final_score_away"),
+        )
     return settle_scores(
         halftime_home=half_home, halftime_away=half_away,
         final_home=values.get("final_score_home"), final_away=values.get("final_score_away"),
@@ -58,17 +74,32 @@ def process_results(service: Any, resolver: Any = None, now: datetime | None = N
             if not values:
                 row = db.match_result_for_event(event_id)
                 if row:
-                    values = {"source": "TIPICO_MATCH_RESULT", "final_score_home": row["ft_home"],
+                    values = {"source": row["result_source"] or "TIPICO_ORIGINAL", "final_score_home": row["ft_home"],
                               "final_score_away": row["ft_away"], "status": row["final_status"],
                               "extra_time": row["extra_time"], "penalties": row["penalties"],
-                              "ht_home": row["ht_home"], "ht_away": row["ht_away"]}
+                              "ht_home": row["ht_home"], "ht_away": row["ht_away"],
+                              "result_status": row["result_status"],
+                              "result_use_ft": row["result_use_ft"],
+                              "result_use_h2": row["result_use_h2"],
+                              "result_reason": row["result_reason"],
+                              "result_evidence_id": row["result_evidence_id"],
+                              "result_revision": row["result_revision"],
+                              "result_resolved_at": row["result_resolved_at"]}
                 else:
                     row = db.final_snapshot_for_event(event_id)
                     if row:
                         values = {"source": "TIPICO_FINAL_SNAPSHOT", "final_score_home": row["score_home"],
                                   "final_score_away": row["score_away"], "status": row["match_status"],
                                   "extra_time": row["extra_time"], "penalties": row["penalties"],
-                                  "ht_home": row["ht_score_home"], "ht_away": row["ht_score_away"]}
+                                  "ht_home": row["ht_score_home"], "ht_away": row["ht_score_away"],
+                                  "result_source": "TIPICO_FINAL_SNAPSHOT",
+                                  # A raw FINAL snapshot is not a finalized
+                                  # result by itself.  The V0.6.5 worker must
+                                  # validate it before paper settlement.
+                                  "result_status": "PENDING",
+                                  "result_use_ft": 0,
+                                  "result_use_h2": 0,
+                                  "result_reason": "FINAL_SNAPSHOT"}
             outcome = classify(half_home, half_away, values)
             due = not cached or timestamp(cached["next_check_at"]) <= now
             current = live.get(event_id)

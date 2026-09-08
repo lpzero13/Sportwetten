@@ -69,6 +69,7 @@ class FotMobMatchIndexRecord:
     captured_live: bool = False
     is_next_day: bool = False
     field_provenance: dict[str, Any] | None = None
+    raw_fixture: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)

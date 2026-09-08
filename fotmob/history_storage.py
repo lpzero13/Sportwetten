@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS fotmob_daily_index (
     round TEXT,
     match_status TEXT,
     is_next_day INTEGER NOT NULL DEFAULT 0,
+    raw_fixture_json TEXT,
     source_endpoint TEXT,
     payload_hash TEXT,
     fetched_at TEXT NOT NULL,
@@ -323,6 +324,7 @@ class FotMobHistoryStore:
                 },
                 "fotmob_daily_index": {
                     "is_next_day": "INTEGER NOT NULL DEFAULT 0",
+                    "raw_fixture_json": "TEXT",
                 },
                 "fotmob_daily_load_runs": {
                     "skipped_no_halftime_count": "INTEGER NOT NULL DEFAULT 0",
@@ -621,14 +623,37 @@ class FotMobHistoryStore:
         payload_hash: str | None = None,
         fetched_at: str | None = None,
         provider: str = "FOTMOB",
+        replace_day: bool = False,
     ) -> dict[str, int]:
-        """Persist the date-bounded fixture catalog without storing stats."""
+        """Persist the date-bounded fixture catalog without storing stats.
+
+        ``replace_day`` is used only after an explicit fresh feed request.  A
+        daily response is a complete catalogue for its requested day, so
+        stale rows which disappeared from that response must not remain in the
+        matching cache.  It is intentionally opt-in for backwards
+        compatibility with incremental callers.
+        """
 
         record_list = list(records)
         fetched = fetched_at or _now()
         day = str(observation_date)
         inserted = updated = 0
         with self._lock, self.connection:
+            if replace_day:
+                ids = tuple(dict.fromkeys(str(record.provider_match_id) for record in record_list))
+                if ids:
+                    placeholders = ", ".join("?" for _ in ids)
+                    self.connection.execute(
+                        f"""DELETE FROM fotmob_daily_index
+                            WHERE provider = ? AND observation_date = ?
+                              AND fotmob_match_id NOT IN ({placeholders})""",
+                        (provider.upper(), day, *ids),
+                    )
+                else:
+                    self.connection.execute(
+                        "DELETE FROM fotmob_daily_index WHERE provider = ? AND observation_date = ?",
+                        (provider.upper(), day),
+                    )
             for record in record_list:
                 country_code = record.country_code or self._country_code(record.country)
                 country_name = record.country_name or self._country_name(record.country)
@@ -648,8 +673,8 @@ class FotMobHistoryStore:
                         season_label, kickoff_at_utc, home_team_id, home_team_name,
                         away_team_id, away_team_name, round, match_status, is_next_day,
                         source_endpoint, payload_hash, fetched_at, first_seen_at,
-                        last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        last_seen_at, raw_fixture_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(provider, observation_date, fotmob_match_id) DO UPDATE SET
                         league_id = excluded.league_id,
                         league_name = COALESCE(excluded.league_name, fotmob_daily_index.league_name),
@@ -665,6 +690,7 @@ class FotMobHistoryStore:
                         round = COALESCE(excluded.round, fotmob_daily_index.round),
                         match_status = COALESCE(excluded.match_status, fotmob_daily_index.match_status),
                         is_next_day = excluded.is_next_day,
+                        raw_fixture_json = COALESCE(excluded.raw_fixture_json, fotmob_daily_index.raw_fixture_json),
                         source_endpoint = COALESCE(excluded.source_endpoint, fotmob_daily_index.source_endpoint),
                         payload_hash = COALESCE(excluded.payload_hash, fotmob_daily_index.payload_hash),
                         fetched_at = excluded.fetched_at,
@@ -677,7 +703,7 @@ class FotMobHistoryStore:
                         record.kickoff_at, record.home_team_id, record.home_team_name,
                         record.away_team_id, record.away_team_name, record.round_name,
                         record.match_status, int(bool(record.is_next_day)), source_endpoint, payload_hash, fetched,
-                        first_seen, fetched,
+                        first_seen, fetched, json.dumps(record.raw_fixture, ensure_ascii=False) if record.raw_fixture is not None else None,
                     ),
                 )
                 if existing is None:

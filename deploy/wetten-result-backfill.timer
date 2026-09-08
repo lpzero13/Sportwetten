@@ -1,10 +1,11 @@
 [Unit]
-Description=Daily Sportwetten FotMob result reconciliation
+Description=Daily Sportwetten Tipico result finalization
 
 [Timer]
-OnCalendar=*-*-* 03:15:00
+OnCalendar=*-*-* 01:00:00 Europe/Berlin
+OnCalendar=*-*-* 07:00:00 Europe/Berlin
 Persistent=true
-RandomizedDelaySec=15m
+RandomizedDelaySec=0
 Unit=wetten-result-backfill.service
 
 [Install]

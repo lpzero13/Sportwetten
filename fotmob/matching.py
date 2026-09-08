@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any, Mapping
 
 from .models import FotMobMatch
+from .competition_aliases import competition_label_key
 
 
 MATCH_STATUSES = (
@@ -32,6 +34,7 @@ MATCH_STATUSES = (
 # exposes localized country names. Keep the same conversion for matching and
 # for labels stored by the daily-index persistence path.
 COUNTRY_CODE_NAMES = {
+    "NIR": "Nordirland", "SLV": "El Salvador", "MDA": "Moldawien",
     "AFG": "Afghanistan", "ALB": "Albanien", "ALG": "Algerien", "AND": "Andorra",
     "ANG": "Angola", "ARG": "Argentinien", "ARM": "Armenien", "AUS": "Australien",
     "AUT": "Österreich", "AZE": "Aserbaidschan", "BAH": "Bahamas", "BAN": "Bangladesch",
@@ -87,7 +90,12 @@ def normalize_name(value: Any) -> str:
 
     if value is None:
         return ""
-    text = unicodedata.normalize("NFKD", str(value)).casefold()
+    return _normalize_name_text(str(value))
+
+
+@lru_cache(maxsize=32768)
+def _normalize_name_text(value: str) -> str:
+    text = unicodedata.normalize("NFKD", value).casefold()
     text = "".join(char for char in text if not unicodedata.combining(char))
     text = text.replace("ß", "ss")
     text = text.replace("&", " and ")
@@ -160,7 +168,11 @@ def normalize_competition_name(value: Any) -> str:
 
 
 def normalize_country(value: Any) -> str:
-    normalized = normalize_name(value)
+    return _normalized_country(normalize_name(value))
+
+
+@lru_cache(maxsize=1024)
+def _normalized_country(normalized: str) -> str:
     aliases = {
         "de": "deutschland",
         "germany": "deutschland",
@@ -256,6 +268,7 @@ def normalize_country(value: Any) -> str:
         "south korea": "sudkorea",
         "turkey": "turkei",
         "united arab emirates": "vereinigte arabische emirate",
+        "v a emirate": "vereinigte arabische emirate",
         "international": "international",
     }
     aliases.update(
@@ -419,7 +432,9 @@ class MatchMatcher:
     def _team_equal(self, left: str, right: str) -> bool:
         return team_names_equivalent(left, right, self.team_aliases)
 
-    def _competition_equal(self, left: str, right: str) -> bool:
+    def _competition_equal(self, left: str, right: str, country: str = "") -> bool:
+        if country and competition_label_key(country, left, normalize_competition_name) == competition_label_key(country, right, normalize_competition_name):
+            return True
         normalized_left = normalize_competition_name(left)
         normalized_right = normalize_competition_name(right)
         if normalized_left == normalized_right:
@@ -493,7 +508,12 @@ class MatchMatcher:
         country_right = normalize_country(fotmob.competition_country)
         if country_left and country_right and country_left != country_right:
             return MatchCandidate(fotmob.provider_match_id or "", 0.0, "UNMATCHED", ["country_mismatch"])
-        competition_equal = self._competition_equal(tipico.competition_name, fotmob.competition_name)
+        if country_left and country_left == country_right:
+            left_key = competition_label_key(country_left, tipico.competition_name, normalize_competition_name)
+            right_key = competition_label_key(country_left, fotmob.competition_name, normalize_competition_name)
+            if left_key.startswith("country-label:") and right_key.startswith("country-label:") and left_key != right_key:
+                return MatchCandidate(fotmob.provider_match_id or "", 0.0, "UNMATCHED", ["competition_mismatch"])
+        competition_equal = self._competition_equal(tipico.competition_name, fotmob.competition_name, country_left if country_left == country_right else "")
         if competition_equal:
             reasons.append("competition_exact_or_alias")
         elif normalize_competition_name(tipico.competition_name) and normalize_competition_name(fotmob.competition_name):
@@ -546,7 +566,19 @@ class MatchMatcher:
             # newly supplied candidate still represents the same event.  The
             # candidate must pass the normal competition/team/kickoff checks;
             # Tipico and FotMob IDs are provider-specific namespaces.
-            scored.append(self.score_candidate(tipico, identity))
+            variants = [self.score_candidate(tipico, identity)]
+            aliases = candidate.extra_data.get("identity_aliases", {})
+            if variants[0].score == 1.0 or any(reason in variants[0].reasons for reason in ("competition_mismatch", "country_mismatch", "kickoff_outside_tolerance")):
+                scored.append(variants[0])
+                continue
+            for home in aliases.get("home", []):
+                for away in aliases.get("away", []):
+                    # Only names actually supplied by this provider are aliases.
+                    # Preserve explicit reserve/youth/gender markers.
+                    if _team_markers(home) != _team_markers(candidate.home_team) or _team_markers(away) != _team_markers(candidate.away_team):
+                        continue
+                    variants.append(self.score_candidate(tipico, replace(identity, home_team=home, away_team=away)))
+            scored.append(max(variants, key=lambda item: item.score))
         scored.sort(key=lambda item: (-item.score, item.provider_match_id))
         viable = [item for item in scored if item.score > 0]
         if not viable:

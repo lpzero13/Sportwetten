@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 
-APP_VERSION = "0.6.4"
+APP_VERSION = "0.6.5.2"
 RESEARCH_VERSION = "0.6.1.1"
 
 

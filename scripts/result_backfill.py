@@ -72,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _readonly_connection(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(
-        f"file:{path.resolve()}?mode=ro&immutable=1",
+        path.resolve().as_uri() + "?mode=ro",
         uri=True,
         timeout=30,
     )

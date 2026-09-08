@@ -199,7 +199,8 @@ FOTMOB_NETWORK_MODE_VALUES = ("off", "manual", "worker")
 FOTMOB_ARCHIVE_ROOT = ""
 FOTMOB_HISTORY_LEAGUE_ID = "54"
 FOTMOB_HT_ENRICHMENT_ENABLED = True
-# V0.6.4: daily result reconciliation.  This is a result-label worker only;
+# V0.6.5: daily result finalization, local repair and FotMob reconciliation.
+# This is a result-label worker only;
 # it does not collect Tipico odds or overwrite complete Tipico results.
 RESULT_BACKFILL_ENABLED = True
 RESULT_BACKFILL_GRACE_HOURS = 3.0
